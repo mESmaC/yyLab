@@ -41,7 +41,12 @@ def load_base(ref: str, quant: str, attn_implementation: str = "sdpa", rope_scal
 
     kwargs: dict = {"attn_implementation": attn_implementation}
     if rope_scaling:
-        kwargs["rope_scaling"] = rope_scaling
+        from transformers import AutoConfig
+
+        base_cfg = AutoConfig.from_pretrained(ref)
+        merged_rope = dict(getattr(base_cfg, "rope_scaling", None) or {})
+        merged_rope.update(rope_scaling)
+        kwargs["rope_scaling"] = merged_rope
     if quant == "fp8":
         quant = "nf4"
         notes.append("FP8 base weights unavailable in the loader; fell back to NF4.")

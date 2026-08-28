@@ -51,6 +51,7 @@ DEFAULT_SETTINGS: dict = {
         "kv_quant": "none",
         "sliding_window": 4096,
         "max_context_tokens": 8192,
+        "prefill_chunk_size": 8192,
         "rope_scaling": "none",
         "rope_factor": 2.0,
     },
