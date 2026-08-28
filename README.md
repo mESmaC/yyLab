@@ -34,6 +34,9 @@ Artifacts live in `./artifacts` (override with `YYLAB_HOME`).
 - **Chat** — load checkpoint (+ adapter + router snapshot), streaming
   generation, temperature/top-p/max-tokens controls, KV/context settings
   applied at load.
+- **RL export** — merge any trained adapter (MoLE or LoRA) into a standalone
+  HF checkpoint usable by TRL/any RL stack; MoLE merges are calibrated on your
+  corpora (exact under uniform routing).
 - **RL-friendly artifacts** — everything is plain safetensors + JSON.
 
 Docs: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)

@@ -25,8 +25,9 @@ yylab/
     data.py        shard streaming + EOS-packed sequence batches
     loop.py        generic training loop (metrics, aux loss, saves)
   workers/         detached training subprocesses (train.py, launch.py)
-  models/loading.py  shared base loader (bnb quant, SDPA, RoPE scaling)
+  models/loading.py  shared base loader (bnb quant, SDPA, RoPE scaling) + checkpoint scanner
   infer/engine.py  chat inference engine (base + MoLE/LoRA + router, KV settings)
+  export/merge.py  merge adapters into standalone HF checkpoints (RL-ready)
   ui/              NiceGUI app shell + pages
 ```
 
@@ -156,9 +157,33 @@ E=4 r=8 k=2 (18.6 M trainable) stage 1, then router stage 2.
 Validated on RTX 2050: Qwen2.5-0.5B NF4 + trained MoLE adapter + router
 snapshot → coherent streaming replies.
 
+## RL export (phase 4)
+
+`yylab/export/merge.py` produces standalone HF checkpoints from any trained
+adapter — plain safetensors + config + tokenizer, loadable by TRL or any RL
+stack with zero yylab code:
+
+- **LoRA adapters**: PEFT `merge_and_unload` over the full-precision base.
+- **MoLE adapters**: base loaded full-precision on CPU → inject + apply
+  adapter (or router snapshot) → per-layer expert usage weights computed by
+  calibrating router softmax over packed corpus sequences (uniform 1/E
+  fallback) → `materialize_mole` folds Σ_e wₑ·scaling·(BₑAₑ) into each base
+  Linear → `save_pretrained`.
+  - With a zero-init router (uniform routing), the dense merge reproduces the
+    MoLE forward exactly (unit-tested).
+  - Dense merging necessarily collapses input-dependent routing; keep the
+    safetensors adapter + `mole_config.json` when you want the full MoLE
+    behavior (also RL-loadable via `mole.store.apply_mole_weights`).
+
+Triggered from Checkpoints → adapter row → "Export merged"; runs as the
+`export` worker kind and registers the result as a new checkpoint.
+
+GGUF conversion stays external (llama.cpp's convert script consumes the
+merged HF directory directly).
+
 ## Phases
 
 - [x] 1. Scaffold, artifact store, corpora intake + UI, planner, MoLE core
 - [x] 2. Training runtime (MoLE stage 1, router stage 2, base training)
 - [x] 3. Inference engine + chat (base + adapter + router, KV settings)
-- [ ] 4. RL export hardening (merged checkpoint export, GGUF)
+- [x] 4. RL export (merged standalone HF checkpoints)

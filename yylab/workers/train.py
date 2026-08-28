@@ -248,6 +248,68 @@ def run_base(cfg: dict, rd: Path) -> dict:
     return {"result": result, "docs_seen": batches.docs_seen, "tokens": batches.tokens_seen}
 
 
+def _calib_ids(ref: str, corpora: list[str], seq_len: int = 512, n_seqs: int = 2) -> list[list[int]]:
+    from transformers import AutoTokenizer
+
+    from ..train.data import iter_corpus_docs
+
+    tokenizer = AutoTokenizer.from_pretrained(ref)
+    carry: list[int] = []
+    seqs: list[list[int]] = []
+    eos = tokenizer.eos_token_id
+    for doc in iter_corpus_docs(corpora, None, shuffle_buffer=128):
+        ids = tokenizer(doc["text"], add_special_tokens=False)["input_ids"]
+        carry.extend(ids)
+        if eos is not None:
+            carry.append(eos)
+        while len(carry) >= seq_len and len(seqs) < n_seqs:
+            seqs.append(carry[:seq_len])
+            carry = carry[seq_len :]
+        if len(seqs) >= n_seqs:
+            break
+    return seqs
+
+
+def run_export(cfg: dict, rd: Path) -> dict:
+    from ..artifacts import checkpoint_dir
+    from ..export.merge import merge_lora, merge_mole
+    from ..models.loading import scan_checkpoint
+
+    out = checkpoint_dir(cfg["out_checkpoint_id"])
+    if cfg["adapter_arch"] == "lora":
+        merge_lora(cfg["checkpoint_ref"], cfg["adapter_path"], out)
+    else:
+        calib = None
+        if cfg.get("corpora"):
+            calib = _calib_ids(cfg["checkpoint_ref"], cfg["corpora"])
+            log(f"calibrating expert usage on {len(calib)} sequences")
+        merge_mole(
+            cfg["checkpoint_ref"],
+            cfg["adapter_path"],
+            out,
+            router_path=cfg.get("router_path"),
+            calib_ids=calib,
+        )
+    info = scan_checkpoint(out)
+    import json as _json
+
+    db.execute(
+        "UPDATE checkpoints SET kind='base', source='local', ref=?, arch=?, params_b=?, path=?,"
+        " hidden_size=?, num_layers=?, meta_json=? WHERE id=?",
+        (
+            str(out),
+            info["arch"],
+            info["params_b"],
+            str(out),
+            info["hidden_size"],
+            info["num_layers"],
+            _json.dumps({"exported_from": cfg["checkpoint_ref"], "adapter": cfg.get("adapter_path")}),
+            cfg["out_checkpoint_id"],
+        ),
+    )
+    return {"params_b": info["params_b"], "arch": info["arch"]}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run", required=True)
@@ -268,20 +330,22 @@ def main() -> None:
     )
     log(f"yylab worker: run={run_id} kind={run['kind']}")
 
-    if not cfg.get("max_steps"):
-        cfg["max_steps"] = estimate_steps(
-            cfg["corpora"], cfg.get("domains"), cfg.get("epochs", 1),
-            cfg["seq_len"], cfg["micro_batch"], cfg["grad_accum"],
-        )
-        log(f"estimated {cfg['max_steps']} optimizer steps")
-
     try:
+        if not cfg.get("max_steps") and run["kind"] in {"mole_stage1", "router_stage2", "base"}:
+            cfg["max_steps"] = estimate_steps(
+                cfg["corpora"], cfg.get("domains"), cfg.get("epochs", 1),
+                cfg["seq_len"], cfg["micro_batch"], cfg["grad_accum"],
+            )
+            log(f"estimated {cfg['max_steps']} optimizer steps")
+
         if run["kind"] == "mole_stage1":
             summary = run_mole(cfg, rd)
         elif run["kind"] == "router_stage2":
             summary = run_router(cfg, rd)
         elif run["kind"] == "base":
             summary = run_base(cfg, rd)
+        elif run["kind"] == "export":
+            summary = run_export(cfg, rd)
         else:
             raise RuntimeError(f"unknown run kind: {run['kind']}")
         db.execute(
@@ -296,10 +360,11 @@ def main() -> None:
             "UPDATE runs SET status='failed', finished_at=?, error=? WHERE id=?",
             (db.now_iso(), err[-4000:], run_id),
         )
-        if cfg.get("adapter_id"):
-            db.execute("UPDATE adapters SET status='failed' WHERE id=?", (cfg["adapter_id"],))
-        if cfg.get("router_id"):
-            db.execute("UPDATE routers SET status='failed' WHERE id=?", (cfg["router_id"],))
+        if run["kind"] != "export":
+            if cfg.get("adapter_id"):
+                db.execute("UPDATE adapters SET status='failed' WHERE id=?", (cfg["adapter_id"],))
+            if cfg.get("router_id"):
+                db.execute("UPDATE routers SET status='failed' WHERE id=?", (cfg["router_id"],))
         raise SystemExit(1)
 
 

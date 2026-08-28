@@ -1,38 +1,16 @@
 from __future__ import annotations
 
 import json
-import math
 from pathlib import Path
 
 from nicegui import ui
-from safetensors import safe_open
 
 from ... import db
 from ...artifacts import checkpoint_dir
+from ...models.loading import scan_checkpoint as scan_local_checkpoint
+from ...workers.launch import launch_worker
 from ..components import dir_browser
 from ..shell import panel, shell
-
-
-def scan_local_checkpoint(path: Path) -> dict:
-    cfg_file = path / "config.json"
-    if not cfg_file.exists():
-        raise FileNotFoundError("config.json not found — not a HuggingFace checkpoint folder")
-    cfg = json.loads(cfg_file.read_text("utf-8"))
-    arch = (cfg.get("architectures") or ["unknown"])[0]
-    params = 0
-    files = list(path.glob("*.safetensors"))
-    for f in files:
-        with safe_open(str(f), framework="numpy") as sf:
-            for key in sf.keys():
-                shape = sf.get_slice(key).get_shape()
-                params += math.prod(shape) if shape else 0
-    return {
-        "arch": arch,
-        "params_b": round(params / 1e9, 3),
-        "hidden_size": cfg.get("hidden_size", 0) or cfg.get("n_embd", 0),
-        "num_layers": cfg.get("num_hidden_layers", 0) or cfg.get("n_layer", 0),
-        "base_cfg": cfg,
-    }
 
 
 @ui.page("/checkpoints")
@@ -116,9 +94,45 @@ def checkpoints_page():
                 if adapters:
                     ui.label("Adapters").classes("text-sm font-semibold mt-2")
                     for a in adapters:
-                        ui.label(
-                            f'· {a["name"]} — {a["arch"]} E={a["num_experts"]} k={a["top_k"]} r={a["rank"]} quant={a["quant"]} [{a["status"]}]'
-                        ).classes("text-xs text-gray-400")
+                        with ui.row().classes("w-full items-center justify-between gap-2"):
+                            ui.label(
+                                f'· {a["name"]} — {a["arch"]} E={a["num_experts"]} k={a["top_k"]} r={a["rank"]} quant={a["quant"]} [{a["status"]}]'
+                            ).classes("text-xs text-gray-400")
+                            if a["status"] == "trained":
+                                ui.button(
+                                    "Export merged",
+                                    icon="ios_share",
+                                    on_click=lambda _, a=a: export_adapter(c, a),
+                                ).props("dense flat no-caps")
+
+        def export_adapter(ckpt_row: dict, a: dict) -> None:
+            router = db.q1(
+                "SELECT * FROM routers WHERE adapter_id=? AND status='trained' ORDER BY created_at DESC",
+                (a["id"],),
+            )
+            out_id = db.new_id("ckpt")
+            out_name = f'{ckpt_row["name"]}+{a["name"]}-merged'
+            db.execute(
+                "INSERT INTO checkpoints(id, name, created_at, kind, source, ref) VALUES(?,?,?,?,?,?)",
+                (out_id, out_name, db.now_iso(), "pending", "pending", ""),
+            )
+            rid = db.new_id("run")
+            config = {
+                "checkpoint_ref": ckpt_row["ref"],
+                "adapter_id": a["id"],
+                "adapter_path": a["path"],
+                "adapter_arch": a["arch"],
+                "router_path": router["path"] if router else None,
+                "corpora": json.loads(a["corpora_json"] or "[]"),
+                "out_checkpoint_id": out_id,
+            }
+            db.execute(
+                "INSERT INTO runs(id, kind, status, created_at, config_json) VALUES(?,?,?,?,?)",
+                (rid, "export", "queued", db.now_iso(), json.dumps(config)),
+            )
+            pid = launch_worker(rid)
+            db.execute("UPDATE runs SET metrics_json=? WHERE id=?", (json.dumps({"pid": pid}), rid))
+            ui.notify(f"Export started — {out_name} (pid {pid}). See Runs.", type="positive")
 
         def remove(cid: str) -> None:
             if db.q1("SELECT id FROM adapters WHERE checkpoint_id=?", (cid,)):

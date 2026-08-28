@@ -1,6 +1,34 @@
 from __future__ import annotations
 
 
+def scan_checkpoint(path) -> dict:
+    import json
+    import math
+    from pathlib import Path
+
+    from safetensors import safe_open
+
+    path = Path(path)
+    cfg_file = path / "config.json"
+    if not cfg_file.exists():
+        raise FileNotFoundError("config.json not found — not a HuggingFace checkpoint folder")
+    cfg = json.loads(cfg_file.read_text("utf-8"))
+    arch = (cfg.get("architectures") or ["unknown"])[0]
+    params = 0
+    for f in sorted(path.glob("*.safetensors")):
+        with safe_open(str(f), framework="numpy") as sf:
+            for key in sf.keys():
+                shape = sf.get_slice(key).get_shape()
+                params += math.prod(shape) if shape else 0
+    return {
+        "arch": arch,
+        "params_b": round(params / 1e9, 3),
+        "hidden_size": cfg.get("hidden_size", 0) or cfg.get("n_embd", 0),
+        "num_layers": cfg.get("num_hidden_layers", 0) or cfg.get("n_layer", 0),
+        "base_cfg": cfg,
+    }
+
+
 def load_base(ref: str, quant: str, attn_implementation: str = "sdpa", rope_scaling: dict | None = None):
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
