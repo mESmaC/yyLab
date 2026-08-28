@@ -7,6 +7,7 @@ from nicegui import ui
 
 from ... import db
 from ...hw import best_gpu
+from ...ingest.domains import DOMAINS
 from ...train.data import estimate_steps
 from ...workers.launch import launch_worker
 from ..components import field_grid, form_section, hint
@@ -50,6 +51,13 @@ def train_base_page():
                 corp_sel = ui.select(corpora, multiple=True, label="Corpora").props(
                     "dense outlined use-chips"
                 ).classes("w-full")
+                dom_filter = ui.select(
+                    DOMAINS,
+                    multiple=True,
+                    value=[],
+                    label="Domain filter (optional)",
+                ).props("dense outlined use-chips").classes("w-full")
+                hint("Restrict training to these domains within the selected corpora. Empty = all domains.")
                 data_lbl = ui.label("Select corpora to see totals.").classes(
                     "text-xs text-gray-400 px-3 py-2 rounded-md w-full"
                 ).style(f"background: {ACCENT}10")
@@ -104,15 +112,23 @@ def train_base_page():
             if not sel:
                 data_lbl.text = "Select corpora to see totals."
                 return
+            flt = set(dom_filter.value or [])
             docs = chars = 0
             for cid in sel:
                 row = db.q1("SELECT stats_json FROM corpora WHERE id=?", (cid,))
                 if not row:
                     continue
                 stats = orjson.loads(row["stats_json"] or b"{}")
-                docs += stats.get("docs_written", 0)
-                chars += stats.get("chars_written", 0)
-            data_lbl.text = f"{len(sel)} corpora · {docs:,} docs · {chars / 1e9:.2f}B chars"
+                for d, v in stats.get("domains", {}).items():
+                    if flt and d not in flt:
+                        continue
+                    docs += v.get("docs", 0)
+                    chars += v.get("chars", 0)
+            tag = f" · filter: {', '.join(sorted(flt))}" if flt else ""
+            if flt and chars == 0:
+                data_lbl.text = f"{len(sel)} corpora · no docs in domains: {', '.join(sorted(flt))}"
+                return
+            data_lbl.text = f"{len(sel)} corpora{tag} · {docs:,} docs · {chars / 1e9:.2f}B chars"
 
         def resolve_method() -> tuple[str, str]:
             m = method.value
@@ -148,7 +164,8 @@ def train_base_page():
             mb = int(micro_bs.value or 1)
             ga = int(grad_accum.value or 16)
             n_epochs = int(epochs.value or 1)
-            max_steps = estimate_steps(list(corp_sel.value), None, n_epochs, seq, mb, ga)
+            domains_sel = list(dom_filter.value) if dom_filter.value else None
+            max_steps = estimate_steps(list(corp_sel.value), domains_sel, n_epochs, seq, mb, ga)
             base_name = (name_in.value or "").strip() or f'{ckpt["name"]}-{m_resolved}'
 
             config = {
@@ -159,7 +176,7 @@ def train_base_page():
                 "rank": int(rank.value or 32),
                 "alpha": int(rank.value or 32) * 2,
                 "corpora": list(corp_sel.value),
-                "domains": None,
+                "domains": domains_sel,
                 "seq_len": seq,
                 "epochs": n_epochs,
                 "micro_batch": mb,
@@ -200,5 +217,6 @@ def train_base_page():
         for el in (ckpt_sel, method, seq_sel, quant):
             el.on_value_change(lambda _: update_plan())
         corp_sel.on_value_change(lambda _: update_data_summary())
+        dom_filter.on_value_change(lambda _: update_data_summary())
         start_btn.on_click(on_start)
         update_plan()

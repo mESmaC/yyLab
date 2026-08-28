@@ -7,6 +7,7 @@ from nicegui import ui
 
 from ... import db
 from ...hw import best_gpu, has_triton
+from ...ingest.domains import DOMAINS
 from ...mole.inject import DEFAULT_TARGET_MODULES
 from ...train.data import estimate_steps
 from ...train.planner import PlanInput, plan_training
@@ -139,6 +140,13 @@ def train_mole_page():
                             corp_sel.update()
                             update_data_summary()
                         ui.button(dom, on_click=pick).props("dense flat no-caps size=sm")
+                dom_filter = ui.select(
+                    DOMAINS,
+                    multiple=True,
+                    value=[],
+                    label="Domain filter (optional)",
+                ).props("dense outlined use-chips").classes("w-full")
+                hint("Restrict training to these domains within the selected corpora. Empty = all domains.")
                 data_lbl = ui.label("Select corpora to see totals.").classes(
                     "text-xs text-gray-400 px-3 py-2 rounded-md w-full"
                 ).style(f"background: {ACCENT}10")
@@ -215,6 +223,7 @@ def train_mole_page():
             if not sel:
                 data_lbl.text = "Select corpora to see totals."
                 return
+            flt = set(dom_filter.value or [])
             docs = chars = 0
             doms: dict[str, int] = {}
             for cid in sel:
@@ -222,13 +231,19 @@ def train_mole_page():
                 if not row:
                     continue
                 stats = orjson.loads(row["stats_json"] or b"{}")
-                docs += stats.get("docs_written", 0)
-                chars += stats.get("chars_written", 0)
                 for d, v in stats.get("domains", {}).items():
+                    if flt and d not in flt:
+                        continue
                     doms[d] = doms.get(d, 0) + v.get("chars", 0)
+                    docs += v.get("docs", 0)
+                    chars += v.get("chars", 0)
+            if flt and chars == 0:
+                data_lbl.text = f"{len(sel)} corpora · no docs in domains: {', '.join(sorted(flt))}"
+                return
             top = sorted(doms.items(), key=lambda kv: -kv[1])
             mix = ", ".join(f"{k} {v / max(chars, 1) * 100:.0f}%" for k, v in top)
-            data_lbl.text = f"{len(sel)} corpora · {docs:,} docs · {chars / 1e9:.2f}B chars · mix: {mix}"
+            tag = f" · filter: {', '.join(sorted(flt))}" if flt else ""
+            data_lbl.text = f"{len(sel)} corpora{tag} · {docs:,} docs · {chars / 1e9:.2f}B chars · mix: {mix}"
 
         def update_quant_visibility() -> None:
             quant.enabled = method.value in {"auto", "qlora"}
@@ -271,7 +286,8 @@ def train_mole_page():
             mb = int(micro_bs.value or 1)
             ga = int(grad_accum.value or 16)
             n_epochs = int(epochs.value or 1)
-            max_steps = estimate_steps(list(corp_sel.value), None, n_epochs, seq, mb, ga)
+            domains_sel = list(dom_filter.value) if dom_filter.value else None
+            max_steps = estimate_steps(list(corp_sel.value), domains_sel, n_epochs, seq, mb, ga)
 
             aid = db.new_id("adp")
             name = (name_in.value or "").strip() or f'{ckpt["name"]}-mole-E{int(n_exp.value)}k{int(top_k.value)}r{int(rank.value)}'
@@ -297,7 +313,7 @@ def train_mole_page():
                 "top_k": int(top_k.value or 2),
                 "target_modules": list(targets.value),
                 "corpora": list(corp_sel.value),
-                "domains": None,
+                "domains": domains_sel,
                 "seq_len": seq,
                 "epochs": n_epochs,
                 "micro_batch": mb,
@@ -321,6 +337,7 @@ def train_mole_page():
             el.on_value_change(lambda _: update_plan())
         method.on_value_change(lambda _: update_quant_visibility())
         corp_sel.on_value_change(lambda _: update_data_summary())
+        dom_filter.on_value_change(lambda _: update_data_summary())
         start_btn.on_click(on_start)
 
         update_plan()
