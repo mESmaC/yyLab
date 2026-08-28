@@ -40,12 +40,21 @@ def _make_sample(tokenizer, rng: random.Random, filler_tokens: int, mode: str) -
     fact = f"The voltage reading on channel {chan} was {num} volts during the overnight test."
     if mode == "exact":
         x = f"Therefore, the voltage reading on channel {chan} was {num} volts."
-    else:
+    elif mode == "paraphrase":
         x = rng.choice(
             [
                 f"So sensor {chan} logged {num} V.",
                 f"Probe {chan} measured {num} V overall.",
                 f"Unit {chan} recorded {num} V.",
+            ]
+        )
+    else:  # deanchor: no exact number, no channel referent in X
+        rounded = int(round(num))
+        x = rng.choice(
+            [
+                f"That sensor came in at about {rounded} volts.",
+                f"The probe settled near {rounded} volts.",
+                f"It read roughly {rounded} volts.",
             ]
         )
     fact_ids = tokenizer(fact, add_special_tokens=False)["input_ids"]
@@ -214,7 +223,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Predictive-gain memory experiment")
     ap.add_argument("--ref", default="Qwen/Qwen2.5-0.5B-Instruct")
     ap.add_argument("--quant", default="nf4")
-    ap.add_argument("--mode", default="paraphrase", choices=["exact", "paraphrase"])
+    ap.add_argument("--mode", default="paraphrase", choices=["exact", "paraphrase", "deanchor"])
     ap.add_argument("--retriever", default="st", choices=["st", "llm"])
     ap.add_argument("--st-model", default=DEFAULT_ST_MODEL)
     ap.add_argument("--samples", type=int, default=8)
