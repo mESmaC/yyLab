@@ -11,7 +11,8 @@ from ...mole.inject import DEFAULT_TARGET_MODULES
 from ...train.data import estimate_steps
 from ...train.planner import PlanInput, plan_training
 from ...workers.launch import launch_worker
-from ..shell import panel, shell
+from ..components import field_grid, form_section, hint
+from ..shell import ACCENT, panel, shell
 
 
 def render_plan(container, params_b: float, seq_len: int, method: str, quant: str, rank: int, num_experts: int) -> None:
@@ -78,15 +79,16 @@ def corpus_domains(cid: str) -> set[str]:
 
 @ui.page("/train/mole")
 def train_mole_page():
-
     with shell("Train · Mixture of LoRA Experts", "/train/mole"):
         ui.label("Adapter training (frozen base, MoLE)").classes("text-xl font-semibold")
+        ui.label("Train a set of LoRA experts + a top-K router over a frozen checkpoint.").classes(
+            "text-sm text-gray-400 -mt-2"
+        )
 
         ckpts = {c["id"]: f'{c["name"]} ({c["params_b"]:.2f} B)' if c["params_b"] else c["name"] for c in db.q("SELECT * FROM checkpoints ORDER BY name")}
         corpora = corpus_options()
 
         if not ckpts or not corpora:
-
             missing = []
             if not ckpts:
                 missing.append(("a checkpoint", "/checkpoints"))
@@ -95,23 +97,39 @@ def train_mole_page():
             with panel():
                 with ui.row().classes("items-center gap-3"):
                     ui.icon("info", size="20px").classes("text-amber-400")
-                    ui.label(
-                        "Before training you need " + " and ".join(m[0] for m in missing) + "."
-                    ).classes("text-sm text-gray-300")
+                    ui.label("Before training you need " + " and ".join(m[0] for m in missing) + ".").classes(
+                        "text-sm text-gray-300"
+                    )
                     for label, path in missing:
                         ui.button("Add " + label.split()[-1], on_click=lambda _, p=path: ui.navigate.to(p)).props(
                             "dense no-caps outline"
                         )
 
         with ui.row().classes("w-full gap-4 items-start flex-wrap"):
-            with panel().classes("w-[440px]"):
-                ui.label("Setup").classes("text-base font-semibold mb-2")
+            with panel().classes("w-[560px] shrink-0"):
+                form_section("1", "Model")
                 name_in = ui.input("Adapter name", placeholder="auto").props("dense outlined").classes("w-full")
                 ckpt_sel = ui.select(ckpts, label="Base checkpoint (frozen)").props("dense outlined").classes("w-full")
+                with field_grid(2):
+                    method = ui.select(
+                        {"auto": "Auto (recommended)", "qlora": "QLoRA (4-bit base)", "lora": "LoRA (bf16 base)"},
+                        value="auto",
+                        label="Training method",
+                    ).props("dense outlined").classes("w-full")
+                    quant = ui.select(
+                        {"nf4": "NF4", "int8": "INT8", "fp8": "FP8"},
+                        value="nf4",
+                        label="Base quant (locked)",
+                    ).props("dense outlined").classes("w-full")
+                hint("Quant is locked to this checkpoint+adapter pair for the adapter's lifetime — no drift.")
+
+                ui.separator().classes("my-3")
+                form_section("2", "Training data")
                 corp_sel = ui.select(corpora, multiple=True, label="Corpora").props(
                     "dense outlined use-chips"
                 ).classes("w-full")
-                with ui.row().classes("gap-2"):
+                with ui.row().classes("items-center gap-2 -mt-1"):
+                    ui.label("Quick pick:").classes("text-xs text-gray-500")
                     for dom in ("code", "math", "language", "all"):
                         def pick(dom=dom):
                             if dom == "all":
@@ -119,70 +137,60 @@ def train_mole_page():
                             else:
                                 corp_sel.value = [cid for cid in corpora if dom in corpus_domains(cid)]
                             corp_sel.update()
-                        ui.button(dom, on_click=pick).props("dense flat no-caps")
-                ui.label("Domain quick-picks select all corpora containing that domain.").classes(
-                    "text-xs text-gray-500"
-                )
+                            update_data_summary()
+                        ui.button(dom, on_click=pick).props("dense flat no-caps size=sm")
+                data_lbl = ui.label("Select corpora to see totals.").classes(
+                    "text-xs text-gray-400 px-3 py-2 rounded-md w-full"
+                ).style(f"background: {ACCENT}10")
 
                 ui.separator().classes("my-3")
-                with ui.row().classes("w-full gap-3"):
-                    n_exp = ui.number("Experts", value=4, min=1, max=16).props("dense outlined").classes("w-24")
-                    top_k = ui.number("Top-K active", value=2, min=1, max=16).props("dense outlined").classes("w-28")
-                    rank = ui.number("Rank", value=16, min=1, max=256).props("dense outlined").classes("w-24")
-                with ui.row().classes("w-full gap-3"):
-                    seq_sel = ui.select([512, 1024, 2048, 4096, 8192], value=2048, label="Seq length").props(
-                        "dense outlined"
-                    ).classes("w-28")
-                    epochs = ui.number("Epochs", value=1, min=1, max=20).props("dense outlined").classes("w-24")
-                    lr = ui.select([1e-4, 3e-4, 5e-5, 1e-5], value=3e-4, label="LR").props("dense outlined").classes("w-28")
+                form_section("3", "Expert architecture", "y = W_frozen(x) + Σ gₖ(x)·(BₖAₖx)")
+                with field_grid(3):
+                    n_exp = ui.number("Experts", value=4, min=1, max=16).props("dense outlined").classes("w-full")
+                    top_k = ui.number("Top-K active", value=2, min=1, max=16).props("dense outlined").classes("w-full")
+                    rank = ui.number("Rank", value=16, min=1, max=256).props("dense outlined").classes("w-full")
                 targets = ui.select(
                     list(DEFAULT_TARGET_MODULES),
                     multiple=True,
                     value=list(DEFAULT_TARGET_MODULES),
                     label="Target modules",
                 ).props("dense outlined use-chips").classes("w-full")
-                with ui.row().classes("w-full gap-3"):
-                    micro_bs = ui.number("Micro batch", value=1, min=1, max=16).props("dense outlined").classes("w-28")
-                    grad_accum = ui.number("Grad accum", value=16, min=1, max=256).props("dense outlined").classes("w-28")
-                    aux_w = ui.number("Aux loss w", value=0.01, min=0, max=1, step=0.005).props(
-                        "dense outlined"
-                    ).classes("w-28")
+
                 ui.separator().classes("my-3")
-                method = ui.select(
-                    {"auto": "Auto (recommended)", "qlora": "QLoRA (4-bit base)", "lora": "LoRA (bf16 base)"},
-                    value="auto",
-                    label="Training method",
-                ).props("dense outlined").classes("w-full")
-                quant = ui.select(
-                    {"nf4": "NF4", "int8": "INT8", "fp8": "FP8"},
-                    value="nf4",
-                    label="Base quantization (locked for this adapter)",
-                ).props("dense outlined").classes("w-full")
-                ui.label(
-                    "The quant chosen here is locked to the checkpoint+adapter pair for the adapter's lifetime — no quant drift between adapters."
-                ).classes("text-xs text-gray-500")
+                form_section("4", "Training run")
+                with field_grid(3):
+                    seq_sel = ui.select([512, 1024, 2048, 4096, 8192], value=2048, label="Seq length").props(
+                        "dense outlined"
+                    ).classes("w-full")
+                    epochs = ui.number("Epochs", value=1, min=1, max=20).props("dense outlined").classes("w-full")
+                    lr = ui.select([1e-4, 3e-4, 5e-5, 1e-5], value=3e-4, label="Learning rate").props(
+                        "dense outlined"
+                    ).classes("w-full")
+                with ui.expansion("Advanced", icon="tune").classes("w-full"):
+                    with field_grid(3):
+                        micro_bs = ui.number("Micro batch", value=1, min=1, max=16).props("dense outlined").classes("w-full")
+                        grad_accum = ui.number("Grad accum", value=16, min=1, max=256).props("dense outlined").classes("w-full")
+                        aux_w = ui.number("Aux loss w", value=0.01, min=0, max=1, step=0.005).props(
+                            "dense outlined"
+                        ).classes("w-full")
 
-                start_btn = ui.button("Start training", icon="play_arrow").props("no-caps unelevated").classes("w-full mt-3")
-                ui.label("Runs in a background worker process — follow progress on the Runs page.").classes(
-                    "text-xs text-gray-500"
+                start_btn = ui.button("Start training", icon="play_arrow").props("no-caps unelevated").classes(
+                    "w-full mt-4"
                 )
+                hint("Runs in a background worker — follow live progress on the Runs page.")
 
-            with ui.column().classes("flex-1 gap-4 min-w-[380px]"):
+            with ui.column().classes("flex-1 gap-4 min-w-[360px]"):
                 with panel():
                     ui.label("Auto training plan").classes("text-base font-semibold mb-2")
                     plan_box = ui.column().classes("w-full gap-1")
-
                 with panel():
-                    ui.label("MoLE architecture").classes("text-base font-semibold mb-2")
-                    ui.label(
-                        "y = W_frozen(x) + Σ_k g_k(x) · (B_k A_k x). Each expert is a rank-r LoRA branch; a per-layer router "
-                        "selects top-K experts per token. Stage 1 trains experts (+router), stage 2 refines the router only. "
-                        "Weights are stored as plain safetensors + JSON config, fully RL-friendly."
-                    ).classes("text-sm text-gray-300")
-
-                with panel():
-                    ui.label("Training data summary").classes("text-base font-semibold mb-2")
-                    data_lbl = ui.label("Select corpora to see totals.").classes("text-sm text-gray-400")
+                    with ui.expansion("What is MoLE?", icon="help_outline").classes("w-full"):
+                        ui.label(
+                            "Each target linear layer gets E low-rank LoRA experts plus a per-layer router that picks the "
+                            "top-K experts for every token. Stage 1 co-trains experts + router from a zero-init gate "
+                            "(uniform routing); stage 2 (Router page) refines only the router. Weights are plain "
+                            "safetensors + JSON — fully RL-friendly."
+                        ).classes("text-sm text-gray-300")
 
         def params_b_of() -> float:
             cid = ckpt_sel.value

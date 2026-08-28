@@ -62,6 +62,24 @@ def confirm(title: str, message: str, on_confirm, confirm_label: str = "Delete",
     return dlg
 
 
+def form_section(step: str, title: str, sub: str = ""):
+    with ui.row().classes("w-full items-center gap-2 mt-1"):
+        ui.label(step).classes(
+            "w-5 h-5 items-center justify-center rounded-full text-[11px] font-bold shrink-0"
+        ).style(f"background: {ACCENT}2e; color: {ACCENT}; display: flex")
+        ui.label(title).classes("text-sm font-semibold text-gray-200")
+    if sub:
+        ui.label(sub).classes("text-xs text-gray-500 ml-7 -mt-0.5")
+
+
+def hint(text: str):
+    ui.label(text).classes("text-xs text-gray-500")
+
+
+def field_grid(cols: int = 3):
+    return ui.grid(columns=cols).classes("w-full gap-3")
+
+
 def drive_roots() -> list[str]:
     return [f"{d}:\\" for d in string.ascii_uppercase if Path(f"{d}:\\").exists()]
 

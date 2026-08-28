@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import json
 
+import orjson
 from nicegui import ui
 
 from ... import db
 from ...hw import best_gpu
 from ...train.data import estimate_steps
 from ...workers.launch import launch_worker
-from ..shell import panel, shell
+from ..components import field_grid, form_section, hint
+from ..shell import ACCENT, panel, shell
 from .train_mole import corpus_options, render_plan
 
 
@@ -16,48 +18,66 @@ from .train_mole import corpus_options, render_plan
 def train_base_page():
     with shell("Train · Base", "/train/base"):
         ui.label("Trainable base (continued pretraining / finetune)").classes("text-xl font-semibold")
+        ui.label(
+            "Full fine-tunes become new checkpoints to build expert adapters on. LoRA/QLoRA become adapters."
+        ).classes("text-sm text-gray-400 -mt-2")
 
         ckpts = {c["id"]: f'{c["name"]} ({c["params_b"]:.2f} B)' if c["params_b"] else c["name"] for c in db.q("SELECT * FROM checkpoints ORDER BY name")}
         corpora = corpus_options()
 
         with ui.row().classes("w-full gap-4 items-start flex-wrap"):
-            with panel().classes("w-[440px]"):
-                ui.label("Setup").classes("text-base font-semibold mb-2")
+            with panel().classes("w-[560px] shrink-0"):
+                form_section("1", "Model")
                 name_in = ui.input("Output name", placeholder="auto").props("dense outlined").classes("w-full")
                 ckpt_sel = ui.select(ckpts, label="Checkpoint to train").props("dense outlined").classes("w-full")
+                with field_grid(2):
+                    method = ui.select(
+                        {
+                            "auto": "Auto (recommended)",
+                            "full": "Full fine-tune",
+                            "lora": "LoRA",
+                            "qlora": "QLoRA",
+                        },
+                        value="auto",
+                        label="Method",
+                    ).props("dense outlined").classes("w-full")
+                    quant = ui.select(
+                        {"nf4": "NF4", "int8": "INT8", "fp8": "FP8"}, value="nf4", label="Quant (QLoRA)"
+                    ).props("dense outlined").classes("w-full")
+
+                ui.separator().classes("my-3")
+                form_section("2", "Training data")
                 corp_sel = ui.select(corpora, multiple=True, label="Corpora").props(
                     "dense outlined use-chips"
                 ).classes("w-full")
-                method = ui.select(
-                    {
-                        "auto": "Auto (recommended)",
-                        "full": "Full fine-tune",
-                        "lora": "LoRA",
-                        "qlora": "QLoRA",
-                    },
-                    value="auto",
-                    label="Method",
-                ).props("dense outlined").classes("w-full")
-                quant = ui.select({"nf4": "NF4", "int8": "INT8", "fp8": "FP8"}, value="nf4", label="Quant (QLoRA)").props(
-                    "dense outlined"
-                ).classes("w-full")
-                with ui.row().classes("w-full gap-3"):
+                data_lbl = ui.label("Select corpora to see totals.").classes(
+                    "text-xs text-gray-400 px-3 py-2 rounded-md w-full"
+                ).style(f"background: {ACCENT}10")
+
+                ui.separator().classes("my-3")
+                form_section("3", "Training run")
+                with field_grid(3):
                     seq_sel = ui.select([512, 1024, 2048, 4096, 8192, 16384], value=2048, label="Context window").props(
                         "dense outlined"
-                    ).classes("w-32")
-                    epochs = ui.number("Epochs", value=1, min=1, max=20).props("dense outlined").classes("w-24")
-                    lr = ui.select([1e-4, 3e-4, 5e-5, 1e-5, 5e-6], value=5e-5, label="LR").props("dense outlined").classes("w-28")
-                with ui.row().classes("w-full gap-3"):
-                    rank = ui.number("LoRA rank", value=32, min=1, max=256).props("dense outlined").classes("w-28")
-                    micro_bs = ui.number("Micro batch", value=1, min=1, max=16).props("dense outlined").classes("w-28")
-                    grad_accum = ui.number("Grad accum", value=16, min=1, max=256).props("dense outlined").classes("w-28")
-                start_btn = ui.button("Start training", icon="play_arrow").props("no-caps unelevated").classes("w-full mt-3")
-                ui.label(
-                    "Full fine-tunes become new checkpoints to train expert adapters on. LoRA/QLoRA become adapters. "
-                    "Runs in a background worker."
-                ).classes("text-xs text-gray-500")
+                    ).classes("w-full")
+                    epochs = ui.number("Epochs", value=1, min=1, max=20).props("dense outlined").classes("w-full")
+                    lr = ui.select([1e-4, 3e-4, 5e-5, 1e-5, 5e-6], value=5e-5, label="Learning rate").props(
+                        "dense outlined"
+                    ).classes("w-full")
+                rank = ui.number("LoRA rank (LoRA/QLoRA)", value=32, min=1, max=256).props(
+                    "dense outlined"
+                ).classes("w-full")
+                with ui.expansion("Advanced", icon="tune").classes("w-full"):
+                    with field_grid(2):
+                        micro_bs = ui.number("Micro batch", value=1, min=1, max=16).props("dense outlined").classes("w-full")
+                        grad_accum = ui.number("Grad accum", value=16, min=1, max=256).props("dense outlined").classes("w-full")
 
-            with ui.column().classes("flex-1 gap-4 min-w-[380px]"):
+                start_btn = ui.button("Start training", icon="play_arrow").props("no-caps unelevated").classes(
+                    "w-full mt-4"
+                )
+                hint("Runs in a background worker — follow live progress on the Runs page.")
+
+            with ui.column().classes("flex-1 gap-4 min-w-[360px]"):
                 with panel():
                     ui.label("Auto training plan").classes("text-base font-semibold mb-2")
                     plan_box = ui.column().classes("w-full gap-1")
@@ -78,6 +98,21 @@ def train_base_page():
                 rank=int(rank.value or 32),
                 num_experts=1,
             )
+
+        def update_data_summary() -> None:
+            sel = corp_sel.value or []
+            if not sel:
+                data_lbl.text = "Select corpora to see totals."
+                return
+            docs = chars = 0
+            for cid in sel:
+                row = db.q1("SELECT stats_json FROM corpora WHERE id=?", (cid,))
+                if not row:
+                    continue
+                stats = orjson.loads(row["stats_json"] or b"{}")
+                docs += stats.get("docs_written", 0)
+                chars += stats.get("chars_written", 0)
+            data_lbl.text = f"{len(sel)} corpora · {docs:,} docs · {chars / 1e9:.2f}B chars"
 
         def resolve_method() -> tuple[str, str]:
             m = method.value
@@ -164,5 +199,6 @@ def train_base_page():
 
         for el in (ckpt_sel, method, seq_sel, quant):
             el.on_value_change(lambda _: update_plan())
+        corp_sel.on_value_change(lambda _: update_data_summary())
         start_btn.on_click(on_start)
         update_plan()
