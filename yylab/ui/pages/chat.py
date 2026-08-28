@@ -288,12 +288,14 @@ def chat_page():
             threading.Thread(target=gen_worker, daemon=True).start()
 
         def on_stop() -> None:
+            ENGINE.cancel()
             if stream_state["active"]:
                 stream_state["active"] = False
                 buf = stream_state["buf"]
                 messages.append({"role": "assistant", "content": buf})
                 finish_assistant(buf)
                 send_btn.enable()
+                ui.notify("Generation stopped", type="info")
 
         def on_clear() -> None:
             messages.clear()

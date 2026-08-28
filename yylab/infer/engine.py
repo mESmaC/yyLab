@@ -85,6 +85,10 @@ class Engine:
         self.device: str = "cpu"
         self.cuda = False
         self._lock = threading.Lock()
+        self._cancel = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel.set()
 
     def is_loaded(self) -> bool:
         return self.model is not None
@@ -183,6 +187,16 @@ class Engine:
         cache_kwargs, cache_notes = _cache_kwargs(settings, self.cuda)
         self.notes.extend(cache_notes)
         kwargs.update(cache_kwargs)
+
+        from transformers import StoppingCriteria, StoppingCriteriaList
+
+        cancel_event = self._cancel
+
+        class _Cancel(StoppingCriteria):
+            def __call__(self, input_ids, scores, **_kw) -> bool:
+                return cancel_event.is_set()
+
+        kwargs["stopping_criteria"] = StoppingCriteriaList([_Cancel()])
         return kwargs
 
     def generate_stream(
@@ -194,6 +208,7 @@ class Engine:
     ) -> Iterator[str]:
         if not self.is_loaded():
             raise RuntimeError("no model loaded")
+        self._cancel.clear()
 
         prompt = format_messages(self.tokenizer, messages)
         enc = self.tokenizer(prompt, return_tensors="pt")

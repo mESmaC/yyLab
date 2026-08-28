@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
 from nicegui import ui
@@ -122,12 +123,17 @@ def checkpoints_page():
                             ui.label(
                                 f'· {a["name"]} — {a["arch"]} E={a["num_experts"]} k={a["top_k"]} r={a["rank"]} quant={a["quant"]} [{a["status"]}]'
                             ).classes("text-xs text-gray-400")
-                            if a["status"] == "trained":
+                            with ui.row().classes("items-center gap-1"):
+                                if a["status"] == "trained":
+                                    ui.button(
+                                        "Export merged",
+                                        icon="ios_share",
+                                        on_click=lambda _, a=a: export_adapter(c, a),
+                                    ).props("dense flat no-caps")
                                 ui.button(
-                                    "Export merged",
-                                    icon="ios_share",
-                                    on_click=lambda _, a=a: export_adapter(c, a),
-                                ).props("dense flat no-caps")
+                                    icon="delete",
+                                    on_click=lambda _, a=a: ask_delete_adapter(a),
+                                ).props("dense flat no-caps color=negative").tooltip("Delete adapter + its routers")
 
         def export_adapter(ckpt_row: dict, a: dict) -> None:
             router = db.q1(
@@ -191,6 +197,44 @@ def checkpoints_page():
             rm_state["cid"] = cid
             rm_msg.text = f'Remove "{name}" from the registry?'
             rm_dlg.open()
+
+        def delete_adapter(aid: str) -> None:
+            for r in db.q("SELECT id, path FROM routers WHERE adapter_id=?", (aid,)):
+                if r["path"]:
+                    shutil.rmtree(r["path"], ignore_errors=True)
+                db.execute("DELETE FROM routers WHERE id=?", (r["id"],))
+            a = db.q1("SELECT path FROM adapters WHERE id=?", (aid,))
+            if a and a["path"]:
+                shutil.rmtree(a["path"], ignore_errors=True)
+            db.execute("DELETE FROM adapters WHERE id=?", (aid,))
+            ui.notify("Adapter and its routers deleted", type="info")
+            render_detail()
+
+        adp_state: dict = {"aid": None}
+        with ui.dialog() as adp_dlg, ui.card().classes("w-[440px] p-4").style(
+            "background: #16161d; border: 1px solid #262633"
+        ):
+            ui.label("Delete adapter?").classes("text-base font-semibold")
+            adp_msg = ui.label("").classes("text-sm text-gray-400 mt-1")
+            ui.label(
+                "Removes the adapter and any router snapshots trained on it, including their files on disk."
+            ).classes("text-xs text-gray-500 mt-1")
+            with ui.row().classes("w-full justify-end gap-2 mt-4"):
+                ui.button("Cancel", on_click=adp_dlg.close).props("flat dense no-caps")
+
+                def do_delete_adapter() -> None:
+                    adp_dlg.close()
+                    if adp_state["aid"]:
+                        delete_adapter(adp_state["aid"])
+
+                ui.button("Delete", on_click=do_delete_adapter).props("dense no-caps color=negative")
+
+        def ask_delete_adapter(a: dict) -> None:
+            adp_state["aid"] = a["id"]
+            n_routers = db.q1("SELECT COUNT(*) n FROM routers WHERE adapter_id=?", (a["id"],))["n"]
+            extra = f" and {n_routers} router snapshot(s)" if n_routers else ""
+            adp_msg.text = f'Delete "{a["name"]}"{extra}?'
+            adp_dlg.open()
 
         with ui.dialog() as add_dlg, ui.card().classes("w-[560px]").style("background: #16161d; border: 1px solid #262633"):
             ui.label("Add checkpoint").classes("text-base font-semibold")

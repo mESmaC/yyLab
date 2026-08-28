@@ -153,6 +153,11 @@ E=4 r=8 k=2 (18.6 M trainable) stage 1, then router stage 2.
 - Streaming: `TextIteratorStreamer` in a thread; chat page drains a queue via
   `ui.timer` into message bubbles. Chat template via
   `apply_chat_template` with a plain-text fallback.
+- Stop: chat Stop calls `ENGINE.cancel()`, which sets an event checked by a
+  `StoppingCriteria` so `generate()` halts on the next token (frees the GPU
+  instead of just abandoning the stream).
+- KV-cache modes (dynamic / quantized-int8 / sliding-window / static) are all
+  validated on-device; a failing cache falls back to dynamic automatically.
 
 Validated on RTX 2050: Qwen2.5-0.5B NF4 + trained MoLE adapter + router
 snapshot → coherent streaming replies.

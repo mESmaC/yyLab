@@ -108,6 +108,21 @@ def test_engine_with_mole_adapter(tmp_path, monkeypatch):
     assert isinstance("".join(chunks), str)
 
 
+def test_engine_cancel(tmp_path, monkeypatch):
+    model_dir = _fake_loader(tmp_path, monkeypatch)
+    eng = Engine()
+    eng.load(LoadSpec(ref=str(model_dir), quant="bf16"))
+    gen = eng.generate_stream(
+        [{"role": "user", "content": "hi"}], temperature=0.0, max_new_tokens=200
+    )
+    got = 0
+    for _chunk in gen:
+        got += 1
+        if got >= 2:
+            eng.cancel()
+    assert got < 50
+
+
 def test_engine_context_budget(tmp_path, monkeypatch):
     model_dir = _fake_loader(tmp_path, monkeypatch)
     eng = Engine()
