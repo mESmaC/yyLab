@@ -20,7 +20,13 @@ yylab/
     inject.py      model surgery + stage freezing (experts/router/both)
     losses.py      switch-style load-balance aux loss
     store.py       safetensors save/load (RL-friendly format)
-  train/planner.py VRAM-aware auto method picker (full/lora/qlora)
+  train/
+    planner.py     VRAM-aware auto method picker (full/lora/qlora)
+    data.py        shard streaming + EOS-packed sequence batches
+    loop.py        generic training loop (metrics, aux loss, saves)
+  workers/         detached training subprocesses (train.py, launch.py)
+  models/loading.py  shared base loader (bnb quant, SDPA, RoPE scaling)
+  infer/engine.py  chat inference engine (base + MoLE/LoRA + router, KV settings)
   ui/              NiceGUI app shell + pages
 ```
 
@@ -129,9 +135,30 @@ early when packed data is exhausted.
 Validated end-to-end on an RTX 2050 (4 GB): Qwen2.5-0.5B-Instruct NF4,
 E=4 r=8 k=2 (18.6 M trainable) stage 1, then router stage 2.
 
+## Inference engine + chat (phase 3)
+
+`yylab/infer/engine.py` holds a singleton `ENGINE` in the GUI process:
+
+- `LoadSpec` = checkpoint ref + quant (adapter quant / checkpoint quant-lock /
+  auto) + optional MoLE adapter dir + optional router snapshot dir + engine
+  settings. Router snapshot overrides the adapter's router weights.
+- Load path: `models/loading.load_base` (NF4/INT8 via bitsandbytes, SDPA
+  attention, optional RoPE scaling) → inject MoLE + apply safetensors →
+  `set_stage("none")` → eval. PEFT path for LoRA adapters.
+- Engine settings from `settings.json`: attention impl, KV cache
+  (dynamic / quantized-int8 / sliding-window / static), max context budget,
+  RoPE factor. Cache kwargs are passed to `generate()` and auto-fall back to
+  dynamic cache on error.
+- Streaming: `TextIteratorStreamer` in a thread; chat page drains a queue via
+  `ui.timer` into message bubbles. Chat template via
+  `apply_chat_template` with a plain-text fallback.
+
+Validated on RTX 2050: Qwen2.5-0.5B NF4 + trained MoLE adapter + router
+snapshot → coherent streaming replies.
+
 ## Phases
 
 - [x] 1. Scaffold, artifact store, corpora intake + UI, planner, MoLE core
 - [x] 2. Training runtime (MoLE stage 1, router stage 2, base training)
-- [ ] 3. Inference engine + chat (base + adapter + router, KV settings)
+- [x] 3. Inference engine + chat (base + adapter + router, KV settings)
 - [ ] 4. RL export hardening (merged checkpoint export, GGUF)

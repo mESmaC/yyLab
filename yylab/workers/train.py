@@ -19,38 +19,9 @@ def log(msg: str) -> None:
 
 
 def load_base(ref: str, quant: str):
-    import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+    from ..models.loading import load_base as _load_base
 
-    notes: list[str] = []
-    cuda = torch.cuda.is_available()
-    tokenizer = AutoTokenizer.from_pretrained(ref)
-    if tokenizer.pad_token is None and tokenizer.eos_token is not None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    kwargs: dict = {"attn_implementation": "sdpa"}
-    if quant == "fp8":
-        quant = "nf4"
-        notes.append("FP8 base weights unavailable in the loader; fell back to NF4.")
-    if cuda and quant == "nf4":
-        kwargs["quantization_config"] = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True,
-        )
-        kwargs["dtype"] = torch.bfloat16
-    elif cuda and quant == "int8":
-        kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
-        kwargs["dtype"] = torch.bfloat16
-    else:
-        kwargs["dtype"] = torch.bfloat16 if cuda else torch.float32
-        if not cuda and quant not in {"bf16", "fp16", ""}:
-            notes.append("No CUDA GPU: quantization disabled, using fp32 on CPU (slow).")
-    if cuda:
-        kwargs["device_map"] = {"": 0}
-
-    model = AutoModelForCausalLM.from_pretrained(ref, **kwargs)
+    model, tokenizer, cuda, quant, notes = _load_base(ref, quant)
     model.config.use_cache = False
     return model, tokenizer, cuda, quant, notes
 

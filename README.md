@@ -31,6 +31,9 @@ Artifacts live in `./artifacts` (override with `YYLAB_HOME`).
   full/LoRA/QLoRA + batch/accum/grad-ckpt/offload/compile automatically.
 - **Context & KV cache** — SDPA attention, dynamic/quantized/sliding-window
   caches, RoPE scaling for context extension.
+- **Chat** — load checkpoint (+ adapter + router snapshot), streaming
+  generation, temperature/top-p/max-tokens controls, KV/context settings
+  applied at load.
 - **RL-friendly artifacts** — everything is plain safetensors + JSON.
 
 Docs: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
