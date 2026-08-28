@@ -45,34 +45,56 @@ def _rope_scaling(settings: dict) -> dict | None:
     kind = settings.get("rope_scaling", "none")
     factor = float(settings.get("rope_factor", 2.0) or 2.0)
     if kind == "linear":
-        return {"type": "linear", "factor": factor}
-    if kind == "dynamic":
-        return {"type": "dynamic", "factor": factor}
+        return {"rope_type": "linear", "factor": factor}
+    if kind in {"yarn", "dynamic"}:
+        return {"rope_type": "yarn", "factor": factor}
     return None
 
 
 def _cache_kwargs(settings: dict, cuda: bool) -> tuple[dict, list[str]]:
     notes: list[str] = []
     impl = settings.get("cache_implementation", "dynamic")
+    max_ctx = int(settings.get("max_context_tokens", 8192) or 8192)
+    chunk = int(settings.get("prefill_chunk_size", 8192) or 8192)
     if impl == "dynamic" or not cuda:
+        if impl != "dynamic" and not cuda:
+            notes.append("CPU inference: using dynamic cache.")
         return {}, notes
+    if impl == "offloaded":
+        notes.append("KV cache offloaded to CPU RAM (dynamic).")
+        return {"cache_implementation": "offloaded"}, notes
+    if impl == "offloaded_static":
+        notes.append("KV cache offloaded to CPU RAM (static, chunked prefill).")
+        return {
+            "cache_implementation": "offloaded_static",
+            "max_cache_len": max_ctx,
+            "prefill_chunk_size": chunk,
+        }, notes
+    if impl == "static":
+        return {
+            "cache_implementation": "static",
+            "max_cache_len": max_ctx,
+            "prefill_chunk_size": chunk,
+        }, notes
     if impl == "quantized":
         kvq = settings.get("kv_quant", "int8")
         if kvq == "none":
             return {}, notes
         if kvq == "fp8":
             notes.append("FP8 KV requested; using INT8 KV quantization.")
+            nbits = 8
+        else:
+            nbits = 8 if kvq == "int8" else 4
+        notes.append(f"KV cache quantized to {nbits}-bit.")
         return {
             "cache_implementation": "quantized",
-            "cache_config": {"nbits": 8, "device": "cuda"},
+            "cache_config": {"nbits": nbits, "q_group_size": 64, "residual_length": 128},
         }, notes
     if impl == "sliding_window":
         return {
             "cache_implementation": "sliding_window",
             "cache_config": {"window_size": int(settings.get("sliding_window", 4096))},
         }, notes
-    if impl == "static":
-        return {"cache_implementation": "static"}, notes
     return {}, notes
 
 
@@ -89,6 +111,22 @@ class Engine:
 
     def cancel(self) -> None:
         self._cancel.set()
+
+    def nll_ids(self, prefix_ids, target_ids) -> float:
+        import torch
+
+        if not self.is_loaded():
+            raise RuntimeError("no model loaded")
+        t = list(target_ids)
+        if not t:
+            return 0.0
+        p = list(prefix_ids)
+        dev = torch.device(self.device)
+        input_ids = torch.tensor([p + t], dtype=torch.long, device=dev)
+        labels = torch.tensor([[-100] * len(p) + t], dtype=torch.long, device=dev)
+        with torch.no_grad():
+            out = self.model(input_ids=input_ids, labels=labels)
+        return float(out.loss.item())
 
     def is_loaded(self) -> bool:
         return self.model is not None
