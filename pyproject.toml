@@ -1,0 +1,72 @@
+[project]
+name = "yylab"
+version = "0.1.0"
+description = "yyLab: corpus engineering + Mixture-of-LoRA-Experts training lab GUI"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "nicegui>=2.14",
+    "torch>=2.8",
+    "triton-windows>=3.2; sys_platform == 'win32'",
+    "transformers>=4.55",
+    "tokenizers>=0.21",
+    "peft>=0.16",
+    "trl>=0.19",
+    "accelerate>=1.7",
+    "bitsandbytes>=0.46",
+    "datasets>=3.6",
+    "safetensors>=0.5",
+    "tiktoken>=0.9",
+    "sentencepiece>=0.2",
+    "protobuf>=5",
+    "mistral-common>=1.5",
+    "datasketch>=1.6",
+    "xxhash>=3.5",
+    "zstandard>=0.23",
+    "orjson>=3.10",
+    "pyarrow>=20",
+    "nvidia-ml-py>=12",
+    "psutil>=7",
+    "quanto>=0.2",
+    "pydantic>=2.11",
+    "numpy>=2",
+    "rich>=14",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "ruff>=0.11",
+]
+
+[project.scripts]
+yylab = "yylab.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["yylab"]
+
+[tool.uv]
+package = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
