@@ -8,7 +8,7 @@ dependencies = [
     "nicegui>=2.14",
     "torch>=2.8",
     "triton-windows>=3.2; sys_platform == 'win32'",
-    "transformers>=4.55",
+    "transformers>=5.0",
     "tokenizers>=0.21",
     "peft>=0.16",
     "trl>=0.19",

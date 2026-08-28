@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+import torch
 from torch import nn
 
 from .layer import MoLELinear
@@ -53,13 +54,15 @@ def _parent_and_attr(model: nn.Module, dotted: str) -> tuple[nn.Module, str]:
     return parent, parts[-1]
 
 
-def inject_mole(model: nn.Module, cfg: MoLEConfig) -> list[tuple[str, MoLELinear]]:
+def inject_mole(
+    model: nn.Module, cfg: MoLEConfig, expert_dtype: torch.dtype | None = None
+) -> list[tuple[str, MoLELinear]]:
     replaced: list[tuple[str, MoLELinear]] = []
     targets = set(cfg.target_modules)
     for name, module in list(model.named_modules()):
         if isinstance(module, nn.Linear) and name.split(".")[-1] in targets:
             parent, attr = _parent_and_attr(model, name)
-            mole = MoLELinear(module, cfg.num_experts, cfg.rank, cfg.alpha, cfg.top_k)
+            mole = MoLELinear(module, cfg.num_experts, cfg.rank, cfg.alpha, cfg.top_k, expert_dtype=expert_dtype)
             setattr(parent, attr, mole)
             replaced.append((name, mole))
     return replaced

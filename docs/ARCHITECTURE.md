@@ -104,9 +104,34 @@ Then register the class in `adapters/loader.py::_ADAPTER_CLASSES`.
 max context, RoPE scaling. Consumed by the inference engine (phase 4) and
 used as training context defaults.
 
+## Training runtime (phase 2)
+
+Training runs in detached subprocess workers (`python -m yylab.workers.train
+--run <id>`), launched from the UI via `workers/launch.py`. Workers stream to
+`runs/<id>/train.log`, write `progress.json` (live step/loss) and
+`metrics.jsonl`, and update the `runs` table — the Runs page polls both.
+
+Run kinds:
+
+- `mole_stage1` — frozen NF4/INT8/bf16 base → inject MoLE → train experts +
+  router (AdamW8bit, cosine LR, grad-ckpt, aux load-balance loss) → save
+  `adapters/<id>/mole_weights.safetensors`. Enforces the checkpoint quant lock.
+- `router_stage2` — load base + adapter weights → freeze experts → train gates
+  only (top-K may be changed) → save snapshot to `routers/<id>/`.
+- `base` — full FT (saves new checkpoint row) or LoRA/QLoRA via PEFT
+  (`target_modules="all-linear"`, saves adapter row).
+
+Data path: zstd shards → domain filter → buffer-shuffle → tokenize →
+EOS-separated packing into fixed-length sequences → micro batches
+(`train/data.py`). Steps are estimated from corpus char stats; the loop stops
+early when packed data is exhausted.
+
+Validated end-to-end on an RTX 2050 (4 GB): Qwen2.5-0.5B-Instruct NF4,
+E=4 r=8 k=2 (18.6 M trainable) stage 1, then router stage 2.
+
 ## Phases
 
 - [x] 1. Scaffold, artifact store, corpora intake + UI, planner, MoLE core
-- [ ] 2. Training runtime (MoLE stage 1, router stage 2, base training)
+- [x] 2. Training runtime (MoLE stage 1, router stage 2, base training)
 - [ ] 3. Inference engine + chat (base + adapter + router, KV settings)
 - [ ] 4. RL export hardening (merged checkpoint export, GGUF)

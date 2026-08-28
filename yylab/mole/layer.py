@@ -25,14 +25,20 @@ class LoRAExpert(nn.Module):
 
 
 class TopKRouter(nn.Module):
-    def __init__(self, in_features: int, num_experts: int, top_k: int) -> None:
+    def __init__(
+        self,
+        in_features: int,
+        num_experts: int,
+        top_k: int,
+        device: torch.device | None = None,
+    ) -> None:
         super().__init__()
         if not 1 <= top_k <= num_experts:
             raise ValueError("top_k must be within [1, num_experts]")
         self.in_features = in_features
         self.num_experts = num_experts
         self.top_k = top_k
-        self.gate = nn.Linear(in_features, num_experts, bias=False)
+        self.gate = nn.Linear(in_features, num_experts, bias=False, device=device)
         nn.init.zeros_(self.gate.weight)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -50,6 +56,7 @@ class MoLELinear(nn.Module):
         rank: int,
         alpha: float | None = None,
         top_k: int = 2,
+        expert_dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
         self.base = base
@@ -61,6 +68,9 @@ class MoLELinear(nn.Module):
         self.num_experts = num_experts
         self.rank = rank
         self.top_k = min(top_k, num_experts)
+        dtype = expert_dtype or base.weight.dtype
+        if dtype in (torch.uint8, torch.int8):
+            dtype = torch.bfloat16
         self.experts = nn.ModuleList(
             [
                 LoRAExpert(
@@ -68,13 +78,13 @@ class MoLELinear(nn.Module):
                     out_f,
                     rank,
                     alpha if alpha is not None else rank * 2.0,
-                    dtype=base.weight.dtype,
+                    dtype=dtype,
                     device=base.weight.device,
                 )
                 for _ in range(num_experts)
             ]
         )
-        self.router = TopKRouter(in_f, num_experts, self.top_k)
+        self.router = TopKRouter(in_f, num_experts, self.top_k).to(device=base.weight.device)
         self.last_router_logits: torch.Tensor | None = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

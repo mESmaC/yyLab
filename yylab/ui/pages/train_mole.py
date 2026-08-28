@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import json
+
 import orjson
 from nicegui import ui
 
 from ... import db
 from ...hw import best_gpu, has_triton
 from ...mole.inject import DEFAULT_TARGET_MODULES
+from ...train.data import estimate_steps
 from ...train.planner import PlanInput, plan_training
+from ...workers.launch import launch_worker
 from ..shell import panel, shell
 
 
@@ -84,6 +88,7 @@ def train_mole_page():
         with ui.row().classes("w-full gap-4 items-start flex-wrap"):
             with panel().classes("w-[440px]"):
                 ui.label("Setup").classes("text-base font-semibold mb-2")
+                name_in = ui.input("Adapter name", placeholder="auto").props("dense outlined").classes("w-full")
                 ckpt_sel = ui.select(ckpts, label="Base checkpoint (frozen)").props("dense outlined").classes("w-full")
                 corp_sel = ui.select(corpora, multiple=True, label="Corpora").props(
                     "dense outlined use-chips"
@@ -110,17 +115,23 @@ def train_mole_page():
                     seq_sel = ui.select([512, 1024, 2048, 4096, 8192], value=2048, label="Seq length").props(
                         "dense outlined"
                     ).classes("w-28")
-                    ui.number("Epochs", value=1, min=1, max=20).props("dense outlined").classes("w-24")
-                    ui.select([1e-4, 3e-4, 5e-5, 1e-5], value=3e-4, label="LR").props("dense outlined").classes("w-28")
-                ui.select(
+                    epochs = ui.number("Epochs", value=1, min=1, max=20).props("dense outlined").classes("w-24")
+                    lr = ui.select([1e-4, 3e-4, 5e-5, 1e-5], value=3e-4, label="LR").props("dense outlined").classes("w-28")
+                targets = ui.select(
                     list(DEFAULT_TARGET_MODULES),
                     multiple=True,
                     value=list(DEFAULT_TARGET_MODULES),
                     label="Target modules",
                 ).props("dense outlined use-chips").classes("w-full")
+                with ui.row().classes("w-full gap-3"):
+                    micro_bs = ui.number("Micro batch", value=1, min=1, max=16).props("dense outlined").classes("w-28")
+                    grad_accum = ui.number("Grad accum", value=16, min=1, max=256).props("dense outlined").classes("w-28")
+                    aux_w = ui.number("Aux loss w", value=0.01, min=0, max=1, step=0.005).props(
+                        "dense outlined"
+                    ).classes("w-28")
                 ui.separator().classes("my-3")
                 method = ui.select(
-                    {"auto": "Auto (recommended)", "qlora": "QLoRA (4-bit base)", "lora": "LoRA (bf16 base)", "full": "Full fine-tune"},
+                    {"auto": "Auto (recommended)", "qlora": "QLoRA (4-bit base)", "lora": "LoRA (bf16 base)"},
                     value="auto",
                     label="Training method",
                 ).props("dense outlined").classes("w-full")
@@ -134,7 +145,7 @@ def train_mole_page():
                 ).classes("text-xs text-gray-500")
 
                 start_btn = ui.button("Start training", icon="play_arrow").props("no-caps unelevated").classes("w-full mt-3")
-                ui.label("Training runtime lands in phase 3 — config and planner are live now.").classes(
+                ui.label("Runs in a background worker process — follow progress on the Runs page.").classes(
                     "text-xs text-gray-500"
                 )
 
@@ -196,6 +207,16 @@ def train_mole_page():
         def update_quant_visibility() -> None:
             quant.enabled = method.value in {"auto", "qlora"}
 
+        def resolve_method() -> tuple[str, str]:
+            m = method.value
+            if m != "auto":
+                return m, quant.value if m == "qlora" else "bf16"
+            gpu = best_gpu()
+            p = params_b_of()
+            if gpu and p and p * 2.3 < gpu.vram_free_gb:
+                return "lora", "bf16"
+            return "qlora", quant.value
+
         def on_start() -> None:
             problems = []
             if not ckpt_sel.value:
@@ -204,10 +225,71 @@ def train_mole_page():
                 problems.append("choose corpora")
             if int(top_k.value or 1) > int(n_exp.value or 1):
                 problems.append("top-K must be ≤ number of experts")
+            if not targets.value:
+                problems.append("choose target modules")
             if problems:
                 ui.notify("Fix: " + ", ".join(problems), type="warning")
                 return
-            ui.notify("Config validated. Trainer runtime arrives in phase 3.", type="info")
+
+            ckpt = db.q1("SELECT * FROM checkpoints WHERE id=?", (ckpt_sel.value,))
+            m_resolved, q_resolved = resolve_method()
+            if ckpt["quant_locked"] and ckpt["quant_locked"] != q_resolved:
+                ui.notify(
+                    f'Checkpoint is quant-locked to {ckpt["quant_locked"]} — adapters on it must use the same quant.',
+                    type="negative",
+                    multi_line=True,
+                )
+                return
+
+            seq = int(seq_sel.value or 2048)
+            mb = int(micro_bs.value or 1)
+            ga = int(grad_accum.value or 16)
+            n_epochs = int(epochs.value or 1)
+            max_steps = estimate_steps(list(corp_sel.value), None, n_epochs, seq, mb, ga)
+
+            aid = db.new_id("adp")
+            name = (name_in.value or "").strip() or f'{ckpt["name"]}-mole-E{int(n_exp.value)}k{int(top_k.value)}r{int(rank.value)}'
+            db.execute(
+                "INSERT INTO adapters(id, name, created_at, checkpoint_id, arch, quant, num_experts, top_k, rank,"
+                " target_modules_json, domains_json, corpora_json, status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    aid, name, db.now_iso(), ckpt["id"], "mole", q_resolved,
+                    int(n_exp.value or 4), int(top_k.value or 2), int(rank.value or 16),
+                    json.dumps(list(targets.value)), json.dumps([]), json.dumps(list(corp_sel.value)), "training",
+                ),
+            )
+            rid = db.new_id("run")
+            config = {
+                "checkpoint_id": ckpt["id"],
+                "checkpoint_ref": ckpt["ref"],
+                "adapter_id": aid,
+                "method": m_resolved,
+                "quant": q_resolved,
+                "num_experts": int(n_exp.value or 4),
+                "rank": int(rank.value or 16),
+                "alpha": None,
+                "top_k": int(top_k.value or 2),
+                "target_modules": list(targets.value),
+                "corpora": list(corp_sel.value),
+                "domains": None,
+                "seq_len": seq,
+                "epochs": n_epochs,
+                "micro_batch": mb,
+                "grad_accum": ga,
+                "lr": float(lr.value or 3e-4),
+                "aux_weight": float(aux_w.value or 0.01),
+                "grad_ckpt": True,
+                "max_steps": max_steps,
+                "log_every": 5,
+                "save_every": None,
+            }
+            db.execute(
+                "INSERT INTO runs(id, kind, status, created_at, config_json) VALUES(?,?,?,?,?)",
+                (rid, "mole_stage1", "queued", db.now_iso(), json.dumps(config)),
+            )
+            pid = launch_worker(rid)
+            db.execute("UPDATE runs SET metrics_json=? WHERE id=?", (json.dumps({"pid": pid}), rid))
+            ui.notify(f"Training started — {name} (~{max_steps} steps, pid {pid}). See Runs.", type="positive")
 
         for el in (ckpt_sel, seq_sel, method, quant, rank, n_exp):
             el.on_value_change(lambda _: update_plan())
