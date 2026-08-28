@@ -31,6 +31,7 @@ dependencies = [
     "pydantic>=2.11",
     "numpy>=2",
     "rich>=14",
+    "sentence-transformers>=6.0.0",
 ]
 
 [dependency-groups]

@@ -4,7 +4,7 @@ import argparse
 import random
 import statistics
 
-import torch
+import numpy as np
 
 from ..infer.engine import ENGINE, LoadSpec
 
@@ -20,6 +20,9 @@ NEUTRAL = [
 ]
 
 STRATEGIES = ["empty", "recent", "lex", "sem", "full_history", "oracle"]
+DEFAULT_ST_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+
+_ST = {"model": None}
 
 
 def _filler_ids(tokenizer, target_tokens: int) -> list[int]:
@@ -68,27 +71,27 @@ def _retrieve_lex(h_ids: list[int], x_ids: list[int], chunk_size: int, top_k: in
     return out
 
 
-def _cosine(a: torch.Tensor, b: torch.Tensor) -> float:
-    denom = a.norm() * b.norm() + 1e-9
-    return float(torch.dot(a, b) / denom)
+def _cosine_np(a, b) -> float:
+    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9))
 
 
-def _embed_cached(ids, cache: dict) -> torch.Tensor:
-    key = tuple(ids)
-    if key not in cache:
-        cache[key] = ENGINE.embed_ids(list(ids))
-    return cache[key]
+def _st_model(model_name: str):
+    if _ST["model"] is None:
+        from sentence_transformers import SentenceTransformer
+
+        _ST["model"] = SentenceTransformer(model_name, device="cpu")
+    return _ST["model"]
 
 
-def _retrieve_sem(h_ids, x_ids, chunk_size, top_k, cache) -> list[int]:
+def _retrieve_sem(h_ids, x_ids, chunk_size, top_k, embed_fn) -> list[int]:
     chunks = _chunks(h_ids, chunk_size)
     if not chunks:
         return []
-    x_emb = _embed_cached(list(x_ids), cache)
+    x_emb = embed_fn(list(x_ids))
     scored = []
     for i, c in enumerate(chunks):
-        c_emb = _embed_cached(list(c), cache)
-        scored.append((_cosine(x_emb, c_emb), i, c))
+        c_emb = embed_fn(list(c))
+        scored.append((_cosine_np(x_emb, c_emb), i, c))
     scored.sort(key=lambda t: (-t[0], t[1]))
     top = scored[:top_k]
     top.sort(key=lambda t: t[1])
@@ -98,10 +101,34 @@ def _retrieve_sem(h_ids, x_ids, chunk_size, top_k, cache) -> list[int]:
     return out
 
 
+def _build_embed_fn(retriever: str, tokenizer, st_model_name: str, cache: dict):
+    if retriever == "st":
+        model = _st_model(st_model_name)
+
+        def embed_fn(ids):
+            key = tuple(ids)
+            if key not in cache:
+                text = tokenizer.decode(ids, skip_special_tokens=True)
+                cache[key] = model.encode(text, normalize_embeddings=True)
+            return cache[key]
+
+        return embed_fn
+
+    def embed_fn(ids):
+        key = tuple(ids)
+        if key not in cache:
+            cache[key] = ENGINE.embed_ids(list(ids)).numpy()
+        return cache[key]
+
+    return embed_fn
+
+
 def run_predictive_gain(
     checkpoint_ref: str = "Qwen/Qwen2.5-0.5B-Instruct",
     quant: str = "nf4",
     mode: str = "paraphrase",
+    retriever: str = "st",
+    st_model: str = DEFAULT_ST_MODEL,
     n_samples: int = 8,
     filler_tokens: int = 1200,
     recent_k: int = 256,
@@ -113,6 +140,7 @@ def run_predictive_gain(
     tok = ENGINE.tokenizer
     rng = random.Random(seed)
     emb_cache: dict = {}
+    embed_fn = _build_embed_fn(retriever, tok, st_model, emb_cache)
 
     deltas = {s: [] for s in STRATEGIES}
     nlls = {s: [] for s in STRATEGIES}
@@ -125,7 +153,7 @@ def run_predictive_gain(
             "empty": [],
             "recent": sample["H_ids"][-recent_k:],
             "lex": _retrieve_lex(sample["H_ids"], x, chunk_size, top_k),
-            "sem": _retrieve_sem(sample["H_ids"], x, chunk_size, top_k, emb_cache),
+            "sem": _retrieve_sem(sample["H_ids"], x, chunk_size, top_k, embed_fn),
             "full_history": sample["H_ids"],
             "oracle": sample["fact_ids"],
         }
@@ -149,12 +177,17 @@ def run_predictive_gain(
                 "mean_prefix_tokens": statistics.mean(prefix_lens[name]),
             }
         )
-    return {"rows": rows, "mode": mode, "config": {"n_samples": n_samples, "filler_tokens": filler_tokens}}
+    return {
+        "rows": rows,
+        "mode": mode,
+        "retriever": retriever,
+        "config": {"n_samples": n_samples, "filler_tokens": filler_tokens},
+    }
 
 
 def _print_report(result: dict) -> None:
     base = next(r["mean_nll"] for r in result["rows"] if r["strategy"] == "empty")
-    print(f"\nPredictive gain — mode={result['mode']}")
+    print(f"\nPredictive gain — mode={result['mode']}  sem-retriever={result['retriever']}")
     print("(Δ = NLL(X|empty) − NLL(X|C); higher = context helped more)")
     print(f"{'strategy':<14}{'mean NLL':>10}{'Δ gain':>10}{'prefix tok':>12}")
     print("-" * 48)
@@ -167,14 +200,14 @@ def _print_report(result: dict) -> None:
 
     print(f"baseline NLL(X|empty) = {base:.4f}")
     print(f"lex (token-overlap)  : {d('lex'):+.4f}")
-    print(f"sem (embedding)      : {d('sem'):+.4f}")
+    print(f"sem ({result['retriever']:<14}): {d('sem'):+.4f}")
     print(f"recent               : {d('recent'):+.4f}")
     print(f"full_history         : {d('full_history'):+.4f}")
     print(f"oracle (ceiling)     : {d('oracle'):+.4f}")
     if d("sem") > d("lex"):
         print("=> semantic retrieval beat token-overlap.")
     else:
-        print("=> token-overlap matched/beat semantic (value-anchor likely doing the work).")
+        print("=> token-overlap matched/beat semantic.")
 
 
 def main() -> None:
@@ -182,6 +215,8 @@ def main() -> None:
     ap.add_argument("--ref", default="Qwen/Qwen2.5-0.5B-Instruct")
     ap.add_argument("--quant", default="nf4")
     ap.add_argument("--mode", default="paraphrase", choices=["exact", "paraphrase"])
+    ap.add_argument("--retriever", default="st", choices=["st", "llm"])
+    ap.add_argument("--st-model", default=DEFAULT_ST_MODEL)
     ap.add_argument("--samples", type=int, default=8)
     ap.add_argument("--filler-tokens", type=int, default=1200)
     ap.add_argument("--recent-k", type=int, default=256)
@@ -193,6 +228,8 @@ def main() -> None:
         checkpoint_ref=args.ref,
         quant=args.quant,
         mode=args.mode,
+        retriever=args.retriever,
+        st_model=args.st_model,
         n_samples=args.samples,
         filler_tokens=args.filler_tokens,
         recent_k=args.recent_k,
