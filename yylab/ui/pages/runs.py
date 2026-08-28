@@ -76,7 +76,17 @@ def runs_page():
 
         def render_table() -> None:
             table_container.clear()
+            data = rows()
             with table_container:
+                if not data:
+                    from ..components import empty_state
+
+                    empty_state(
+                        "history",
+                        "No runs yet",
+                        "Training, router, base, and export jobs appear here with live progress, logs, and metrics.",
+                    )
+                    return
                 table = ui.table(
                     columns=[
                         {"name": "kind", "label": "Kind", "field": "kind", "sortable": True},
@@ -85,7 +95,7 @@ def runs_page():
                         {"name": "created", "label": "Created", "field": "created", "sortable": True},
                         {"name": "error", "label": "Error", "field": "error", "align": "left"},
                     ],
-                    rows=rows(),
+                    rows=data,
                     row_key="id",
                     pagination=20,
                 ).classes("w-full")

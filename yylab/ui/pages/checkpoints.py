@@ -9,7 +9,7 @@ from ... import db
 from ...artifacts import checkpoint_dir
 from ...models.loading import scan_checkpoint as scan_local_checkpoint
 from ...workers.launch import launch_worker
-from ..components import dir_browser
+from ..components import dir_browser, empty_state
 from ..shell import panel, shell
 
 
@@ -46,7 +46,18 @@ def checkpoints_page():
 
         def refresh() -> None:
             table_container.clear()
+            data = rows()
             with table_container:
+                if not data:
+                    empty_state(
+                        "hub",
+                        "No checkpoints registered",
+                        "Add a pretrained model — a local HuggingFace folder (params scanned instantly) or a hub id "
+                        "like Qwen/Qwen2.5-1.5B-Instruct.",
+                        "Add checkpoint",
+                        add_dlg.open,
+                    )
+                    return
                 table = ui.table(
                     columns=[
                         {"name": "name", "label": "Name", "field": "name", "sortable": True, "align": "left"},
@@ -55,10 +66,21 @@ def checkpoints_page():
                         {"name": "source", "label": "Source", "field": "source", "align": "left"},
                         {"name": "quant_locked", "label": "Quant lock", "field": "quant_locked"},
                     ],
-                    rows=rows(),
+                    rows=data,
                     row_key="id",
                     pagination=15,
                 ).classes("w-full")
+                table.add_slot(
+                    "body-cell-quant_locked",
+                    """
+                    <q-td :props="props">
+                      <q-badge v-if="props.value !== '-'" color="amber" outline>
+                        <q-icon name="lock" size="12px" class="q-mr-xs"></q-icon>{{ props.value }}
+                      </q-badge>
+                      <span v-else class="text-grey-6">-</span>
+                    </q-td>
+                    """,
+                )
                 table.on("row-click", lambda e: select(e.args[1]["id"]))
 
         def select(cid: str) -> None:
@@ -77,9 +99,11 @@ def checkpoints_page():
             with detail_container, panel():
                 with ui.row().classes("w-full items-center justify-between"):
                     ui.label(c["name"]).classes("text-lg font-semibold")
-                    ui.button("Remove", icon="delete", on_click=lambda: remove(cid)).props(
-                        "flat dense no-caps color=negative"
-                    )
+                    ui.button(
+                        "Remove",
+                        icon="delete",
+                        on_click=lambda cid=cid, name=c["name"]: ask_remove(cid, name),
+                    ).props("flat dense no-caps color=negative")
                 ui.label(f'arch: {c["arch"]} · hidden {c["hidden_size"]} · {c["num_layers"]} layers · {c["params_b"]:.2f} B params')
                 ui.label(f'source: {c["source"]} → {c["ref"]}')
                 if c["quant_locked"]:
@@ -143,6 +167,30 @@ def checkpoints_page():
             refresh()
             render_detail()
             ui.notify("Checkpoint removed from registry", type="info")
+
+        rm_state: dict = {"cid": None}
+        with ui.dialog() as rm_dlg, ui.card().classes("w-[440px] p-4").style(
+            "background: #16161d; border: 1px solid #262633"
+        ):
+            ui.label("Remove checkpoint?").classes("text-base font-semibold")
+            rm_msg = ui.label("").classes("text-sm text-gray-400 mt-1")
+            ui.label(
+                "This only removes the registry entry. Local folders stay on disk; hub models stay cached."
+            ).classes("text-xs text-gray-500 mt-1")
+            with ui.row().classes("w-full justify-end gap-2 mt-4"):
+                ui.button("Cancel", on_click=rm_dlg.close).props("flat dense no-caps")
+
+                def do_remove() -> None:
+                    rm_dlg.close()
+                    if rm_state["cid"]:
+                        remove(rm_state["cid"])
+
+                ui.button("Remove", on_click=do_remove).props("dense no-caps color=negative")
+
+        def ask_remove(cid: str, name: str) -> None:
+            rm_state["cid"] = cid
+            rm_msg.text = f'Remove "{name}" from the registry?'
+            rm_dlg.open()
 
         with ui.dialog() as add_dlg, ui.card().classes("w-[560px]").style("background: #16161d; border: 1px solid #262633"):
             ui.label("Add checkpoint").classes("text-base font-semibold")

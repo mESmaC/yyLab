@@ -10,18 +10,32 @@ from ...config import get_settings
 from ...hw import best_gpu
 from ...infer.engine import ENGINE, LoadSpec
 from ...jobs import JOBS
-from ..shell import PANEL_EDGE, panel, shell
+from ..components import empty_state
+from ..shell import ACCENT, PANEL, PANEL_EDGE, panel, shell
+
+MD_CSS = """
+<style>
+.assistant-md { font-size: 0.875rem; line-height: 1.5; }
+.assistant-md p { margin: 0.25rem 0; }
+.assistant-md pre { background: #0d0d12; border: 1px solid #262633; padding: 0.6rem;
+  border-radius: 8px; overflow-x: auto; }
+.assistant-md code { background: #0d0d12; padding: 0.1rem 0.3rem; border-radius: 4px;
+  font-size: 0.8rem; }
+.assistant-md pre code { background: transparent; padding: 0; }
+</style>
+"""
 
 
 @ui.page("/chat")
 def chat_page():
     with shell("Chat", "/chat"):
+        ui.add_head_html(MD_CSS)
         ui.label("Chat").classes("text-xl font-semibold")
 
         ckpts = {c["id"]: c["name"] for c in db.q("SELECT * FROM checkpoints WHERE kind!='pending' ORDER BY name")}
         engine_settings = dict(get_settings()["engine"])
         messages: list[dict] = []
-        stream_state: dict = {"q": None, "label": None, "active": False, "buf": ""}
+        stream_state: dict = {"q": None, "col": None, "label": None, "active": False, "buf": "", "spin": None}
         load_job: dict = {"id": None}
 
         with panel().classes("w-full"):
@@ -50,20 +64,65 @@ def chat_page():
                 clear_btn = ui.button("Clear chat", icon="delete_sweep").props("dense flat no-caps")
 
         chat_box = ui.column().classes(
-            "w-full gap-2 min-h-[300px] max-h-[520px] overflow-auto p-2 rounded-lg"
-        ).style(f"border: 1px solid {PANEL_EDGE}")
+            "w-full gap-3 min-h-[320px] max-h-[540px] overflow-auto p-4 rounded-xl"
+        ).style(f"border: 1px solid {PANEL_EDGE}; background: {PANEL}66")
 
-        def bubble(role: str, text: str = "") -> ui.label:
+        def scroll_down() -> None:
+            ui.run_javascript(
+                f"const el=document.getElementById('{chat_box.id}'); if(el) el.scrollTop=el.scrollHeight;"
+            )
+
+        def add_user(text: str) -> None:
             with chat_box:
-                if role == "user":
-                    lbl = ui.label(text).classes(
-                        "self-end bg-[#2a2a3a] px-3 py-2 rounded-lg text-sm whitespace-pre-wrap max-w-[80%]"
-                    )
+                with ui.row().classes("w-full justify-end"):
+                    with ui.row().classes("items-start gap-2 max-w-[80%]").style("flex-direction: row-reverse"):
+                        ui.icon("person", size="20px").classes("mt-1 text-gray-400")
+                        ui.label(text).classes(
+                            "bg-[#2a2a3a] px-3 py-2 rounded-xl rounded-tr-sm text-sm whitespace-pre-wrap"
+                        )
+            scroll_down()
+
+        def add_assistant_start() -> None:
+            with chat_box:
+                with ui.row().classes("w-full items-start gap-2"):
+                    ui.icon("smart_toy", size="20px").classes("mt-1").style(f"color: {ACCENT}")
+                    with ui.column().classes("gap-1 flex-1 min-w-0 max-w-[85%]") as col:
+                        spin = ui.spinner("dots", size="md")
+                        lbl = ui.label("").classes(
+                            "px-3 py-2 rounded-xl rounded-tl-sm text-sm whitespace-pre-wrap w-full"
+                        ).style(f"background: {PANEL}; border: 1px solid {PANEL_EDGE}")
+            stream_state["col"] = col
+            stream_state["label"] = lbl
+            stream_state["spin"] = spin
+            scroll_down()
+
+        def finish_assistant(buf: str, error: bool = False) -> None:
+            col = stream_state["col"]
+            if col is None:
+                return
+            col.clear()
+            with col:
+                if error:
+                    ui.label(buf or "(generation error)").classes("text-sm text-red-400 whitespace-pre-wrap")
+                elif not buf:
+                    ui.label("(empty response)").classes("text-sm text-gray-500 italic")
                 else:
-                    lbl = ui.label(text or "…").classes(
-                        "self-start bg-[#1d1d28] px-3 py-2 rounded-lg text-sm whitespace-pre-wrap max-w-[80%]"
-                    ).style(f"border: 1px solid {PANEL_EDGE}")
-            return lbl
+                    ui.markdown(buf).classes("assistant-md w-full")
+            stream_state["col"] = None
+            stream_state["label"] = None
+            stream_state["spin"] = None
+            scroll_down()
+
+        def show_empty_hint() -> None:
+            chat_box.clear()
+            with chat_box:
+                empty_state(
+                    "chat",
+                    "Start a conversation",
+                    "Load a checkpoint (optionally with an adapter and router), then send a message below.",
+                )
+
+        show_empty_hint()
 
         def refresh_adapters(_e=None) -> None:
             opts = {"": "(none)"}
@@ -136,7 +195,7 @@ def chat_page():
 
             load_job["id"] = JOBS.submit("load_model", do_load)
             status_lbl.text = "loading…"
-            load_btn.disable()
+            load_btn.props("loading").disable()
 
         def poll_load() -> None:
             if not load_job["id"]:
@@ -145,7 +204,7 @@ def chat_page():
             if job is None or job.status == "running":
                 return
             load_job["id"] = None
-            load_btn.enable()
+            load_btn.props(remove="loading").enable()
             if job.status == "done":
                 ui.notify(f"Loaded: {ENGINE.status()}", type="positive")
                 for n in ENGINE.notes[-4:]:
@@ -163,26 +222,34 @@ def chat_page():
             q = stream_state["q"]
             if q is None or not stream_state["active"]:
                 return
+            got_new = False
             try:
                 while True:
                     item = q.get_nowait()
                     if item is None:
                         stream_state["active"] = False
                         if not stream_state["buf"]:
-                            stream_state["label"].text = "(empty response)"
+                            pass
                         messages.append({"role": "assistant", "content": stream_state["buf"]})
+                        finish_assistant(stream_state["buf"])
                         send_btn.enable()
                         return
                     if isinstance(item, tuple) and item[0] == "__error__":
                         stream_state["active"] = False
-                        stream_state["label"].text = stream_state["buf"] or ""
                         ui.notify(f"Generation error: {item[1]}", type="negative", multi_line=True)
+                        finish_assistant(stream_state["buf"], error=True)
                         send_btn.enable()
                         return
                     stream_state["buf"] += item
-                    stream_state["label"].text = stream_state["buf"]
+                    got_new = True
             except queue_mod.Empty:
                 pass
+            if got_new and stream_state["label"] is not None:
+                if stream_state["spin"] is not None:
+                    stream_state["spin"].delete()
+                    stream_state["spin"] = None
+                stream_state["label"].text = stream_state["buf"]
+                scroll_down()
 
         def on_send() -> None:
             text = (inp.value or "").strip()
@@ -194,9 +261,9 @@ def chat_page():
             if stream_state["active"]:
                 return
             messages.append({"role": "user", "content": text})
-            bubble("user", text)
+            add_user(text)
             inp.value = ""
-            stream_state["label"] = bubble("assistant", "")
+            add_assistant_start()
             stream_state["buf"] = ""
             stream_state["q"] = queue_mod.Queue()
             stream_state["active"] = True
@@ -223,18 +290,19 @@ def chat_page():
         def on_stop() -> None:
             if stream_state["active"]:
                 stream_state["active"] = False
-                if stream_state["buf"]:
-                    messages.append({"role": "assistant", "content": stream_state["buf"]})
+                buf = stream_state["buf"]
+                messages.append({"role": "assistant", "content": buf})
+                finish_assistant(buf)
                 send_btn.enable()
 
         def on_clear() -> None:
             messages.clear()
-            chat_box.clear()
+            show_empty_hint()
 
         with ui.row().classes("w-full items-end gap-2"):
             inp = ui.input(placeholder="Message…").props("outlined autogrow").classes("flex-1")
             send_btn = ui.button(icon="send", on_click=on_send).props("dense")
-            ui.button(icon="stop", on_click=on_stop).props("dense flat")
+            ui.button(icon="stop", on_click=on_stop).props("dense flat").tooltip("Stop generating")
 
         load_btn.on_click(on_load)
         unload_btn.on_click(on_unload)

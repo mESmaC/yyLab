@@ -85,6 +85,24 @@ def train_mole_page():
         ckpts = {c["id"]: f'{c["name"]} ({c["params_b"]:.2f} B)' if c["params_b"] else c["name"] for c in db.q("SELECT * FROM checkpoints ORDER BY name")}
         corpora = corpus_options()
 
+        if not ckpts or not corpora:
+
+            missing = []
+            if not ckpts:
+                missing.append(("a checkpoint", "/checkpoints"))
+            if not corpora:
+                missing.append(("a processed corpus", "/corpora"))
+            with panel():
+                with ui.row().classes("items-center gap-3"):
+                    ui.icon("info", size="20px").classes("text-amber-400")
+                    ui.label(
+                        "Before training you need " + " and ".join(m[0] for m in missing) + "."
+                    ).classes("text-sm text-gray-300")
+                    for label, path in missing:
+                        ui.button("Add " + label.split()[-1], on_click=lambda _, p=path: ui.navigate.to(p)).props(
+                            "dense no-caps outline"
+                        )
+
         with ui.row().classes("w-full gap-4 items-start flex-wrap"):
             with panel().classes("w-[440px]"):
                 ui.label("Setup").classes("text-base font-semibold mb-2")

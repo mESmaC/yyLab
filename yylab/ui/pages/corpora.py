@@ -11,7 +11,7 @@ from ...ingest.domains import DOMAINS
 from ...ingest.pipeline import IngestConfig, _iter_shards, run_ingest
 from ...ingest.tokenize_stats import SPEC_KEYS, SPEC_LABELS
 from ...jobs import JOBS
-from ..components import dir_browser
+from ..components import dir_browser, empty_state, status_badge
 from ..shell import panel, shell, stat_card
 
 
@@ -71,7 +71,19 @@ def corpora_page():
 
         def refresh_table() -> None:
             table_container.clear()
+            rows = corpus_rows()
             with table_container:
+                if not rows:
+                    empty_state(
+                        "folder_open",
+                        "No corpora yet",
+                        "Point yyLab at a folder of text, code, or JSONL data. It will deduplicate, tag domains, "
+                        "and count tokens across several tokenizer families.",
+                        "Ingest folder",
+                        ingest_dlg.open,
+                    )
+                    table_holder["t"] = None
+                    return
                 table = ui.table(
                     columns=[
                         {"name": "name", "label": "Name", "field": "name", "sortable": True, "align": "left"},
@@ -81,10 +93,21 @@ def corpora_page():
                         {"name": "size", "label": "On disk", "field": "size"},
                         {"name": "tokens", "label": f"Tokens ({SPEC_LABELS[state['tok']]})", "field": "tokens", "sortable": True},
                     ],
-                    rows=corpus_rows(),
+                    rows=rows,
                     row_key="id",
                     pagination=15,
                 ).classes("w-full")
+                table.add_slot(
+                    "body-cell-status",
+                    """
+                    <q-td :props="props">
+                      <q-badge :color="props.value === 'ready' ? 'green' : props.value === 'failed' ? 'red' : 'primary'"
+                               :outline="props.value === 'processing'">
+                        {{ props.value }}
+                      </q-badge>
+                    </q-td>
+                    """,
+                )
                 table.on("row-click", lambda e: select_corpus(e.args[1]["id"]))
                 table_holder["t"] = table
 
@@ -106,12 +129,12 @@ def corpora_page():
                 with ui.row().classes("w-full items-center justify-between"):
                     with ui.row().classes("items-center gap-3"):
                         ui.label(c["name"]).classes("text-lg font-semibold")
-                        ui.badge(c["status"]).props(
-                            "color=green" if c["status"] == "ready" else "color=orange"
-                        )
-                    ui.button("Delete", icon="delete", on_click=lambda: delete_corpus(cid)).props(
-                        "flat dense no-caps color=negative"
-                    )
+                        status_badge(c["status"])
+                    ui.button(
+                        "Delete",
+                        icon="delete",
+                        on_click=lambda cid=cid, name=c["name"]: ask_delete(cid, name),
+                    ).props("flat dense no-caps color=negative")
                 ui.label(f'source: {c["source_path"]}').classes("text-xs text-gray-500")
                 if c["error"]:
                     ui.label(c["error"]).classes("text-xs text-red-400")
@@ -211,6 +234,27 @@ def corpora_page():
 
         tok_select.on_value_change(lambda e: (state.update(tok=e.value), refresh_table(), render_detail()))
         ui.timer(1.0, poll_job)
+
+        del_state: dict = {"cid": None}
+        with ui.dialog() as del_dlg, ui.card().classes("w-[420px] p-4").style(
+            "background: #16161d; border: 1px solid #262633"
+        ):
+            ui.label("Delete corpus?").classes("text-base font-semibold")
+            del_msg = ui.label("").classes("text-sm text-gray-400 mt-1")
+            with ui.row().classes("w-full justify-end gap-2 mt-4"):
+                ui.button("Cancel", on_click=del_dlg.close).props("flat dense no-caps")
+
+                def do_delete() -> None:
+                    del_dlg.close()
+                    if del_state["cid"]:
+                        delete_corpus(del_state["cid"])
+
+                ui.button("Delete", on_click=do_delete).props("dense no-caps color=negative")
+
+        def ask_delete(cid: str, name: str) -> None:
+            del_state["cid"] = cid
+            del_msg.text = f'"{name}" and its shards + dedup hashes will be removed permanently.'
+            del_dlg.open()
 
         with ui.dialog() as ingest_dlg, ui.card().classes("w-[560px]").style("background: #16161d; border: 1px solid #262633"):
             ui.label("Ingest corpora folder").classes("text-base font-semibold")
