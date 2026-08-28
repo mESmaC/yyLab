@@ -128,6 +128,21 @@ class Engine:
             out = self.model(input_ids=input_ids, labels=labels)
         return float(out.loss.item())
 
+    def embed_ids(self, ids):
+        import torch
+
+        if not self.is_loaded():
+            raise RuntimeError("no model loaded")
+        ids = list(ids)
+        if not ids:
+            return None
+        dev = torch.device(self.device)
+        input_ids = torch.tensor([ids], dtype=torch.long, device=dev)
+        with torch.no_grad():
+            out = self.model(input_ids=input_ids, output_hidden_states=True, use_cache=False)
+        h = out.hidden_states[-1][0]
+        return h.mean(dim=0).float().cpu()
+
     def is_loaded(self) -> bool:
         return self.model is not None
 
