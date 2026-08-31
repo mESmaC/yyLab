@@ -1,16 +1,65 @@
-from .inject import DEFAULT_TARGET_MODULES, MoLEConfig, inject_mole, mole_layers, set_stage
-from .layer import LoRAExpert, MoLELinear, TopKRouter
-from .losses import collect_router_logits, load_balance_loss
+from .adaptive import (
+    AdaptiveOccupancyConfig,
+    AdaptiveOccupancyController,
+    ControllerCheckpoint,
+    ExpertBudgetPlan,
+    OccupancyDecision,
+    RecomputationDecision,
+    solve_expert_budget,
+)
+from .inject import (
+    DEFAULT_TARGET_MODULES,
+    MoLEConfig,
+    begin_prompt_route,
+    end_prompt_route,
+    inject_mole,
+    mole_layers,
+    reset_expert,
+    resolve_adaptive_budget,
+    set_active_expert,
+    set_adaptive_expert_pool,
+    set_stage,
+    set_trainable_expert,
+    shared_router,
+    token_routers,
+)
+from .layer import LoRAExpert, MoLELinear, SharedPromptRouter, SharedTokenRouter, TopKRouter
+from .losses import (
+    adaptive_candidate_nll,
+    collect_router_logits,
+    load_balance_loss,
+    surprise_calibration_loss,
+)
 
 __all__ = [
+    "AdaptiveOccupancyConfig",
+    "AdaptiveOccupancyController",
+    "ControllerCheckpoint",
     "DEFAULT_TARGET_MODULES",
+    "ExpertBudgetPlan",
     "LoRAExpert",
     "MoLEConfig",
     "MoLELinear",
+    "OccupancyDecision",
+    "RecomputationDecision",
+    "SharedPromptRouter",
+    "SharedTokenRouter",
     "TopKRouter",
+    "adaptive_candidate_nll",
+    "begin_prompt_route",
     "collect_router_logits",
+    "end_prompt_route",
     "inject_mole",
     "load_balance_loss",
     "mole_layers",
+    "reset_expert",
+    "resolve_adaptive_budget",
+    "set_adaptive_expert_pool",
+    "shared_router",
+    "token_routers",
+    "set_active_expert",
     "set_stage",
+    "set_trainable_expert",
+    "solve_expert_budget",
+    "surprise_calibration_loss",
 ]

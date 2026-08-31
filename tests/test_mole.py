@@ -3,9 +3,16 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from yylab.mole.inject import MoLEConfig, count_trainable, inject_mole, mole_layers, set_stage
+from yylab.mole.inject import (
+    MoLEConfig,
+    count_trainable,
+    inject_mole,
+    mole_layers,
+    set_stage,
+    set_trainable_expert,
+)
 from yylab.mole.losses import aux_loss, collect_router_logits, load_balance_loss
-from yylab.mole.store import apply_mole_weights, load_mole_weights, save_mole
+from yylab.mole.store import apply_mole_weights, load_mole_config, load_mole_weights, save_mole
 
 
 class TinyModel(nn.Module):
@@ -56,6 +63,25 @@ def test_backward_trains_only_mole():
             assert p.requires_grad and p.grad is not None, name
         else:
             assert not p.requires_grad, name
+
+
+def test_isolated_stage_forces_one_coherent_expert_without_router_graph():
+    torch.manual_seed(0)
+    model = _inject()
+    set_trainable_expert(model, 2)
+    model(torch.randn(3, 4, 32)).sum().backward()
+    for _, layer in mole_layers(model):
+        assert layer.last_router_logits is None
+        assert layer.router.gate.weight.grad is None
+        for index, expert in enumerate(layer.experts):
+            if index == 2:
+                assert expert.lora_A.requires_grad
+                assert expert.lora_A.grad is not None
+                assert expert.lora_B.grad is not None
+            else:
+                assert not expert.lora_A.requires_grad
+                assert expert.lora_A.grad is None
+                assert expert.lora_B.grad is None
 
 
 def test_topk_routing_and_aux_loss():
@@ -128,3 +154,35 @@ def test_save_load_roundtrip(tmp_path):
     n = apply_mole_weights(fresh, state)
     assert n == 8
     assert torch.allclose(fresh(x), ref_out, atol=1e-6)
+
+
+def test_strict_load_rejects_partial_or_wrong_shape_bank(tmp_path):
+    cfg = MoLEConfig(num_experts=4, rank=8, alpha=16.0, top_k=2, target_modules=("q_proj", "v_proj"))
+    model = _inject()
+    save_mole(tmp_path, model, cfg, base_ref="tiny")
+    state = load_mole_weights(tmp_path)
+
+    missing = dict(state)
+    missing.pop(next(iter(missing)))
+    with torch.no_grad():
+        try:
+            apply_mole_weights(_inject(), missing)
+            raise AssertionError("partial MoLE bank should be rejected")
+        except ValueError as exc:
+            assert "tensor set mismatch" in str(exc)
+
+    wrong_shape = dict(state)
+    key = next(key for key in wrong_shape if key.endswith("lora_A"))
+    wrong_shape[key] = wrong_shape[key][:-1]
+    try:
+        apply_mole_weights(_inject(), wrong_shape)
+        raise AssertionError("shape-incompatible MoLE bank should be rejected")
+    except ValueError as exc:
+        assert "shape mismatch" in str(exc)
+
+    assert load_mole_config(tmp_path, expected_base_ref="tiny")["format_version"] == 2
+    try:
+        load_mole_config(tmp_path, expected_base_ref="another-base")
+        raise AssertionError("wrong-base MoLE config should be rejected")
+    except ValueError as exc:
+        assert "different frozen base" in str(exc)

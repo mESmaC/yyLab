@@ -9,6 +9,7 @@ from yylab.infer.context_math import (
     kv_shape,
     max_context_for_budget,
     model_weight_gb,
+    quantized_kv_bytes_per_token,
 )
 
 QWEN_SMALL = SimpleNamespace(
@@ -36,6 +37,15 @@ def test_kv_gb():
     assert 22.0 < gb_at_1m < 24.0
 
 
+def test_quantized_kv_bytes_include_group_scales():
+    raw_int4 = kv_bytes_per_token(QWEN_SMALL, "int4")
+    packed_int4 = quantized_kv_bytes_per_token(QWEN_SMALL, "int4", group_size=64)
+    packed_int8 = quantized_kv_bytes_per_token(QWEN_SMALL, "int8", group_size=64)
+
+    assert packed_int4 > raw_int4
+    assert packed_int8 > packed_int4
+
+
 def test_capacity_rows():
     rows = capacity_rows(QWEN_SMALL, 100_000, vram_free_gb=3.5, ram_gb=32.0, model_gb=0.5)
     by_label = {r["label"]: r for r in rows}
@@ -44,6 +54,8 @@ def test_capacity_rows():
     assert by_label["KV int4 (quant cache)"]["fits"] in (True, False)
     offloaded = by_label["KV offloaded"]
     assert offloaded["location"] == "RAM"
+    assert by_label["KV int8 offloaded"]["location"] == "RAM"
+    assert by_label["KV int4 offloaded"]["kv_gb"] < by_label["KV int8 offloaded"]["kv_gb"]
 
 
 def test_max_context_for_budget():

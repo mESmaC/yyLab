@@ -21,6 +21,9 @@ class Paths:
         self.routers = root / "routers"
         self.runs = root / "runs"
         self.cache = root / "cache"
+        self.rejected = root / "rejected"
+        self.annotations = root / "annotations"
+        self.rankers = root / "rankers"
         self.db_file = root / "yylab.sqlite3"
         self.settings_file = root / "settings.json"
 
@@ -33,6 +36,9 @@ class Paths:
             self.routers,
             self.runs,
             self.cache,
+            self.rejected,
+            self.annotations,
+            self.rankers,
         ):
             p.mkdir(parents=True, exist_ok=True)
 
@@ -44,16 +50,28 @@ os.environ.setdefault("HF_HOME", str(PATHS.cache / "hf"))
 DEFAULT_SETTINGS: dict = {
     "hf_token": "",
     "default_quant": "nf4",
+    "datasets_root": "",
     "tokenizers_enabled": {},
     "engine": {
         "attn_implementation": "sdpa",
         "cache_implementation": "dynamic",
         "kv_quant": "none",
+        "kv_offload_group_size": 64,
+        "kv_offload_residual_length": 32,
+        "kv_offload_pin_memory": True,
+        "kv_offload_growth_chunk_size": 256,
         "sliding_window": 4096,
         "max_context_tokens": 8192,
         "prefill_chunk_size": 8192,
         "rope_scaling": "none",
         "rope_factor": 2.0,
+        "context_compaction_strategy": "nll_atxy",
+        "context_recent_turns": 1,
+        "context_nll_max_probes": 4,
+        "context_nll_probe_tokens": 128,
+        "context_min_nll_gain_nats": 0.01,
+        "context_nll_token_cost_nats": 0.00002,
+        "context_nll_trigger_ratio": 0.9,
     },
 }
 

@@ -1,21 +1,138 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import traceback
 from pathlib import Path
 
 from .. import db
-from ..artifacts import adapter_dir, checkpoint_dir, router_dir, run_dir, write_json
-from ..mole.inject import MoLEConfig, inject_mole, set_stage
-from ..mole.losses import aux_loss
-from ..mole.store import apply_mole_weights, load_mole_weights, save_mole
-from ..train.data import PackedBatches, estimate_steps, iter_corpus_docs
+from ..artifacts import adapter_dir, checkpoint_dir, read_json, router_dir, run_dir, write_json
+from ..mole.adaptive import AdaptiveOccupancyConfig, AdaptiveOccupancyController
+from ..mole.inject import (
+    MoLEConfig,
+    attach_shared_router,
+    inject_mole,
+    reset_expert,
+    resolve_adaptive_budget,
+    set_active_expert,
+    set_adaptive_expert_pool,
+    set_stage,
+    set_trainable_expert,
+)
+from ..mole.losses import (
+    adaptive_candidate_nll,
+    aux_loss,
+    router_usage_metrics,
+    surprise_calibration_loss,
+)
+from ..mole.store import (
+    apply_mole_weights,
+    assemble_mole_experts,
+    load_mole_config,
+    load_mole_weights,
+    save_isolated_expert,
+    save_mole,
+)
+from ..train.base_config import (
+    BASE_RECIPE_VERSION,
+    ScratchModelSpec,
+    build_hf_config,
+    estimate_parameter_count,
+)
+from ..train.data import (
+    CORPUS_MIX_CONCATENATE,
+    DEFAULT_TEXT_CHUNK_CHARS,
+    ExpertDataPlan,
+    PackedBatches,
+    allocate_expert_steps,
+    corpus_data_provenance,
+    estimate_steps,
+    iter_corpus_docs,
+    normalize_corpus_ids,
+    normalize_corpus_mix,
+    plan_expert_data,
+)
 from ..train.loop import LoopOpts, make_optimizer, train_loop
+from ..train.low_precision import apply_qat, qat_metadata
 
 
 def log(msg: str) -> None:
     print(msg, flush=True)
+
+
+def benchmark_progress(rd: Path, stage: str, step: int, total: int, value: float, msg: str) -> None:
+    """Publish benchmark progress using the same live contract as training."""
+
+    metric_label = (
+        "score"
+        if stage == "quality benchmark"
+        else ("loss" if stage == "training performance" else "progress")
+    )
+    write_json(
+        rd / "progress.json",
+        {
+            "stage": stage,
+            "step": step,
+            "max_steps": total,
+            "value": round(float(value), 4),
+            "metric_label": metric_label,
+            # Retain loss for older Runs-page clients that only know this field.
+            "loss": round(float(value), 4),
+            "msg": msg,
+        },
+    )
+
+
+def run_benchmark_quality(cfg: dict, rd: Path) -> dict:
+    from ..benchmark.quality import run_quality_benchmark
+
+    resolved = dict(cfg)
+    baseline_run_id = str(resolved.get("baseline_run_id") or "")
+    if baseline_run_id:
+        baseline_dir = run_dir(baseline_run_id)
+        semantic_projection = baseline_dir / "semantic-summary.json"
+        baseline_path = (
+            semantic_projection if semantic_projection.is_file() else baseline_dir / "summary.json"
+        )
+        if not baseline_path.is_file():
+            raise FileNotFoundError(f"baseline benchmark has no summary: {baseline_run_id}")
+        resolved["baseline_summary_path"] = str(baseline_path)
+    return run_quality_benchmark(
+        resolved,
+        rd,
+        progress=lambda stage, step, total, value, msg: benchmark_progress(
+            rd, stage, step, total, value, msg
+        ),
+    )
+
+
+def run_benchmark_training_performance(cfg: dict, rd: Path) -> dict:
+    from ..benchmark.performance import run_training_performance
+
+    return run_training_performance(
+        cfg,
+        rd,
+        progress=lambda stage, step, total, value, msg: benchmark_progress(
+            rd, stage, step, total, value, msg
+        ),
+    )
+
+
+def mark_training_artifacts_failed(run_kind: str, cfg: dict) -> None:
+    """Fail only artifacts owned by a training run, never benchmark subjects."""
+
+    if run_kind in {"mole_stage1", "router_stage2", "base"} and cfg.get("adapter_id"):
+        db.execute("UPDATE adapters SET status='failed' WHERE id=?", (cfg["adapter_id"],))
+    if run_kind == "router_stage2" and cfg.get("router_id"):
+        db.execute("UPDATE routers SET status='failed' WHERE id=?", (cfg["router_id"],))
+    if run_kind == "base" and cfg.get("out_checkpoint_id"):
+        # The failed run remains the durable error record. Do not leave a
+        # phantom checkpoint selectable as a training or inference input.
+        db.execute(
+            "DELETE FROM checkpoints WHERE id=? AND kind='pending'",
+            (cfg["out_checkpoint_id"],),
+        )
 
 
 def load_base(ref: str, quant: str):
@@ -26,36 +143,111 @@ def load_base(ref: str, quant: str):
     return model, tokenizer, cuda, quant, notes
 
 
-def build_batches(cfg: dict, tokenizer, max_steps: int) -> PackedBatches:
-    docs = iter_corpus_docs(cfg["corpora"], cfg.get("domains") or None)
+def normalize_base_data_config(cfg: dict) -> dict:
+    """Canonicalize old and new base data selections without mutating the run."""
+
+    resolved = dict(cfg)
+    raw_corpora = resolved.get("corpora")
+    if raw_corpora is None:
+        raw_corpora = resolved.get("corpus")
+    corpora = normalize_corpus_ids(raw_corpora)
+    if not corpora:
+        raise ValueError("base training requires at least one corpus")
+
+    raw_domains = resolved.get("domains")
+    if isinstance(raw_domains, str):
+        raw_domains = [raw_domains]
+    domains: list[str] = []
+    seen_domains: set[str] = set()
+    for value in raw_domains or ():
+        domain = str(value).strip()
+        if domain and domain not in seen_domains:
+            domains.append(domain)
+            seen_domains.add(domain)
+
+    resolved["corpora"] = corpora
+    resolved["domains"] = domains or None
+    resolved["corpus_mix"] = normalize_corpus_mix(resolved.get("corpus_mix"))
+    return resolved
+
+
+def build_batches(
+    cfg: dict,
+    tokenizer,
+    max_steps: int,
+    *,
+    domains: list[str] | None = None,
+    shard_index: int | None = None,
+    num_shards: int | None = None,
+) -> PackedBatches:
+    selected_domains = domains if domains is not None else cfg.get("domains") or None
+
+    def docs():
+        for epoch in range(max(1, int(cfg.get("epochs", 1)))):
+            yield from iter_corpus_docs(
+                cfg["corpora"],
+                selected_domains,
+                shuffle_buffer=int(cfg.get("shuffle_buffer", 128)),
+                shuffle_buffer_bytes=int(cfg.get("shuffle_buffer_bytes", 64 * 2**20)),
+                seed=int(cfg.get("seed", 42)) + epoch,
+                shard_index=shard_index,
+                num_shards=num_shards,
+                corpus_mix=cfg.get("corpus_mix", CORPUS_MIX_CONCATENATE),
+            )
 
     def tokenize(texts: list[str]) -> list[list[int]]:
-        enc = tokenizer(texts, add_special_tokens=False, return_attention_mask=False)
+        # PackedBatches slices these raw encodings to cfg["seq_len"] before
+        # model execution.  Transformers' model-length warning is therefore
+        # misleading here: no un-packed sequence is ever forwarded.
+        enc = tokenizer(
+            texts,
+            add_special_tokens=False,
+            return_attention_mask=False,
+            verbose=False,
+        )
         return enc["input_ids"]
 
     return PackedBatches(
-        docs,
+        docs(),
         tokenize,
         seq_len=cfg["seq_len"],
         eos_token_id=tokenizer.eos_token_id,
         micro_batch=cfg["micro_batch"],
         max_batches=max_steps * cfg["grad_accum"],
+        tokenize_chunk=int(cfg.get("tokenize_chunk", 8)),
+        max_text_chars=int(cfg.get("max_text_chars", DEFAULT_TEXT_CHUNK_CHARS)),
     )
 
 
-def loop_opts(cfg: dict, rd: Path, cuda: bool) -> LoopOpts:
+def loop_opts(
+    cfg: dict,
+    rd: Path,
+    cuda: bool,
+    *,
+    max_steps: int | None = None,
+    stage: str = "train",
+    step_offset: int = 0,
+    total_steps: int | None = None,
+) -> LoopOpts:
     return LoopOpts(
         micro_batch=cfg["micro_batch"],
         grad_accum=cfg["grad_accum"],
-        max_steps=cfg["max_steps"],
+        max_steps=max_steps if max_steps is not None else cfg["max_steps"],
         log_every=cfg.get("log_every", 5),
         save_every=cfg.get("save_every"),
         device="cuda" if cuda else "cpu",
         run_dir=rd,
+        stage=stage,
+        step_offset=step_offset,
+        total_steps=total_steps,
+        prefer_cudnn_sdpa=cfg.get("cudnn_sdpa", True),
+        grad_clip=float(cfg.get("grad_clip", 1.0)),
     )
 
 
 def enforce_quant_lock(checkpoint_id: str, quant: str) -> None:
+    """Validate an established lock without poisoning it before training succeeds."""
+
     row = db.q1("SELECT quant_locked FROM checkpoints WHERE id=?", (checkpoint_id,))
     if not row:
         return
@@ -65,8 +257,18 @@ def enforce_quant_lock(checkpoint_id: str, quant: str) -> None:
             f"Checkpoint quantization is locked to '{locked}'; adapter requested '{quant}'. "
             "Quant cannot drift between adapters on the same checkpoint."
         )
-    if not locked:
-        db.execute("UPDATE checkpoints SET quant_locked=? WHERE id=?", (quant, checkpoint_id))
+
+
+def commit_quant_lock(checkpoint_id: str, quant: str) -> None:
+    """Pin quantization only after a complete adapter artifact exists."""
+
+    enforce_quant_lock(checkpoint_id, quant)
+    changed = db.execute(
+        "UPDATE checkpoints SET quant_locked=? WHERE id=? AND (quant_locked='' OR quant_locked IS NULL OR quant_locked=?)",
+        (quant, checkpoint_id, quant),
+    )
+    if changed != 1:
+        raise RuntimeError("could not commit checkpoint quantization lock")
 
 
 def enable_grad_ckpt(model) -> None:
@@ -74,9 +276,363 @@ def enable_grad_ckpt(model) -> None:
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     except TypeError:
         model.gradient_checkpointing_enable()
+    enable_inputs = getattr(model, "enable_input_require_grads", None)
+    if callable(enable_inputs):
+        enable_inputs()
+
+
+def prepare_kbit_training(model, quant: str) -> None:
+    if quant not in {"nf4", "int8"}:
+        return
+    from peft import prepare_model_for_kbit_training
+
+    prepare_model_for_kbit_training(model, use_gradient_checkpointing=False)
+
+
+def enable_fused_linear_ce(model, enabled: bool = True, *, full_kernels: bool = True) -> bool:
+    """Install the optimized Qwen3 kernel set, including fused linear CE."""
+
+    if not enabled or getattr(model.config, "model_type", None) != "qwen3":
+        return False
+    try:
+        from liger_kernel.transformers import apply_liger_kernel_to_qwen3
+        from liger_kernel.transformers.model.qwen3 import lce_forward
+
+        target = model
+        get_base_model = getattr(model, "get_base_model", None)
+        if callable(get_base_model):
+            candidate = get_base_model()
+            if getattr(candidate.config, "model_type", None) == "qwen3":
+                target = candidate
+
+        apply_liger_kernel_to_qwen3(
+            rope=full_kernels,
+            cross_entropy=False,
+            fused_linear_cross_entropy=True,
+            rms_norm=full_kernels,
+            swiglu=full_kernels,
+            model=target,
+        )
+        if getattr(target.forward, "__func__", None) is not lce_forward:
+            raise RuntimeError("Liger did not install the fused Qwen3 forward")
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            "Qwen3 memory-efficient loss setup failed; install a compatible liger-kernel runtime"
+        ) from exc
+    return True
+
+
+def log_memory(label: str) -> None:
+    parts: list[str] = []
+    try:
+        import psutil
+
+        parts.append(f"RAM RSS={psutil.Process().memory_info().rss / 2**30:.2f} GB")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            parts.append(f"CUDA allocated={torch.cuda.memory_allocated() / 2**30:.2f} GB")
+            parts.append(f"reserved={torch.cuda.memory_reserved() / 2**30:.2f} GB")
+    except Exception:  # noqa: BLE001
+        pass
+    if parts:
+        log(f"memory [{label}]: " + ", ".join(parts))
+
+
+def _warmup_steps(total_steps: int) -> int:
+    """Keep a one-step expert from spending its only update at zero LR."""
+
+    return 0 if total_steps <= 1 else max(1, total_steps // 20)
+
+
+JOINT_PER_TOKEN_STRATEGY = "joint_per_token_v1"
+ADAPTIVE_SURPRISE_STRATEGY = "joint_adaptive_surprise_v1"
+SEQUENTIAL_EXPERT_STRATEGY = "sequential_single_resident_v1"
+
+
+def _mole_training_strategy(cfg: dict) -> str:
+    """Resolve MoLE stage-1 behavior without changing queued legacy runs.
+
+    Older run configs predate the strategy field and were created with the
+    isolated, sequential contract.  New run configs opt into joint learned
+    routing explicitly, which keeps replaying an old queue deterministic.
+    """
+
+    strategy = str(cfg.get("training_strategy") or SEQUENTIAL_EXPERT_STRATEGY)
+    if strategy not in {
+        ADAPTIVE_SURPRISE_STRATEGY,
+        JOINT_PER_TOKEN_STRATEGY,
+        SEQUENTIAL_EXPERT_STRATEGY,
+    }:
+        raise ValueError(f"unknown MoLE training strategy: {strategy}")
+    return strategy
+
+
+def _run_mole_joint_per_token(
+    cfg: dict,
+    rd: Path,
+    *,
+    adaptive: bool = False,
+) -> dict:
+    """Jointly optimize every LoRA expert and learned token router.
+
+    The corpus is streamed once with the optional *global* domain filter from
+    the run config.  It is deliberately never partitioned into per-expert
+    domains or document shards: every token reaches the learned sparse gates.
+    """
+
+    import torch
+    from transformers.optimization import get_cosine_schedule_with_warmup
+
+    enforce_quant_lock(cfg["checkpoint_id"], cfg["quant"])
+    model, tokenizer, cuda, quant, notes = load_base(cfg["checkpoint_ref"], cfg["quant"])
+    for note in notes:
+        log(f"note: {note}")
+    prepare_kbit_training(model, quant)
+    log_memory("joint MoLE base loaded")
+    base_seed = int(cfg.get("seed", 42))
+    torch.manual_seed(base_seed)
+    if cuda:
+        torch.cuda.manual_seed_all(base_seed)
+
+    adaptive_config = AdaptiveOccupancyConfig()
+    if adaptive:
+        adaptive_payload = dict(cfg.get("adaptive") or {})
+        adaptive_payload["enabled"] = True
+        adaptive_config = AdaptiveOccupancyConfig.from_dict(adaptive_payload)
+    requested_experts = max(
+        int(cfg.get("num_experts") or adaptive_config.minimum_experts),
+        adaptive_config.minimum_experts if adaptive else 1,
+    )
+    requested_rank = int(cfg.get("rank") or 8)
+    requested_top_k = min(
+        requested_experts,
+        int(cfg.get("top_k") or adaptive_config.minimum_experts),
+    )
+    mole_cfg = MoLEConfig(
+        num_experts=requested_experts,
+        rank=requested_rank,
+        alpha=cfg.get("alpha") or requested_rank * 2.0,
+        top_k=requested_top_k,
+        target_modules=tuple(cfg["target_modules"]),
+        router_type="per_token",
+        adaptive=adaptive_config,
+    )
+    budget_plan = None
+    if adaptive:
+        budget_plan = resolve_adaptive_budget(model, mole_cfg)
+        if cfg.get("alpha") is None:
+            mole_cfg.alpha = mole_cfg.rank * 2.0
+        log(
+            "adaptive architecture resolved: "
+            f"E={mole_cfg.num_experts} r={mole_cfg.rank}; "
+            f"lane={budget_plan.parameters_per_expert:,} params "
+            f"({budget_plan.expert_footprint_fraction:.3%}); "
+            f"active={mole_cfg.adaptive.minimum_experts}-"
+            f"{mole_cfg.adaptive.maximum_experts(mole_cfg.num_experts)} lanes"
+        )
+    replaced = inject_mole(
+        model,
+        mole_cfg,
+        expert_dtype=torch.bfloat16 if cuda else torch.float32,
+    )
+    if not replaced:
+        raise RuntimeError("no target linear modules matched the requested MoLE architecture")
+    set_active_expert(model, None)
+    controller: AdaptiveOccupancyController | None = None
+    training_state: dict[str, object] = {}
+    if adaptive:
+        controller = AdaptiveOccupancyController(mole_cfg.adaptive, mole_cfg.num_experts)
+        preferred = list(mole_cfg.adaptive.preferred_experts)
+        preferred.extend(index for index in range(mole_cfg.num_experts) if index not in preferred)
+        if not mole_cfg.adaptive.preferred_experts:
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed(base_seed)
+            preferred = torch.randperm(mole_cfg.num_experts, generator=generator).tolist()
+        initial_pool = tuple(preferred[: controller.minimum])
+        set_adaptive_expert_pool(model, initial_pool)
+        training_state.update(order=preferred, active_pool=initial_pool)
+    set_stage(model, "both")
+    if cfg.get("grad_ckpt", True):
+        enable_grad_ckpt(model)
+    full_liger = cfg.get("liger_full_kernels", True)
+    fused_ce = enable_fused_linear_ce(
+        model,
+        cfg.get("liger_fused_ce", True),
+        full_kernels=full_liger,
+    )
+
+    trainable = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+    routing_label = "adaptive surprise MoLE" if adaptive else "joint per-token MoLE"
+    log(
+        f"{routing_label}: E={mole_cfg.num_experts} r={mole_cfg.rank} "
+        f"k={mole_cfg.top_k}; trainable={trainable:,}; global domains={cfg.get('domains') or 'all'}; "
+        f"liger_full={fused_ce and full_liger}; cudnn_sdpa={cfg.get('cudnn_sdpa', True)}"
+    )
+    log_memory("joint experts and token routers injected")
+
+    optimizer = make_optimizer(
+        model,
+        cfg["lr"],
+        cuda=cuda,
+        optimizer_state=cfg.get("optimizer_state", "auto"),
+    )
+    optimizer_impl = type(optimizer).__name__
+    log(f"optimizer={optimizer_impl}; state mode={cfg.get('optimizer_state', 'auto')}")
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=_warmup_steps(cfg["max_steps"]),
+        num_training_steps=cfg["max_steps"],
+    )
+    # build_batches applies cfg["domains"] once as a global corpus filter. It
+    # never sees expert_plan here, so no expert receives a hand-authored slice.
+    training_cfg = cfg
+    if adaptive:
+        training_cfg = {
+            **cfg,
+            "num_experts": mole_cfg.num_experts,
+            "rank": mole_cfg.rank,
+            "top_k": mole_cfg.top_k,
+            "adaptive": mole_cfg.adaptive.to_dict(),
+        }
+    batches = build_batches(training_cfg, tokenizer, cfg["max_steps"])
+    a_dir = adapter_dir(cfg["adapter_id"])
+    strategy = ADAPTIVE_SURPRISE_STRATEGY if adaptive else JOINT_PER_TOKEN_STRATEGY
+    metadata = {
+        "stage": "joint_experts_and_router",
+        "training_strategy": strategy,
+        "router_arch": (
+            "global_surprise_lanes_v1"
+            if adaptive
+            else "shared_per_block_per_token_v1"
+        ),
+        "global_domain_filter": sorted(cfg.get("domains") or []),
+        "fused_linear_cross_entropy": fused_ce,
+        "liger_full_kernels": fused_ce and full_liger,
+        "cudnn_priority_sdpa": bool(cfg.get("cudnn_sdpa", True)),
+        "optimizer_state": cfg.get("optimizer_state", "auto"),
+        "optimizer_impl": optimizer_impl,
+    }
+    if budget_plan is not None:
+        metadata.update(
+            adaptive_capacity=budget_plan.to_dict(),
+            occupancy_semantics="incremental_expert_parameters_over_resolved_total",
+            training_residency="full_bank_weights_resident_selected_lanes_execute",
+        )
+
+    def update_adaptive_pool(step: int, task_nll: torch.Tensor) -> None:
+        assert controller is not None
+        decision = controller.observe(float(task_nll.detach().item()), "nll")
+        scores = adaptive_candidate_nll(model)
+        if scores is None:
+            return
+        ordering = torch.argsort(scores, stable=True).cpu().tolist()
+        active_count = decision.active_experts
+        cadence = mole_cfg.adaptive.nested_k_probe_every
+        if step % cadence == 0:
+            span = controller.maximum - controller.minimum + 1
+            active_count = controller.minimum + ((step // cadence - 1) % span)
+        exploration = min(
+            mole_cfg.adaptive.exploration_experts,
+            active_count,
+            mole_cfg.num_experts,
+        )
+        selected = ordering[: max(0, active_count - exploration)]
+        cursor = (step * max(1, exploration)) % mole_cfg.num_experts
+        if len(selected) < active_count:
+            for offset in range(mole_cfg.num_experts):
+                candidate = (cursor + offset) % mole_cfg.num_experts
+                if candidate not in selected:
+                    selected.append(candidate)
+                if len(selected) >= active_count:
+                    break
+        pool = tuple(selected)
+        set_adaptive_expert_pool(model, pool)
+        training_state.update(order=ordering, active_pool=pool)
+        mole_cfg.adaptive.baseline_nll = controller.baseline("nll")
+        mole_cfg.adaptive.preferred_experts = tuple(ordering)
+
+    def training_metrics() -> dict:
+        metrics = router_usage_metrics(model)
+        if controller is not None:
+            metrics.update(
+                adaptive_controller=controller.telemetry(),
+                training_active_experts=len(training_state.get("active_pool", ())),
+            )
+        return metrics
+
+    def save(_step: int) -> None:
+        if controller is not None:
+            metadata["adaptive_controller"] = controller.telemetry()
+            metadata["preferred_experts"] = list(mole_cfg.adaptive.preferred_experts)
+        save_mole(
+            a_dir,
+            model,
+            mole_cfg,
+            base_ref=cfg["checkpoint_ref"],
+            extra_meta=metadata,
+        )
+
+    result = train_loop(
+        model,
+        batches,
+        optimizer,
+        scheduler,
+        loop_opts(cfg, rd, cuda, stage=routing_label),
+        aux_fn=lambda: aux_loss(model, mole_cfg.top_k, cfg.get("aux_weight", 0.01)),
+        save_fn=save,
+        metrics_fn=training_metrics,
+        loss_aux_fn=(
+            (
+                lambda task_nll: surprise_calibration_loss(
+                    model,
+                    task_nll,
+                    mole_cfg.adaptive.calibration_weight,
+                )
+            )
+            if adaptive
+            else None
+        ),
+        after_step_fn=update_adaptive_pool if adaptive else None,
+    )
+    if result["steps"] < 1:
+        raise RuntimeError("joint per-token MoLE training produced no optimizer steps")
+    save(0)
+    commit_quant_lock(cfg["checkpoint_id"], quant)
+    db.execute(
+        "UPDATE adapters SET status='trained', path=?, domains_json=?, meta_json=?, "
+        "num_experts=?, top_k=?, rank=? WHERE id=?",
+        (
+            str(a_dir),
+            json.dumps(metadata["global_domain_filter"]),
+            json.dumps(metadata),
+            mole_cfg.num_experts,
+            mole_cfg.top_k,
+            mole_cfg.rank,
+            cfg["adapter_id"],
+        ),
+    )
+    return {
+        "strategy": strategy,
+        "result": result,
+        "steps": result["steps"],
+        "docs_seen": batches.docs_seen,
+        "tokens": batches.tokens_seen,
+    }
 
 
 def run_mole(cfg: dict, rd: Path) -> dict:
+    strategy = _mole_training_strategy(cfg)
+    if strategy in {ADAPTIVE_SURPRISE_STRATEGY, JOINT_PER_TOKEN_STRATEGY}:
+        return _run_mole_joint_per_token(
+            cfg,
+            rd,
+            adaptive=strategy == ADAPTIVE_SURPRISE_STRATEGY,
+        )
+
     import torch
     from transformers.optimization import get_cosine_schedule_with_warmup
 
@@ -84,47 +640,172 @@ def run_mole(cfg: dict, rd: Path) -> dict:
     model, tokenizer, cuda, quant, notes = load_base(cfg["checkpoint_ref"], cfg["quant"])
     for n in notes:
         log(f"note: {n}")
+    prepare_kbit_training(model, quant)
+    log_memory("base loaded")
 
-    mole_cfg = MoLEConfig(
+    final_cfg = MoLEConfig(
         num_experts=cfg["num_experts"],
         rank=cfg["rank"],
         alpha=cfg.get("alpha") or cfg["rank"] * 2.0,
         top_k=cfg["top_k"],
         target_modules=tuple(cfg["target_modules"]),
     )
-    inject_mole(model, mole_cfg, expert_dtype=torch.bfloat16 if cuda else torch.float32)
-    set_stage(model, "both")
+    # Keep only one expert resident while stage 1 runs. The completed isolated
+    # checkpoints are assembled into the E-expert bank after all slices finish.
+    resident_cfg = MoLEConfig(
+        num_experts=1,
+        rank=final_cfg.rank,
+        alpha=final_cfg.alpha,
+        top_k=1,
+        target_modules=final_cfg.target_modules,
+    )
+    replaced = inject_mole(model, resident_cfg, expert_dtype=torch.bfloat16 if cuda else torch.float32)
+    if not replaced:
+        raise RuntimeError("no target linear modules matched the requested MoLE architecture")
+    set_trainable_expert(model, 0)
     if cfg.get("grad_ckpt", True):
         enable_grad_ckpt(model)
+    full_liger = cfg.get("liger_full_kernels", True)
+    fused_ce = enable_fused_linear_ce(
+        model,
+        cfg.get("liger_fused_ce", True),
+        full_kernels=full_liger,
+    )
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    log(f"injected MoLE: E={mole_cfg.num_experts} r={mole_cfg.rank} k={mole_cfg.top_k}, trainable={trainable:,}")
-
-    optimizer = make_optimizer(model, cfg["lr"], cuda=cuda)
-    scheduler = get_cosine_schedule_with_warmup(
-        optimizer, num_warmup_steps=max(1, cfg["max_steps"] // 20), num_training_steps=cfg["max_steps"]
+    log(
+        f"isolated MoLE stage 1: final E={final_cfg.num_experts} r={final_cfg.rank} "
+        f"k={final_cfg.top_k}; resident/trainable={trainable:,}; "
+        f"liger_full={fused_ce and full_liger}; cudnn_sdpa={cfg.get('cudnn_sdpa', True)}"
     )
-    batches = build_batches(cfg, tokenizer, cfg["max_steps"])
+    log_memory("single expert injected")
+
+    raw_plan = cfg.get("expert_plan")
+    plans = (
+        [ExpertDataPlan.from_dict(value) for value in raw_plan]
+        if raw_plan
+        else plan_expert_data(cfg["corpora"], final_cfg.num_experts, cfg.get("domains") or None)
+    )
+    if len(plans) != final_cfg.num_experts:
+        raise ValueError("expert data plan does not match num_experts")
+    step_budget = max(int(cfg["max_steps"]), final_cfg.num_experts)
+    expert_steps = allocate_expert_steps(step_budget, plans)
     a_dir = adapter_dir(cfg["adapter_id"])
+    parts_dir = a_dir / "experts"
+    parts_dir.mkdir(parents=True, exist_ok=True)
+    expert_paths: list[Path] = []
+    expert_results: list[dict] = []
+    step_offset = 0
+    docs_seen = 0
+    packed_tokens = 0
+    base_seed = int(cfg.get("seed", 42))
 
-    def save(_step: int) -> None:
-        save_mole(a_dir, model, mole_cfg, base_ref=cfg["checkpoint_ref"])
+    for expert_index, (plan, max_steps) in enumerate(zip(plans, expert_steps, strict=True)):
+        torch.manual_seed(base_seed + expert_index)
+        if cuda:
+            torch.cuda.manual_seed_all(base_seed + expert_index)
+        reset_expert(model, 0)
+        set_trainable_expert(model, 0)
+        optimizer = make_optimizer(model, cfg["lr"], cuda=cuda)
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=_warmup_steps(max_steps),
+            num_training_steps=max_steps,
+        )
+        batches = build_batches(
+            cfg,
+            tokenizer,
+            max_steps,
+            domains=list(plan.domains) or None,
+            shard_index=plan.shard_index,
+            num_shards=plan.num_shards,
+        )
+        expert_path = parts_dir / f"expert_{expert_index:03d}.safetensors"
 
-    result = train_loop(
+        def save_part(_step: int, path: Path = expert_path) -> None:
+            save_isolated_expert(path, model)
+
+        stage = f"expert {expert_index + 1}/{final_cfg.num_experts} · {plan.name}"
+        log(
+            f"training {stage}: step cap={max_steps}, domains={list(plan.domains)}, "
+            f"document_shard={plan.shard_index}"
+        )
+        result = train_loop(
+            model,
+            batches,
+            optimizer,
+            scheduler,
+            loop_opts(
+                cfg,
+                rd,
+                cuda,
+                max_steps=max_steps,
+                stage=stage,
+                step_offset=step_offset,
+                total_steps=step_budget,
+            ),
+            save_fn=save_part,
+        )
+        if result.get("data_exhausted", result["steps"] < max_steps):
+            log(
+                f"{stage}: data slice exhausted after {result['steps']}/{max_steps} optimizer steps; "
+                "the configured step count is a safety cap"
+            )
+        if result["steps"] < 1:
+            raise RuntimeError(f"{stage} produced no optimizer steps")
+        save_part(0)
+        expert_paths.append(expert_path)
+        expert_results.append({"index": expert_index, "plan": plan.to_dict(), **result})
+        docs_seen += batches.docs_seen
+        packed_tokens += batches.tokens_seen
+        step_offset += result["steps"]
+        del batches, scheduler, optimizer
+        gc.collect()
+        if cuda:
+            torch.cuda.empty_cache()
+        log_memory(f"{stage} complete")
+
+    set_active_expert(model, None)
+    set_stage(model, "none")
+    metadata = {
+        "stage": "isolated_experts",
+        "training_strategy": "sequential_single_resident_v1",
+        "expert_plan": [plan.to_dict() for plan in plans],
+        "fused_linear_cross_entropy": fused_ce,
+        "liger_full_kernels": fused_ce and full_liger,
+        "cudnn_priority_sdpa": bool(cfg.get("cudnn_sdpa", True)),
+    }
+    assemble_mole_experts(
+        a_dir,
         model,
-        batches,
-        optimizer,
-        scheduler,
-        loop_opts(cfg, rd, cuda),
-        aux_fn=lambda: aux_loss(model, mole_cfg.top_k, cfg.get("aux_weight", 0.01)),
-        save_fn=save,
+        final_cfg,
+        expert_paths,
+        base_ref=cfg["checkpoint_ref"],
+        extra_meta=metadata,
     )
-    save(0)
+    commit_quant_lock(cfg["checkpoint_id"], quant)
     db.execute(
-        "UPDATE adapters SET status='trained', path=? WHERE id=?",
-        (str(a_dir), cfg["adapter_id"]),
+        "UPDATE adapters SET status='trained', path=?, domains_json=?, meta_json=? WHERE id=?",
+        (
+            str(a_dir),
+            json.dumps(sorted({domain for plan in plans for domain in plan.domains})),
+            json.dumps(metadata),
+            cfg["adapter_id"],
+        ),
     )
-    return {"result": result, "docs_seen": batches.docs_seen, "tokens": batches.tokens_seen}
+    total_result = {
+        "steps": sum(result["steps"] for result in expert_results),
+        "tokens": sum(result["tokens"] for result in expert_results),
+        "elapsed_s": round(sum(result["elapsed_s"] for result in expert_results), 1),
+    }
+    return {
+        "strategy": metadata["training_strategy"],
+        "experts": expert_results,
+        "result": total_result,
+        "steps": total_result["steps"],
+        "docs_seen": docs_seen,
+        "tokens": packed_tokens,
+    }
 
 
 def run_router(cfg: dict, rd: Path) -> dict:
@@ -134,33 +815,67 @@ def run_router(cfg: dict, rd: Path) -> dict:
     a_row = db.q1("SELECT * FROM adapters WHERE id=?", (cfg["adapter_id"],))
     if not a_row:
         raise RuntimeError("adapter not found")
+    if a_row["checkpoint_id"] != cfg["checkpoint_id"]:
+        raise ValueError("adapter and router run reference different frozen checkpoints")
     quant = a_row["quant"]
     enforce_quant_lock(cfg["checkpoint_id"], quant)
     model, tokenizer, cuda, quant, notes = load_base(cfg["checkpoint_ref"], quant)
     for n in notes:
         log(f"note: {n}")
+    prepare_kbit_training(model, quant)
+    log_memory("router base loaded")
 
-    cfg_path = Path(a_row["path"]) / "mole_config.json"
-    saved = json.loads(cfg_path.read_text("utf-8"))
+    saved = load_mole_config(a_row["path"], expected_base_ref=cfg["checkpoint_ref"])
+    if saved.get("config", {}).get("router_type") == "per_token":
+        raise ValueError(
+            "this adapter already contains learned per-token block routers; "
+            "legacy shared-prompt router training is not applicable"
+        )
     mole_cfg = MoLEConfig.from_dict(saved["config"])
-    if cfg.get("top_k"):
-        mole_cfg.top_k = min(cfg["top_k"], mole_cfg.num_experts)
+    # Load the legacy expert bank strictly before adding the new shared-router
+    # namespace. Existing adapters and old per-layer router snapshots remain valid.
     inject_mole(model, mole_cfg, expert_dtype=torch.bfloat16 if cuda else torch.float32)
     n = apply_mole_weights(model, load_mole_weights(a_row["path"]))
     log(f"loaded adapter weights into {n} expert matrices")
+    mole_cfg.router_type = "shared_prompt"
+    mole_cfg.top_k = min(cfg.get("top_k") or mole_cfg.top_k, mole_cfg.num_experts)
+    mole_cfg.router_hidden_size = int(cfg.get("router_hidden_size", 256))
+    mole_cfg.router_max_tokens = int(cfg.get("router_max_tokens", 256))
+    attach_shared_router(model, mole_cfg)
+    set_active_expert(model, None)
     set_stage(model, "router")
     if cfg.get("grad_ckpt", True):
         enable_grad_ckpt(model)
+    full_liger = cfg.get("liger_full_kernels", True)
+    fused_ce = enable_fused_linear_ce(
+        model,
+        cfg.get("liger_fused_ce", True),
+        full_kernels=full_liger,
+    )
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    log(
+        f"shared prompt router trainable={trainable:,}; liger_full={fused_ce and full_liger}; "
+        f"cudnn_sdpa={cfg.get('cudnn_sdpa', True)}"
+    )
+    log_memory("router bank injected")
 
     optimizer = make_optimizer(model, cfg["lr"], cuda=cuda)
     scheduler = get_cosine_schedule_with_warmup(
-        optimizer, num_warmup_steps=max(1, cfg["max_steps"] // 20), num_training_steps=cfg["max_steps"]
+        optimizer,
+        num_warmup_steps=_warmup_steps(cfg["max_steps"]),
+        num_training_steps=cfg["max_steps"],
     )
     batches = build_batches(cfg, tokenizer, cfg["max_steps"])
     r_dir = router_dir(cfg["router_id"])
 
     def save(_step: int) -> None:
-        save_mole(r_dir, model, mole_cfg, base_ref=cfg["checkpoint_ref"], extra_meta={"stage": "router"})
+        save_mole(
+            r_dir,
+            model,
+            mole_cfg,
+            base_ref=cfg["checkpoint_ref"],
+            extra_meta={"stage": "router", "router_arch": "shared_prompt_v1"},
+        )
 
     result = train_loop(
         model,
@@ -171,20 +886,242 @@ def run_router(cfg: dict, rd: Path) -> dict:
         aux_fn=lambda: aux_loss(model, mole_cfg.top_k, cfg.get("aux_weight", 0.01)),
         save_fn=save,
     )
+    master_summary_fn = getattr(optimizer, "master_state_summary", None)
+    master_summary = master_summary_fn() if callable(master_summary_fn) else None
+    if master_summary is not None:
+        log(
+            "persistent optimizer state: "
+            + json.dumps(master_summary, sort_keys=True)
+        )
+        result["persistent_optimizer_state"] = master_summary
     save(0)
     db.execute("UPDATE routers SET status='trained', path=? WHERE id=?", (str(r_dir), cfg["router_id"]))
     return {"result": result, "docs_seen": batches.docs_seen, "tokens": batches.tokens_seen}
 
 
+def _base_initialization(cfg: dict) -> dict:
+    initialization = cfg.get("initialization")
+    if isinstance(initialization, dict):
+        return dict(initialization)
+    # Version-one jobs always continued an existing checkpoint.
+    return {
+        "mode": "pretrained",
+        "checkpoint_id": cfg.get("checkpoint_id"),
+        "checkpoint_ref": cfg.get("checkpoint_ref"),
+        "tokenizer_ref": cfg.get("checkpoint_ref"),
+    }
+
+
+def _precision_config(cfg: dict) -> dict:
+    precision = cfg.get("precision")
+    if isinstance(precision, dict):
+        return dict(precision)
+    return {
+        "parameter_dtype": cfg.get("parameter_dtype", "bf16"),
+        "qat": "none",
+        "qat_group_size": 32,
+        "activation_qat": "none",
+    }
+
+
+def _create_scratch_base(cfg: dict):
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    initialization = _base_initialization(cfg)
+    tokenizer_ref = str(initialization.get("tokenizer_ref") or cfg.get("tokenizer_ref") or "")
+    if not tokenizer_ref:
+        raise ValueError("scratch training requires a tokenizer source")
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_ref)
+    if tokenizer.eos_token_id is None:
+        raise ValueError("scratch tokenizer must define an EOS token")
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    precision = _precision_config(cfg)
+    qat_mode = str(precision.get("qat") or "none")
+    spec = ScratchModelSpec.from_dict(cfg.get("architecture"))
+    spec.validate(
+        tokenizer_vocab_size=len(tokenizer),
+        train_sequence_length=int(cfg["seq_len"]),
+        qat_mode=qat_mode,
+    )
+    config = build_hf_config(spec, tokenizer)
+    resolved_spec = ScratchModelSpec.from_dict(config.yylab_scratch_architecture)
+    tokenizer.model_max_length = resolved_spec.max_position_embeddings
+
+    dtype_name = str(precision.get("parameter_dtype") or "bf16")
+    dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
+    if dtype_name not in dtype_map:
+        raise ValueError(f"unsupported parameter dtype: {dtype_name}")
+    cuda = torch.cuda.is_available()
+    if not cuda and dtype_name == "fp16":
+        raise ValueError("FP16 scratch training requires CUDA")
+    dtype = dtype_map[dtype_name]
+    seed = int(cfg.get("seed", 42))
+    torch.manual_seed(seed)
+    if cuda:
+        torch.cuda.manual_seed_all(seed)
+    device = torch.device("cuda:0" if cuda else "cpu")
+    # Construct directly on the destination device and requested dtype. This
+    # avoids a second full-sized host model during random initialization.
+    with torch.device(device):
+        model = AutoModelForCausalLM.from_config(config, dtype=dtype)
+    model.config.use_cache = False
+    model.config.yylab_training_recipe = {
+        "version": BASE_RECIPE_VERSION,
+        "initialization": initialization,
+        "architecture": resolved_spec.to_dict(),
+        "precision": precision,
+        "sequence_length": int(cfg["seq_len"]),
+        "seed": seed,
+    }
+
+    notes = [
+        f"randomly initialized {model.config.model_type} with "
+        f"{estimate_parameter_count(resolved_spec):,} parameters on {device}",
+        f"native context={resolved_spec.max_position_embeddings:,}; "
+        f"training sequence={int(cfg['seq_len']):,}",
+    ]
+    low_precision = qat_metadata(
+        qat_mode,
+        group_size=int(precision.get("qat_group_size") or 32),
+        activation=str(precision.get("activation_qat") or "none"),
+        parameter_dtype=dtype_name,
+        sparsity=str(precision.get("sparsity") or "none"),
+        backend=str(precision.get("qat_backend") or "auto"),
+        sparsity_backend=str(precision.get("sparsity_backend") or "auto"),
+        backward_precision=str(precision.get("backward_precision") or "bf16"),
+        backward_backend=str(precision.get("backward_backend") or "auto"),
+    )
+    if low_precision is not None:
+        count = apply_qat(model, low_precision)
+        native_note = (
+            "native block-scaled FP4 forward GEMMs"
+            if low_precision.get("native_low_bit_gemm")
+            else "emulated low-bit forward numerics"
+        )
+        if low_precision.get("native_sparse_gemm"):
+            sparse_note = "; compressed paired-4:8 cuSPARSELt execution"
+        elif low_precision.get("sparsity") != "none":
+            sparse_note = "; paired 4:8 SAT mask with dense FP4 execution"
+        else:
+            sparse_note = ""
+        backward_note = (
+            "; native block-32 MXFP8 dgrad/wgrad"
+            if low_precision.get("native_low_bit_backward")
+            else (
+                "; emulated block-32 MXFP8 dgrad/wgrad"
+                if low_precision.get("backward_precision") == "mxfp8"
+                else "; BF16 dgrad/wgrad"
+            )
+        )
+        notes.append(
+            f"{qat_mode} QAT applied to {count} transformer Linear modules; "
+            f"{native_note}{sparse_note}{backward_note}; BF16 shadow parameters retained"
+        )
+    return model, tokenizer, cuda, dtype_name, notes
+
+
+def _make_base_optimizer(model, cfg: dict, *, cuda: bool):
+    optimizer_cfg = cfg.get("optimizer") if isinstance(cfg.get("optimizer"), dict) else {}
+    lr = float(optimizer_cfg.get("lr", cfg.get("lr", 5e-5)))
+    betas = (
+        float(optimizer_cfg.get("beta1", 0.9)),
+        float(optimizer_cfg.get("beta2", 0.999)),
+    )
+    return make_optimizer(
+        model,
+        lr,
+        weight_decay=float(optimizer_cfg.get("weight_decay", cfg.get("weight_decay", 0.0))),
+        cuda=cuda,
+        optimizer_state=str(optimizer_cfg.get("state", cfg.get("optimizer_state", "auto")) or "auto"),
+        implementation=str(optimizer_cfg.get("implementation", "auto") or "auto"),
+        betas=betas,
+        eps=float(optimizer_cfg.get("eps", 1e-8)),
+        master_weight_storage=str(optimizer_cfg.get("master_weight_storage", "fp32") or "fp32"),
+        adaptive_max_promoted_fraction=float(
+            optimizer_cfg.get("adaptive_max_promoted_fraction", 0.10)
+        ),
+        adaptive_promote_threshold=float(
+            optimizer_cfg.get("adaptive_promote_threshold", 0.55)
+        ),
+        adaptive_demote_threshold=float(
+            optimizer_cfg.get("adaptive_demote_threshold", 0.20)
+        ),
+        adaptive_demote_patience=int(optimizer_cfg.get("adaptive_demote_patience", 2)),
+    )
+
+
+def _make_base_scheduler(optimizer, cfg: dict):
+    from transformers import get_scheduler
+
+    scheduler_cfg = cfg.get("scheduler") if isinstance(cfg.get("scheduler"), dict) else {}
+    name = str(scheduler_cfg.get("name", "cosine") or "cosine")
+    max_steps = int(cfg["max_steps"])
+    explicit_warmup = scheduler_cfg.get("warmup_steps")
+    if explicit_warmup is not None and int(explicit_warmup) >= 0:
+        warmup_steps = min(int(explicit_warmup), max_steps)
+    elif "warmup_ratio" in scheduler_cfg:
+        warmup_steps = min(round(max_steps * float(scheduler_cfg["warmup_ratio"])), max_steps)
+    else:
+        warmup_steps = _warmup_steps(max_steps)
+    specific: dict = {}
+    if name == "cosine_with_restarts":
+        specific["num_cycles"] = int(scheduler_cfg.get("num_cycles", 1))
+    return get_scheduler(
+        name,
+        optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=max_steps,
+        scheduler_specific_kwargs=specific or None,
+    ), warmup_steps
+
+
 def run_base(cfg: dict, rd: Path) -> dict:
-    from transformers.optimization import get_cosine_schedule_with_warmup
+    import torch
 
-    method = cfg["method"]
-    quant = cfg["quant"] if method == "qlora" else "bf16"
-    model, tokenizer, cuda, quant, notes = load_base(cfg["checkpoint_ref"], quant)
-    for n in notes:
-        log(f"note: {n}")
+    cfg = normalize_base_data_config(cfg)
+    data_provenance = corpus_data_provenance(
+        cfg["corpora"],
+        cfg.get("domains"),
+        corpus_mix=cfg["corpus_mix"],
+    )
+    log(
+        "base data: "
+        f"corpora={','.join(cfg['corpora'])}; "
+        f"mix={cfg['corpus_mix']}; domains={cfg.get('domains') or 'all'}"
+    )
+    initialization = _base_initialization(cfg)
+    mode = str(initialization.get("mode") or "pretrained")
+    method = str(cfg.get("method") or "full")
+    if mode == "scratch" and method != "full":
+        raise ValueError("scratch initialization supports full-parameter training only")
 
+    precision = _precision_config(cfg)
+    requested_dtype = str(precision.get("parameter_dtype") or "bf16")
+    quant = str(cfg.get("quant") or "nf4") if method == "qlora" else requested_dtype
+    if mode == "scratch":
+        model, tokenizer, cuda, quant, notes = _create_scratch_base(cfg)
+    else:
+        checkpoint_id = str(initialization.get("checkpoint_id") or cfg.get("checkpoint_id") or "")
+        checkpoint_ref = str(initialization.get("checkpoint_ref") or cfg.get("checkpoint_ref") or "")
+        if not checkpoint_ref:
+            raise ValueError("continued base training requires a checkpoint reference")
+        if method != "full":
+            enforce_quant_lock(checkpoint_id, quant)
+        model, tokenizer, cuda, quant, notes = load_base(checkpoint_ref, quant)
+
+    for note in notes:
+        log(f"note: {note}")
+    if method == "qlora":
+        prepare_kbit_training(model, quant)
+    log_memory("base training model loaded")
+
+    seed = int(cfg.get("seed", 42))
+    torch.manual_seed(seed)
+    if cuda:
+        torch.cuda.manual_seed_all(seed)
     if method in {"lora", "qlora"}:
         from peft import LoraConfig, get_peft_model
 
@@ -192,7 +1129,7 @@ def run_base(cfg: dict, rd: Path) -> dict:
             r=cfg.get("rank", 32),
             lora_alpha=cfg.get("alpha", 64),
             target_modules="all-linear",
-            lora_dropout=0.0,
+            lora_dropout=float(cfg.get("lora_dropout", 0.0)),
             bias="none",
             task_type="CAUSAL_LM",
         )
@@ -200,55 +1137,145 @@ def run_base(cfg: dict, rd: Path) -> dict:
         model.print_trainable_parameters()
     if cfg.get("grad_ckpt", True):
         enable_grad_ckpt(model)
+    if cfg.get("allow_tf32", True) and cuda:
+        torch.set_float32_matmul_precision("high")
+    full_liger = cfg.get("liger_full_kernels", True)
+    fused_ce = enable_fused_linear_ce(
+        model,
+        cfg.get("liger_fused_ce", True),
+        full_kernels=full_liger,
+    )
+    log(
+        f"base training init={mode}; dtype={requested_dtype}; "
+        f"qat={precision.get('qat', 'none')}; sparsity={precision.get('sparsity', 'none')}; "
+        f"liger_full={fused_ce and full_liger}; "
+        f"cudnn_sdpa={cfg.get('cudnn_sdpa', True)}"
+    )
 
-    optimizer = make_optimizer(model, cfg["lr"], cuda=cuda)
-    scheduler = get_cosine_schedule_with_warmup(
-        optimizer, num_warmup_steps=max(1, cfg["max_steps"] // 20), num_training_steps=cfg["max_steps"]
+    optimizer = _make_base_optimizer(model, cfg, cuda=cuda)
+    scheduler, warmup_steps = _make_base_scheduler(optimizer, cfg)
+    optimizer_cfg = cfg.get("optimizer") if isinstance(cfg.get("optimizer"), dict) else {}
+    log(
+        f"optimizer={type(optimizer).__name__}; scheduler={type(scheduler).__name__}; "
+        f"warmup={warmup_steps} steps; "
+        f"master={optimizer_cfg.get('master_weight_storage', 'fp32')}"
     )
     batches = build_batches(cfg, tokenizer, cfg["max_steps"])
+    train_model = model
+    if cfg.get("torch_compile", False):
+        compile_mode = str(cfg.get("compile_mode") or "default")
+        train_model = torch.compile(model, mode=compile_mode)
+        log(f"torch.compile enabled ({compile_mode})")
 
-    def save(_step: int) -> None:
+    def save(step: int) -> None:
         if method == "full":
-            out = checkpoint_dir(cfg["out_checkpoint_id"])
+            root = checkpoint_dir(cfg["out_checkpoint_id"])
+            out = root if step == 0 else root / "steps" / f"step-{step:08d}"
             out.mkdir(parents=True, exist_ok=True)
-            model.save_pretrained(out)
-            tokenizer.save_pretrained(out)
+            previous_cache = getattr(model.config, "use_cache", False)
+            model.config.use_cache = True
+            try:
+                model.save_pretrained(out)
+                tokenizer.save_pretrained(out)
+                write_json(out / "yylab_recipe.json", cfg)
+            finally:
+                model.config.use_cache = previous_cache
         else:
             out = adapter_dir(cfg["adapter_id"])
             out.mkdir(parents=True, exist_ok=True)
             model.save_pretrained(out)
+            write_json(out / "yylab_recipe.json", cfg)
 
     result = train_loop(
-        model, batches, optimizer, scheduler, loop_opts(cfg, rd, cuda), save_fn=save
+        train_model,
+        batches,
+        optimizer,
+        scheduler,
+        loop_opts(cfg, rd, cuda),
+        save_fn=save,
     )
+    if int(result.get("steps", 0)) < 1:
+        raise RuntimeError(
+            "selected base-training corpora produced no complete training sequences; "
+            "check corpus shards, domain filters, and sequence length"
+        )
+    master_summary_fn = getattr(optimizer, "master_state_summary", None)
+    master_summary = master_summary_fn() if callable(master_summary_fn) else None
+    if master_summary is not None:
+        log("persistent optimizer state: " + json.dumps(master_summary, sort_keys=True))
+        result["persistent_optimizer_state"] = master_summary
     save(0)
 
     if method == "full":
         out = checkpoint_dir(cfg["out_checkpoint_id"])
-        params = sum(p.numel() for p in model.parameters()) / 1e9
+        params_raw = sum(parameter.numel() for parameter in model.parameters())
+        architecture = getattr(model.config, "yylab_scratch_architecture", None)
+        checkpoint_meta = {
+            "recipe_version": BASE_RECIPE_VERSION,
+            "initialization": mode,
+            "derived_from": (
+                initialization.get("checkpoint_ref") or cfg.get("checkpoint_ref")
+                if mode != "scratch"
+                else None
+            ),
+            "tokenizer_ref": initialization.get("tokenizer_ref"),
+            "architecture": architecture,
+            "precision": precision,
+            "optimizer": optimizer_cfg,
+            "training_sequence_length": int(cfg["seq_len"]),
+            "parameters": params_raw,
+            "data_provenance": data_provenance,
+        }
         db.execute(
             "UPDATE checkpoints SET kind='base', source='local', ref=?, arch=?, params_b=?, path=?,"
             " hidden_size=?, num_layers=?, meta_json=? WHERE id=?",
             (
                 str(out),
-                type(model).__name__,
-                round(params, 3),
+                (getattr(model.config, "architectures", None) or [type(model).__name__])[0],
+                round(params_raw / 1e9, 6),
                 str(out),
                 int(getattr(model.config, "hidden_size", 0) or 0),
                 int(getattr(model.config, "num_hidden_layers", 0) or 0),
-                json.dumps({"derived_from": cfg["checkpoint_ref"]}),
+                json.dumps(checkpoint_meta),
                 cfg["out_checkpoint_id"],
             ),
         )
     else:
+        checkpoint_id = str(initialization.get("checkpoint_id") or cfg.get("checkpoint_id") or "")
+        commit_quant_lock(checkpoint_id, quant)
+        adapter_row = db.q1("SELECT meta_json FROM adapters WHERE id=?", (cfg["adapter_id"],))
+        try:
+            adapter_meta = json.loads((adapter_row or {}).get("meta_json") or "{}")
+        except (TypeError, ValueError):
+            adapter_meta = {}
+        adapter_meta["data_provenance"] = data_provenance
         db.execute(
-            "UPDATE adapters SET status='trained', path=? WHERE id=?",
-            (str(adapter_dir(cfg["adapter_id"])), cfg["adapter_id"]),
+            "UPDATE adapters SET status='trained', path=?, corpora_json=?, meta_json=? WHERE id=?",
+            (
+                str(adapter_dir(cfg["adapter_id"])),
+                json.dumps(cfg["corpora"]),
+                json.dumps(adapter_meta),
+                cfg["adapter_id"],
+            ),
         )
-    return {"result": result, "docs_seen": batches.docs_seen, "tokens": batches.tokens_seen}
+    return {
+        "result": result,
+        "docs_seen": batches.docs_seen,
+        "tokens": batches.tokens_seen,
+        "initialization": mode,
+        "parameter_dtype": requested_dtype,
+        "qat": precision.get("qat", "none"),
+        "sparsity": precision.get("sparsity", "none"),
+        "master_weight_storage": optimizer_cfg.get("master_weight_storage", "fp32"),
+        "persistent_optimizer_state": master_summary,
+        "corpora": list(cfg["corpora"]),
+        "corpus_mix": cfg["corpus_mix"],
+        "domains": list(cfg.get("domains") or []),
+        "data_provenance": data_provenance,
+    }
 
 
-def _calib_ids(ref: str, corpora: list[str], seq_len: int = 512, n_seqs: int = 2) -> list[list[int]]:
+def _calib_ids(ref: str, corpora: list[str], seq_len: int = 512, n_seqs: int = 8) -> list[list[int]]:
     from transformers import AutoTokenizer
 
     from ..train.data import iter_corpus_docs
@@ -264,9 +1291,11 @@ def _calib_ids(ref: str, corpora: list[str], seq_len: int = 512, n_seqs: int = 2
             carry.append(eos)
         while len(carry) >= seq_len and len(seqs) < n_seqs:
             seqs.append(carry[:seq_len])
-            carry = carry[seq_len :]
+            carry = carry[seq_len:]
         if len(seqs) >= n_seqs:
             break
+    if carry and len(seqs) < n_seqs:
+        seqs.append(carry[:seq_len])
     return seqs
 
 
@@ -276,20 +1305,64 @@ def run_export(cfg: dict, rd: Path) -> dict:
     from ..models.loading import scan_checkpoint
 
     out = checkpoint_dir(cfg["out_checkpoint_id"])
+    calibration_ids: list[list[int]] | None = None
+    source_router_type: str | None = None
+    export_mode = "merged_lora_v1"
     if cfg["adapter_arch"] == "lora":
         merge_lora(cfg["checkpoint_ref"], cfg["adapter_path"], out)
     else:
-        calib = None
+        artifact = load_mole_config(
+            Path(cfg["adapter_path"]),
+            expected_base_ref=cfg["checkpoint_ref"],
+        )
+        source_router_type = str(artifact.get("config", {}).get("router_type") or "per_layer")
+        joint_per_token = source_router_type == "per_token"
+        if joint_per_token and cfg.get("router_path"):
+            raise ValueError(
+                "joint per-token adapters already contain block routers; "
+                "a legacy shared-prompt router snapshot cannot be selected for export"
+            )
+        export_mode = "calibrated_static_mole_v1" if joint_per_token else "static_mole_merge_v1"
+        if joint_per_token and not cfg.get("corpora"):
+            raise ValueError(
+                "joint per-token export requires calibration corpora; "
+                "dynamic token routing cannot be preserved in a merged checkpoint"
+            )
         if cfg.get("corpora"):
-            calib = _calib_ids(cfg["checkpoint_ref"], cfg["corpora"])
-            log(f"calibrating expert usage on {len(calib)} sequences")
+            calibration_ids = _calib_ids(cfg["checkpoint_ref"], cfg["corpora"])
+            if joint_per_token and not calibration_ids:
+                raise RuntimeError("calibration corpora produced no token sequences")
+            log(
+                f"calibrating static expert weights on {len(calibration_ids)} sequences; "
+                "the exported checkpoint will not preserve dynamic routing"
+            )
         merge_mole(
             cfg["checkpoint_ref"],
             cfg["adapter_path"],
             out,
-            router_path=cfg.get("router_path"),
-            calib_ids=calib,
+            router_path=None if joint_per_token else cfg.get("router_path"),
+            calib_ids=calibration_ids,
         )
+
+    export_metadata = {
+        "exported_from": cfg["checkpoint_ref"],
+        "adapter": cfg.get("adapter_path"),
+        "adapter_arch": cfg["adapter_arch"],
+        "export_mode": export_mode,
+        "source_router_type": source_router_type,
+        "dynamic_token_routing_preserved": False if source_router_type == "per_token" else None,
+        "calibration": {
+            "performed": calibration_ids is not None,
+            "sequence_count": len(calibration_ids or []),
+            "corpora": list(cfg.get("corpora") or []),
+        },
+    }
+    model_config_path = out / "config.json"
+    model_config = read_json(model_config_path)
+    model_config["yylab_export"] = export_metadata
+    write_json(model_config_path, model_config)
+    write_json(out / "yylab_export.json", export_metadata)
+
     info = scan_checkpoint(out)
     import json as _json
 
@@ -303,11 +1376,15 @@ def run_export(cfg: dict, rd: Path) -> dict:
             str(out),
             info["hidden_size"],
             info["num_layers"],
-            _json.dumps({"exported_from": cfg["checkpoint_ref"], "adapter": cfg.get("adapter_path")}),
+            _json.dumps(export_metadata),
             cfg["out_checkpoint_id"],
         ),
     )
-    return {"params_b": info["params_b"], "arch": info["arch"]}
+    return {
+        "params_b": info["params_b"],
+        "arch": info["arch"],
+        "export": export_metadata,
+    }
 
 
 def main() -> None:
@@ -331,10 +1408,20 @@ def main() -> None:
     log(f"yylab worker: run={run_id} kind={run['kind']}")
 
     try:
+        if run["kind"] == "base":
+            cfg = normalize_base_data_config(cfg)
+            # The run-directory recipe is the canonical replay payload even for
+            # legacy rows that stored one scalar corpus ID.
+            write_json(rd / "config.json", cfg)
         if not cfg.get("max_steps") and run["kind"] in {"mole_stage1", "router_stage2", "base"}:
             cfg["max_steps"] = estimate_steps(
-                cfg["corpora"], cfg.get("domains"), cfg.get("epochs", 1),
-                cfg["seq_len"], cfg["micro_batch"], cfg["grad_accum"],
+                cfg["corpora"],
+                cfg.get("domains"),
+                cfg.get("epochs", 1),
+                cfg["seq_len"],
+                cfg["micro_batch"],
+                cfg["grad_accum"],
+                cfg.get("token_stats_key"),
             )
             log(f"estimated {cfg['max_steps']} optimizer steps")
 
@@ -346,6 +1433,10 @@ def main() -> None:
             summary = run_base(cfg, rd)
         elif run["kind"] == "export":
             summary = run_export(cfg, rd)
+        elif run["kind"] == "benchmark_quality":
+            summary = run_benchmark_quality(cfg, rd)
+        elif run["kind"] == "benchmark_train_perf":
+            summary = run_benchmark_training_performance(cfg, rd)
         else:
             raise RuntimeError(f"unknown run kind: {run['kind']}")
         db.execute(
@@ -360,11 +1451,7 @@ def main() -> None:
             "UPDATE runs SET status='failed', finished_at=?, error=? WHERE id=?",
             (db.now_iso(), err[-4000:], run_id),
         )
-        if run["kind"] != "export":
-            if cfg.get("adapter_id"):
-                db.execute("UPDATE adapters SET status='failed' WHERE id=?", (cfg["adapter_id"],))
-            if cfg.get("router_id"):
-                db.execute("UPDATE routers SET status='failed' WHERE id=?", (cfg["router_id"],))
+        mark_training_artifacts_failed(run["kind"], cfg)
         raise SystemExit(1)
 
 

@@ -7,11 +7,68 @@ from pathlib import Path
 from nicegui import ui
 
 from ... import db
-from ...artifacts import checkpoint_dir
+from ...artifacts import checkpoint_dir, read_json
 from ...models.loading import scan_checkpoint as scan_local_checkpoint
 from ...workers.launch import launch_worker
 from ..components import dir_browser, empty_state
 from ..shell import panel, shell
+
+JOINT_PER_TOKEN_STRATEGY = "joint_per_token_v1"
+PER_TOKEN_ROUTER = "per_token"
+STATIC_TOKEN_EXPORT_MODE = "calibrated_static_mole_v1"
+
+
+def _adapter_router_type(adapter: dict) -> str:
+    """Resolve routing from registry metadata, then the artifact itself."""
+
+    try:
+        metadata = json.loads(adapter.get("meta_json") or "{}")
+    except (TypeError, ValueError):
+        metadata = {}
+    if metadata.get("training_strategy") == JOINT_PER_TOKEN_STRATEGY:
+        return PER_TOKEN_ROUTER
+    if metadata.get("router_arch") == "shared_per_block_per_token_v1":
+        return PER_TOKEN_ROUTER
+
+    artifact_path = adapter.get("path")
+    if artifact_path:
+        config_path = Path(artifact_path) / "mole_config.json"
+        try:
+            payload = read_json(config_path)
+            router_type = payload.get("config", {}).get("router_type")
+            if isinstance(router_type, str):
+                return router_type
+        except (OSError, TypeError, ValueError):
+            pass
+    return "per_layer"
+
+
+def _export_job_config(
+    checkpoint: dict,
+    adapter: dict,
+    router: dict | None,
+    out_checkpoint_id: str,
+) -> dict:
+    router_type = _adapter_router_type(adapter)
+    joint_per_token = router_type == PER_TOKEN_ROUTER
+    try:
+        corpora = json.loads(adapter.get("corpora_json") or "[]")
+    except (TypeError, ValueError):
+        corpora = []
+    return {
+        "checkpoint_ref": checkpoint["ref"],
+        "adapter_id": adapter["id"],
+        "adapter_path": adapter["path"],
+        "adapter_arch": adapter["arch"],
+        # A stage-2 shared-prompt router is a different architecture and must
+        # never override the block token routers stored in a joint artifact.
+        "router_path": None if joint_per_token else router["path"] if router else None,
+        "source_router_type": router_type,
+        "export_mode": STATIC_TOKEN_EXPORT_MODE if joint_per_token else "merged_weights_v1",
+        "dynamic_token_routing_preserved": False if joint_per_token else None,
+        "corpora": corpora,
+        "out_checkpoint_id": out_checkpoint_id,
+    }
 
 
 @ui.page("/checkpoints")
@@ -30,6 +87,21 @@ def checkpoints_page():
             row = db.q1("SELECT quant FROM adapters WHERE checkpoint_id=? AND status!='deleted' ORDER BY created_at LIMIT 1", (cid,))
             return row["quant"] if row else ""
 
+        def base_recipe(c: dict) -> str:
+            try:
+                metadata = json.loads(c.get("meta_json") or "{}")
+            except (TypeError, ValueError):
+                metadata = {}
+            precision = metadata.get("precision") or {}
+            qat = str(precision.get("qat") or "none")
+            dtype = str(precision.get("parameter_dtype") or "")
+            initialization = str(metadata.get("initialization") or "")
+            if qat != "none":
+                return f"{initialization or 'base'} · {qat} QAT / {dtype or 'shadow'}"
+            if initialization or dtype:
+                return " · ".join(value for value in (initialization, dtype) if value)
+            return "imported"
+
         def rows() -> list[dict]:
             out = []
             for c in db.q("SELECT * FROM checkpoints ORDER BY created_at DESC"):
@@ -40,6 +112,7 @@ def checkpoints_page():
                         "arch": c["arch"],
                         "params": f'{c["params_b"]:.2f} B' if c["params_b"] else "?",
                         "source": f'{c["source"]}: {c["ref"]}',
+                        "recipe": base_recipe(c),
                         "quant_locked": c["quant_locked"] or "-",
                     }
                 )
@@ -65,6 +138,7 @@ def checkpoints_page():
                         {"name": "arch", "label": "Architecture", "field": "arch", "align": "left"},
                         {"name": "params", "label": "Params", "field": "params", "sortable": True},
                         {"name": "source", "label": "Source", "field": "source", "align": "left"},
+                        {"name": "recipe", "label": "Base recipe", "field": "recipe", "align": "left"},
                         {"name": "quant_locked", "label": "Quant lock", "field": "quant_locked"},
                     ],
                     rows=data,
@@ -107,6 +181,7 @@ def checkpoints_page():
                     ).props("flat dense no-caps color=negative")
                 ui.label(f'arch: {c["arch"]} · hidden {c["hidden_size"]} · {c["num_layers"]} layers · {c["params_b"]:.2f} B params')
                 ui.label(f'source: {c["source"]} → {c["ref"]}')
+                ui.label(f"base recipe: {base_recipe(c)}").classes("text-sm text-gray-400")
                 if c["quant_locked"]:
                     ui.label(
                         f'Quantization locked to {c["quant_locked"]} for all adapters on this checkpoint.'
@@ -119,50 +194,74 @@ def checkpoints_page():
                 if adapters:
                     ui.label("Adapters").classes("text-sm font-semibold mt-2")
                     for a in adapters:
+                        joint_per_token = _adapter_router_type(a) == PER_TOKEN_ROUTER
                         with ui.row().classes("w-full items-center justify-between gap-2"):
-                            ui.label(
-                                f'· {a["name"]} — {a["arch"]} E={a["num_experts"]} k={a["top_k"]} r={a["rank"]} quant={a["quant"]} [{a["status"]}]'
-                            ).classes("text-xs text-gray-400")
+                            with ui.column().classes("gap-0"):
+                                ui.label(
+                                    f'· {a["name"]} — {a["arch"]} E={a["num_experts"]} k={a["top_k"]} r={a["rank"]} quant={a["quant"]} [{a["status"]}]'
+                                ).classes("text-xs text-gray-400")
+                                if joint_per_token:
+                                    ui.label(
+                                        "Export calibrates a static expert blend; dynamic per-token routing is not preserved."
+                                    ).classes("text-[11px] text-amber-400")
                             with ui.row().classes("items-center gap-1"):
                                 if a["status"] == "trained":
-                                    ui.button(
-                                        "Export merged",
+                                    export_button = ui.button(
+                                        (
+                                            "Export calibrated static approximation"
+                                            if joint_per_token
+                                            else "Export merged"
+                                        ),
                                         icon="ios_share",
                                         on_click=lambda _, a=a: export_adapter(c, a),
                                     ).props("dense flat no-caps")
+                                    if joint_per_token:
+                                        export_button.tooltip(
+                                            "Uses the adapter's corpora to calibrate static expert weights. "
+                                            "The exported base model cannot route each token dynamically."
+                                        )
                                 ui.button(
                                     icon="delete",
                                     on_click=lambda _, a=a: ask_delete_adapter(a),
                                 ).props("dense flat no-caps color=negative").tooltip("Delete adapter + its routers")
 
         def export_adapter(ckpt_row: dict, a: dict) -> None:
-            router = db.q1(
-                "SELECT * FROM routers WHERE adapter_id=? AND status='trained' ORDER BY created_at DESC",
-                (a["id"],),
-            )
+            joint_per_token = _adapter_router_type(a) == PER_TOKEN_ROUTER
+            router = None
+            if not joint_per_token:
+                router = db.q1(
+                    "SELECT * FROM routers WHERE adapter_id=? AND status='trained' ORDER BY created_at DESC",
+                    (a["id"],),
+                )
             out_id = db.new_id("ckpt")
-            out_name = f'{ckpt_row["name"]}+{a["name"]}-merged'
+            suffix = "calibrated-static" if joint_per_token else "merged"
+            out_name = f'{ckpt_row["name"]}+{a["name"]}-{suffix}'
+            config = _export_job_config(ckpt_row, a, router, out_id)
+            if joint_per_token and not config["corpora"]:
+                ui.notify(
+                    "A joint per-token adapter needs its training corpora for calibrated static export.",
+                    type="warning",
+                )
+                return
             db.execute(
                 "INSERT INTO checkpoints(id, name, created_at, kind, source, ref) VALUES(?,?,?,?,?,?)",
                 (out_id, out_name, db.now_iso(), "pending", "pending", ""),
             )
             rid = db.new_id("run")
-            config = {
-                "checkpoint_ref": ckpt_row["ref"],
-                "adapter_id": a["id"],
-                "adapter_path": a["path"],
-                "adapter_arch": a["arch"],
-                "router_path": router["path"] if router else None,
-                "corpora": json.loads(a["corpora_json"] or "[]"),
-                "out_checkpoint_id": out_id,
-            }
             db.execute(
                 "INSERT INTO runs(id, kind, status, created_at, config_json) VALUES(?,?,?,?,?)",
                 (rid, "export", "queued", db.now_iso(), json.dumps(config)),
             )
             pid = launch_worker(rid)
             db.execute("UPDATE runs SET metrics_json=? WHERE id=?", (json.dumps({"pid": pid}), rid))
-            ui.notify(f"Export started — {out_name} (pid {pid}). See Runs.", type="positive")
+            if joint_per_token:
+                ui.notify(
+                    f"Calibrated static approximation started — {out_name} (pid {pid}). "
+                    "Dynamic token routing will not be preserved.",
+                    type="warning",
+                )
+            else:
+                ui.notify(f"Export started — {out_name} (pid {pid}). See Runs.", type="positive")
 
         def remove(cid: str) -> None:
             if db.q1("SELECT id FROM adapters WHERE checkpoint_id=?", (cid,)):

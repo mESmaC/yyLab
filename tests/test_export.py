@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 import torch
 from transformers import AutoModelForCausalLM, LlamaConfig, LlamaForCausalLM
 
 from yylab.export.merge import expert_usage_weights, merge_lora, merge_mole
-from yylab.mole.inject import MoLEConfig, inject_mole, mole_layers
+from yylab.mole.inject import MoLEConfig, inject_mole, mole_layers, token_routers
 from yylab.mole.store import save_mole
 
 
@@ -92,7 +93,7 @@ def test_merge_mole_zero_router_exact(tmp_path):
     assert torch.allclose(ref, got, atol=1e-2)
 
 
-def test_expert_usage_uniform_at_init(tmp_path):
+def test_expert_usage_reflects_sparse_top_k_at_init(tmp_path):
     model_dir = _tiny_llama_dir(tmp_path)
     model = AutoModelForCausalLM.from_pretrained(model_dir)
     mole_cfg = MoLEConfig(num_experts=3, rank=4, alpha=8.0, top_k=2, target_modules=("q_proj",))
@@ -100,7 +101,9 @@ def test_expert_usage_uniform_at_init(tmp_path):
     weights = expert_usage_weights(model, [[2, 3, 4, 5, 6]])
     assert len(weights) == 2
     for w in weights.values():
-        assert torch.allclose(w, torch.full_like(w, 1.0 / 3.0), atol=1e-5)
+        assert torch.allclose(w.sum(), torch.tensor(1.0))
+        assert torch.count_nonzero(w) == 2
+        assert torch.allclose(w[w > 0], torch.tensor([0.5, 0.5]))
 
 
 def test_merge_mole_with_calibration(tmp_path):
@@ -122,3 +125,61 @@ def test_merge_mole_with_calibration(tmp_path):
     merged = AutoModelForCausalLM.from_pretrained(out)
     x = torch.tensor([[2, 3, 4]])
     assert merged(x).logits.shape == (1, 3, 128)
+
+
+def test_token_router_calibration_reuses_each_blocks_sparse_route(tmp_path):
+    model_dir = _tiny_llama_dir(tmp_path)
+    model = AutoModelForCausalLM.from_pretrained(model_dir)
+    mole_cfg = MoLEConfig(
+        num_experts=3,
+        rank=2,
+        alpha=4.0,
+        top_k=1,
+        target_modules=("q_proj", "v_proj"),
+        router_type="per_token",
+    )
+    inject_mole(model, mole_cfg)
+    for _, router in token_routers(model):
+        router.gate.weight.data.zero_()
+
+    weights = expert_usage_weights(model, [[2, 3, 4, 5, 6]])
+
+    assert len(weights) == 4
+    by_block: dict[str, list[torch.Tensor]] = {}
+    for name, weight in weights.items():
+        block = name.split(".self_attn")[0]
+        by_block.setdefault(block, []).append(weight)
+        assert torch.allclose(weight.sum(), torch.tensor(1.0))
+        assert torch.count_nonzero(weight) == 1
+    assert all(len(block_weights) == 2 for block_weights in by_block.values())
+    assert all(torch.equal(block_weights[0], block_weights[1]) for block_weights in by_block.values())
+
+
+def test_merge_token_routed_mole_requires_calibration(tmp_path):
+    model_dir = _tiny_llama_dir(tmp_path)
+    model = AutoModelForCausalLM.from_pretrained(model_dir)
+    mole_cfg = MoLEConfig(
+        num_experts=2,
+        rank=2,
+        alpha=4.0,
+        top_k=1,
+        target_modules=("q_proj",),
+        router_type="per_token",
+    )
+    inject_mole(model, mole_cfg)
+    adp_dir = tmp_path / "token_mole_adp"
+    save_mole(adp_dir, model, mole_cfg, base_ref=str(model_dir))
+
+    with pytest.raises(ValueError, match="requires calibration data"):
+        merge_mole(str(model_dir), str(adp_dir), tmp_path / "uncalibrated")
+
+    out = merge_mole(
+        str(model_dir),
+        str(adp_dir),
+        tmp_path / "calibrated",
+        calib_ids=[[2, 3, 4, 5, 6]],
+    )
+    merged = AutoModelForCausalLM.from_pretrained(out)
+    assert not mole_layers(merged)
+    assert not token_routers(merged)
+    assert merged(torch.tensor([[2, 3, 4]])).logits.shape == (1, 3, 128)

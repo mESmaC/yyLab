@@ -12,11 +12,13 @@ ACCENT = "#8b6bff"
 NAV = [
     ("Dashboard", "/", "dashboard"),
     ("Corpora", "/corpora", "folder_open"),
+    ("Review", "/review", "rate_review"),
     ("Checkpoints", "/checkpoints", "hub"),
     ("Train · MoLE", "/train/mole", "psychology"),
     ("Train · Router", "/train/router", "alt_route"),
     ("Train · Base", "/train/base", "memory"),
     ("Context & KV", "/context", "speed"),
+    ("Benchmarks", "/benchmarks", "science"),
     ("Chat", "/chat", "chat"),
     ("Runs", "/runs", "history"),
     ("Settings", "/settings", "settings"),

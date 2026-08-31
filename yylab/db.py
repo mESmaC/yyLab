@@ -4,6 +4,8 @@ import datetime as dt
 import sqlite3
 import threading
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 from .config import PATHS
 
@@ -80,7 +82,108 @@ CREATE TABLE IF NOT EXISTS runs(
   log_path TEXT DEFAULT '',
   error TEXT DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS reviews(
+  id TEXT PRIMARY KEY,
+  corpus_id TEXT NOT NULL REFERENCES corpora(id),
+  created_at TEXT NOT NULL,
+  updated_at TEXT DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'completed',
+  docs_reviewed INTEGER DEFAULT 0,
+  docs_good INTEGER DEFAULT 0,
+  docs_bad INTEGER DEFAULT 0,
+  verdict TEXT DEFAULT '',
+  approved_corpus_id TEXT DEFAULT '',
+  rejected_corpus_id TEXT DEFAULT '',
+  annotation_path TEXT DEFAULT '',
+  sampling_strategy TEXT DEFAULT 'uniform',
+  model_version TEXT DEFAULT '',
+  notes TEXT DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS rejected_hashes(
+  hash TEXT PRIMARY KEY,
+  added_at TEXT NOT NULL,
+  source TEXT DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS review_annotations(
+  hash TEXT PRIMARY KEY,
+  verdict TEXT NOT NULL,
+  corpus_id TEXT NOT NULL,
+  review_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  text TEXT NOT NULL DEFAULT '',
+  domain TEXT DEFAULT '',
+  lang TEXT DEFAULT '',
+  quality REAL,
+  source TEXT DEFAULT '',
+  bucket TEXT DEFAULT '',
+  sampling_strategy TEXT DEFAULT 'uniform',
+  sampling_component TEXT DEFAULT '',
+  sampling_propensity REAL,
+  model_version TEXT DEFAULT '',
+  rank_score REAL,
+  uncertainty REAL,
+  model_scores_json TEXT DEFAULT '{}',
+  metadata_json TEXT DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_review_annotations_corpus ON review_annotations(corpus_id);
+CREATE TABLE IF NOT EXISTS review_swipes(
+  id TEXT PRIMARY KEY,
+  review_id TEXT NOT NULL,
+  hash TEXT NOT NULL,
+  corpus_id TEXT NOT NULL,
+  verdict TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  text TEXT NOT NULL,
+  domain TEXT DEFAULT '',
+  lang TEXT DEFAULT '',
+  quality REAL,
+  source TEXT DEFAULT '',
+  bucket TEXT DEFAULT '',
+  sampling_strategy TEXT DEFAULT 'uniform',
+  sampling_component TEXT DEFAULT '',
+  sampling_propensity REAL,
+  model_version TEXT DEFAULT '',
+  rank_score REAL,
+  uncertainty REAL,
+  model_scores_json TEXT DEFAULT '{}',
+  metadata_json TEXT DEFAULT '{}',
+  is_new_annotation INTEGER NOT NULL DEFAULT 0,
+  UNIQUE(review_id, hash)
+);
+CREATE INDEX IF NOT EXISTS idx_review_swipes_review ON review_swipes(review_id);
+CREATE INDEX IF NOT EXISTS idx_review_swipes_hash ON review_swipes(hash);
 """
+
+_REVIEW_COLUMNS = {
+    "updated_at": "TEXT DEFAULT ''",
+    "status": "TEXT NOT NULL DEFAULT 'completed'",
+    "rejected_corpus_id": "TEXT DEFAULT ''",
+    "annotation_path": "TEXT DEFAULT ''",
+    "sampling_strategy": "TEXT DEFAULT 'uniform'",
+    "model_version": "TEXT DEFAULT ''",
+}
+
+_ANNOTATION_COLUMNS = {
+    "text": "TEXT NOT NULL DEFAULT ''",
+    "domain": "TEXT DEFAULT ''",
+    "lang": "TEXT DEFAULT ''",
+    "quality": "REAL",
+    "source": "TEXT DEFAULT ''",
+    "bucket": "TEXT DEFAULT ''",
+    "sampling_strategy": "TEXT DEFAULT 'uniform'",
+    "sampling_component": "TEXT DEFAULT ''",
+    "sampling_propensity": "REAL",
+    "model_version": "TEXT DEFAULT ''",
+    "rank_score": "REAL",
+    "uncertainty": "REAL",
+    "model_scores_json": "TEXT DEFAULT '{}'",
+    "metadata_json": "TEXT DEFAULT '{}'",
+}
+
+_SWIPE_COLUMNS = {
+    "sampling_component": "TEXT DEFAULT ''",
+}
 
 
 def _connect() -> sqlite3.Connection:
@@ -94,6 +197,23 @@ def _connect() -> sqlite3.Connection:
 def init_db() -> None:
     with _lock, _connect() as con:
         con.executescript(SCHEMA)
+        cols = {r[1] for r in con.execute("PRAGMA table_info(corpora)")}
+        if "verdict" not in cols:
+            con.execute("ALTER TABLE corpora ADD COLUMN verdict TEXT DEFAULT ''")
+        if "kind" not in cols:
+            con.execute("ALTER TABLE corpora ADD COLUMN kind TEXT DEFAULT 'ingested'")
+        con.execute("UPDATE corpora SET kind='ingested' WHERE kind IS NULL OR kind=''")
+        _ensure_columns(con, "reviews", _REVIEW_COLUMNS)
+        _ensure_columns(con, "review_annotations", _ANNOTATION_COLUMNS)
+        _ensure_columns(con, "review_swipes", _SWIPE_COLUMNS)
+        con.execute("UPDATE reviews SET status='completed' WHERE status IS NULL OR status=''")
+
+
+def _ensure_columns(con: sqlite3.Connection, table: str, columns: dict[str, str]) -> None:
+    existing = {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
+    for name, definition in columns.items():
+        if name not in existing:
+            con.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
 
 def q(sql: str, args: tuple = ()) -> list[dict]:
@@ -116,6 +236,23 @@ def executemany(sql: str, seq) -> int:
     with _lock, _connect() as con:
         cur = con.executemany(sql, seq)
         return cur.rowcount
+
+
+@contextmanager
+def transaction() -> Iterator[sqlite3.Connection]:
+    """Run a group of writes atomically while serializing local writer threads."""
+    with _lock:
+        con = _connect()
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            yield con
+        except BaseException:
+            con.rollback()
+            raise
+        else:
+            con.commit()
+        finally:
+            con.close()
 
 
 def new_id(prefix: str) -> str:

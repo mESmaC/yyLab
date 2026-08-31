@@ -32,9 +32,10 @@ def settings_page():
 
         with panel().classes("max-w-[560px]"):
             ui.label("Defaults").classes("text-base font-semibold mb-2")
+            saved_quant = s.get("default_quant", "nf4")
             quant_def = ui.select(
-                {"nf4": "NF4", "int8": "INT8", "fp8": "FP8"},
-                value=s.get("default_quant", "nf4"),
+                {"nf4": "NF4", "int8": "INT8"},
+                value=saved_quant if saved_quant in {"nf4", "int8"} else "nf4",
                 label="Default quant for QLoRA",
             ).props("dense outlined").classes("w-56")
 

@@ -37,7 +37,7 @@ Everything below is what is **not** yet validated.
   or we identify the break-point and fix routing (hierarchical factor heads / beam).
 
 ### T4. Automated address assignment
-- **What:** assign `(A,T,X,Y)` from memory content via an ingestion step (not
+- **What:** assign factorized address `A=(T,X,Y)` from memory content via an ingestion step (not
   hand-structured), then re-run blind routing.
 - **Why:** every result so far used a hand-laid coordinate space. Real use requires
   the system to build addresses. This is the biggest integration unknown.
@@ -85,6 +85,11 @@ Everything below is what is **not** yet validated.
 - **Why:** exact-value recall is where content-aware controllers still err and where
   ATXY's exact-coordinate design should help.
 - **Pass:** fact-vs-wrong-value discrimination improves over current (5/16 misses).
+
+`A` denotes the complete address; the implemented factors are `T=table/type`,
+`X=entity/key`, and `Y=condition/qualifier`. Before scale-up, add a stable
+record/revision coordinate or a payload-aware second stage: two records with the
+same `(T,X,Y)` are otherwise indistinguishable to a payload-blind router.
 
 ---
 

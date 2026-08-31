@@ -27,11 +27,18 @@ dependencies = [
     "pyarrow>=20",
     "nvidia-ml-py>=12",
     "psutil>=7",
-    "quanto>=0.2",
+    "optimum-quanto>=0.2.6",
     "pydantic>=2.11",
     "numpy>=2",
     "rich>=14",
     "sentence-transformers>=6.0.0",
+    "liger-kernel>=0.8.2",
+    "torchao>=0.18",
+    "nvidia-cusparselt-cu13>=0.9.1; sys_platform == 'win32'",
+    "pypdf>=6.16.2",
+    "python-docx>=1.2.0",
+    "beautifulsoup4>=4.15.0",
+    "langdetect>=1.0.9",
 ]
 
 [dependency-groups]
@@ -52,6 +59,9 @@ packages = ["yylab"]
 
 [tool.uv]
 package = true
+override-dependencies = [
+    { package = { name = "liger-kernel" }, dependencies = ["triton>=3.4; sys_platform != 'win32'"] },
+]
 
 [[tool.uv.index]]
 name = "pytorch-cu128"

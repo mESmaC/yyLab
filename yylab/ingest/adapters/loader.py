@@ -6,13 +6,21 @@ from pathlib import Path
 from .base import Adapter
 from .code import CodeAdapter
 from .csv import CsvAdapter
+from .docx import DocxAdapter
+from .html import HtmlAdapter
 from .jsonl import JsonlAdapter
 from .markdown import MarkdownAdapter
+from .parquet import ParquetAdapter
+from .pdf import PdfAdapter
 from .text import TextAdapter
 
 _ADAPTER_CLASSES: tuple[type[Adapter], ...] = (
     JsonlAdapter,
+    ParquetAdapter,
     CsvAdapter,
+    PdfAdapter,
+    DocxAdapter,
+    HtmlAdapter,
     CodeAdapter,
     MarkdownAdapter,
     TextAdapter,

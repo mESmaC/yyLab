@@ -48,7 +48,15 @@ def _make_source(tmp_path: Path) -> Path:
 
 def test_ingest_pipeline(tmp_path):
     src = _make_source(tmp_path)
-    cfg = IngestConfig(name="unit", source_dir=str(src), tokenizer_keys=[], near_dedup=False, global_dedup=True)
+    cfg = IngestConfig(
+        name="unit",
+        source_dir=str(src),
+        tokenizer_keys=[],
+        near_dedup=False,
+        global_dedup=True,
+        language_filter=False,
+        quality_filter=False,
+    )
     cid = run_ingest(lambda *a: None, cfg)
 
     row = db.q1("SELECT * FROM corpora WHERE id=?", (cid,))
@@ -65,7 +73,15 @@ def test_ingest_pipeline(tmp_path):
     assert "code" in domains
     assert "math" in domains
 
-    cfg2 = IngestConfig(name="unit2", source_dir=str(src), tokenizer_keys=[], near_dedup=False, global_dedup=True)
+    cfg2 = IngestConfig(
+        name="unit2",
+        source_dir=str(src),
+        tokenizer_keys=[],
+        near_dedup=False,
+        global_dedup=True,
+        language_filter=False,
+        quality_filter=False,
+    )
     cid2 = run_ingest(lambda *a: None, cfg2)
     stats2 = read_json(corpus_dir(cid2) / "stats.json")
     assert stats2["docs_written"] == 0

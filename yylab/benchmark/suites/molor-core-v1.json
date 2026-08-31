@@ -1,0 +1,568 @@
+{
+  "schema_version": "molor.benchmark-suite.v1",
+  "suite_id": "molor-core-v1",
+  "version": "1.0.0",
+  "title": "MoLoRA Core Model Benchmark",
+  "description": "Fresh deterministic holdout covering general reasoning and the technical/business domains this local adapter lab targets. These cases must never be used for training.",
+  "default_system": "This is a deterministic benchmark. Follow the requested output format exactly. Give only the final answer and do not include analysis.",
+  "generation": {
+    "max_new_tokens": 48,
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "top_k": 0,
+    "enable_thinking": false,
+    "context_token_budget": 8192,
+    "cache_mode": "dynamic",
+    "seed": 8419
+  },
+  "categories": {
+    "general_reasoning": {"label": "General reasoning", "weight": 0.10},
+    "quantitative": {"label": "Math + quantitative", "weight": 0.10},
+    "programming": {"label": "C/C++/assembly", "weight": 0.13},
+    "embedded": {"label": "Embedded + CAN", "weight": 0.16},
+    "terminal": {"label": "Terminal + command line", "weight": 0.08},
+    "architecture": {"label": "Software architecture", "weight": 0.10},
+    "business": {"label": "Business + go-to-market", "weight": 0.10},
+    "finance": {"label": "Finance + investing", "weight": 0.08},
+    "instruction": {"label": "Instruction following", "weight": 0.08},
+    "context": {"label": "Context retrieval", "weight": 0.07}
+  },
+  "profiles": {
+    "smoke": ["G01", "Q01", "P01", "E01", "T01", "A01", "B01", "F01", "I01", "X01"],
+    "quick": [
+      "G01", "G03", "G05",
+      "Q01", "Q03", "Q05",
+      "P01", "P04", "P07",
+      "E01", "E03", "E07",
+      "T01", "T03", "T05",
+      "A01", "A03", "A05",
+      "B01", "B03", "B05",
+      "F01", "F03", "F05",
+      "I01", "I03", "I05",
+      "X01", "X03", "X05"
+    ]
+  },
+  "cases": [
+    {
+      "id": "G01",
+      "category": "general_reasoning",
+      "prompt": "All zargs are merons. No merons are blue. Which conclusion must be true?\nA. Some zargs are blue\nB. No zargs are blue\nC. All blue things are zargs\nD. No zargs exist\nAnswer with one letter.",
+      "scorer": {"type": "choice", "answer": "B"},
+      "tags": ["logic", "syllogism"],
+      "acceptable_routes": ["base/null"]
+    },
+    {
+      "id": "G02",
+      "category": "general_reasoning",
+      "prompt": "Assume the rule 'If the server is down, the alert fires' is always true. The alert did not fire. What follows?\nA. The server was down\nB. The server was not down\nC. The alert system is broken\nD. Nothing can be inferred\nAnswer with one letter.",
+      "scorer": {"type": "choice", "answer": "B"},
+      "tags": ["logic", "modus-tollens"],
+      "acceptable_routes": ["base/null"]
+    },
+    {
+      "id": "G03",
+      "category": "general_reasoning",
+      "prompt": "Lena arrives before Omar. Omar arrives before Priya. Theo arrives after Priya. Who must arrive first?\nA. Lena\nB. Omar\nC. Priya\nD. Theo\nAnswer with one letter.",
+      "scorer": {"type": "choice", "answer": "A"},
+      "tags": ["ordering"],
+      "acceptable_routes": ["base/null"]
+    },
+    {
+      "id": "G04",
+      "category": "general_reasoning",
+      "prompt": "A team has 40 C programmers and 30 C++ programmers. Fifteen are counted in both groups. How many distinct programmers are in at least one group? Return only the integer.",
+      "scorer": {"type": "numeric", "answer": 55},
+      "tags": ["sets"],
+      "acceptable_routes": ["base/null"]
+    },
+    {
+      "id": "G05",
+      "category": "general_reasoning",
+      "prompt": "The argument says: 'If software is correct, it compiles. This software compiles, therefore it is correct.' Which error is this?\nA. Denying the antecedent\nB. Circular reasoning\nC. Affirming the consequent\nD. False dilemma\nAnswer with one letter.",
+      "scorer": {"type": "choice", "answer": "C"},
+      "tags": ["logic", "fallacy"],
+      "acceptable_routes": ["base/null", "software-architecture-v1"]
+    },
+    {
+      "id": "G06",
+      "category": "general_reasoning",
+      "prompt": "Which study most strongly supports a causal claim about a new landing page increasing conversions?\nA. A survey of users who liked it\nB. A before-and-after comparison during different seasons\nC. A randomized controlled A/B test with adequate sample size\nD. An expert's opinion\nAnswer with one letter.",
+      "scorer": {"type": "choice", "answer": "C"},
+      "tags": ["causality"],
+      "acceptable_routes": ["base/null"]
+    },
+
+    {
+      "id": "Q01",
+      "category": "quantitative",
+      "prompt": "Compute 17 × 23. Return only the number.",
+      "scorer": {"type": "numeric", "answer": 391},
+      "tags": ["arithmetic"],
+      "acceptable_routes": ["base/null"]
+    },
+    {
+      "id": "Q02",
+      "category": "quantitative",
+      "prompt": "An account starts with $10,000 and earns 8% annually, compounded once per year. What is the balance after exactly two years? Return only the number, without a currency symbol.",
+      "scorer": {"type": "numeric", "answer": 11664, "atol": 0.01},
+      "tags": ["compound-interest"],
+      "acceptable_routes": ["base/null"]
+    },
+    {
+      "id": "Q03",
+      "category": "quantitative",
+      "prompt": "A product sells for $50, has $30 variable cost per unit, and $12,000 fixed cost. How many units are required to break even? Return only the integer.",
+      "scorer": {"type": "numeric", "answer": 600},
+      "tags": ["break-even"],
+      "acceptable_routes": ["base/null"]
+    },
+    {
+      "id": "Q04",
+      "category": "quantitative",
+      "prompt": "A fair coin is tossed four times. What is the probability of exactly two heads? Return a decimal.",
+      "scorer": {"type": "numeric", "answer": 0.375, "atol": 0.000001},
+      "tags": ["probability"],
+      "acceptable_routes": ["base/null"]
+    },
+    {
+      "id": "Q05",
+      "category": "quantitative",
+      "prompt": "By Amdahl's law, 80% of a workload is perfectly parallel and 20% is serial. What speedup is obtained with four processors? Return only the number.",
+      "scorer": {"type": "numeric", "answer": 2.5, "atol": 0.000001},
+      "tags": ["amdahl"],
+      "acceptable_routes": ["base/null", "software-architecture-v1"]
+    },
+    {
+      "id": "Q06",
+      "category": "quantitative",
+      "prompt": "Add hexadecimal 0x2F and 0x19. Return the decimal result only.",
+      "scorer": {"type": "numeric", "answer": 72},
+      "tags": ["hexadecimal"],
+      "acceptable_routes": ["base/null", "embedded-knowledge-v1"]
+    },
+
+    {
+      "id": "P01",
+      "category": "programming",
+      "prompt": "In ISO C, what happens when a signed int addition overflows its representable range?\nA. It wraps modulo 2^N by definition\nB. The behavior is undefined\nC. It saturates\nD. A compile-time error is required\nAnswer with one letter.",
+      "scorer": {"type": "choice", "answer": "B"},
+      "tags": ["c", "undefined-behavior"],
+      "acceptable_routes": ["embedded-knowledge-v1", "software-architecture-v1"]
+    },
+    {
+      "id": "P02",
+      "category": "programming",
+      "prompt": "Which statement about C volatile is correct?\nA. It makes compound operations atomic\nB. It provides inter-thread synchronization\nC. It requires observable accesses not be optimized away as ordinary dead stores/loads\nD. It prevents all instruction reordering by the CPU\nAnswer with one letter.",
+      "scorer": {"type": "choice", "answer": "C"},
+      "tags": ["c", "volatile"],
+      "acceptable_routes": ["embedded-knowledge-v1"]
+    },
+    {
+      "id": "P03",
+      "category": "programming",
+      "prompt": "Which C++ type most directly expresses exclusive ownership and automatically destroys its object at scope exit?\nA. std::shared_ptr\nB. std::weak_ptr\nC. std::unique_ptr\nD. A raw pointer\nAnswer with one letter.",
+      "scorer": {"type": "choice", "answer": "C"},
+      "tags": ["cpp", "raii"],
+      "acceptable_routes": ["software-architecture-v1"]
+    },
+    {
+      "id": "P04",
+      "category": "programming",
+      "prompt": "A 32-bit value 0x12345678 is stored at address p on a little-endian machine. List the four bytes at p, p+1, p+2, p+3 as uppercase two-digit hex separated by spaces.",
+      "scorer": {"type": "exact", "answer": "78 56 34 12"},
+      "tags": ["endianness", "memory"],
+      "acceptable_routes": ["embedded-knowledge-v1"]
+    },
+    {
+      "id": "P05",
+      "category": "programming",
+      "prompt": "In a GNU linker script, which output-section attribute commonly reserves the section's address range without loading bytes for it from the program image?\nA. KEEP\nB. NOLOAD\nC. ENTRY\nD. PROVIDE\nAnswer with one letter.",
+      "scorer": {"type": "choice", "answer": "B"},
+      "tags": ["linker-script"],
+      "acceptable_routes": ["embedded-knowledge-v1", "software-architecture-v1"]
+    },
+    {
+      "id": "P06",
+      "category": "programming",
+      "prompt": "On x86, which instruction idiom sets EAX to zero and normally breaks a dependency on its old value?\nA. mov eax, eax\nB. xor eax, eax\nC. add eax, 0\nD. test eax, eax\nAnswer with one letter.",
+      "scorer": {"type": "choice", "answer": "B"},
+      "tags": ["assembly", "x86"],
+      "acceptable_routes": ["embedded-knowledge-v1"]
+    },
+    {
+      "id": "P07",
+      "category": "programming",
+      "prompt": "What is the worst-case time complexity of binary search over a sorted array? Return exactly one of: O(1), O(log n), O(n), O(n log n).",
+      "scorer": {"type": "exact", "answer": "O(log n)", "casefold": false, "strip_punctuation": false},
+      "tags": ["algorithms"],
+      "acceptable_routes": ["software-architecture-v1", "base/null"]
+    },
+    {
+      "id": "P08",
+      "category": "programming",
+      "prompt": "Two threads sometimes acquire mutex A then B and elsewhere acquire B then A. What failure does this inconsistent order primarily risk?\nA. Memory leak\nB. Deadlock\nC. Integer overflow\nD. Livelock is guaranteed\nAnswer with one letter.",
+      "scorer": {"type": "choice", "answer": "B"},
+      "tags": ["concurrency"],
+      "acceptable_routes": ["software-architecture-v1"]
+    },
+
+    {
+      "id": "E01",
+      "category": "embedded",
+      "prompt": "An Intel/little-endian CAN signal starts at bit 8, has length 12, and data bytes 1 and 2 are 0x34 and 0x12. Interpret the 16-bit little-endian field and keep its low 12 bits. Return the unsigned raw value in decimal.",
+      "scorer": {"type": "numeric", "answer": 564},
+      "tags": ["can", "bit-extraction"],
+      "acceptable_routes": ["ocb-can-verified-v1"]
+    },
+    {
+      "id": "E02",
+      "category": "embedded",
+      "prompt": "Interpret the 12-bit two's-complement raw value 0xF80 as a signed decimal integer. Return only the integer.",
+      "scorer": {"type": "numeric", "answer": -128},
+      "tags": ["can", "twos-complement"],
+      "acceptable_routes": ["ocb-can-verified-v1", "embedded-knowledge-v1"]
+    },
+    {
+      "id": "E03",
+      "category": "embedded",
+      "prompt": "A decoded CAN raw value is 500, scale is 0.1, and offset is -40. What is the physical value? Return only the number.",
+      "scorer": {"type": "numeric", "answer": 10, "atol": 0.000001},
+      "tags": ["can", "scaling"],
+      "acceptable_routes": ["ocb-can-verified-v1"]
+    },
+    {
+      "id": "E04",
+      "category": "embedded",
+      "prompt": "Which defensive action is essential before indexing a lookup table with an untrusted decoded signal?\nA. Mark the table volatile\nB. Verify the index is within the table bounds\nC. Disable interrupts permanently\nD. Cast the index to a smaller type\nAnswer with one letter.",
+      "scorer": {"type": "choice", "answer": "B"},
+      "tags": ["misra", "bounds"],
+      "acceptable_routes": ["embedded-knowledge-v1", "ocb-can-verified-v1"]
+    },
+    {
+      "id": "E05",
+      "category": "embedded",
+      "prompt": "Which watchdog design best detects a task that has frozen while the scheduler still runs?\nA. Kick the watchdog from an unconditional timer ISR\nB. Kick it only after all required task health flags have advanced\nC. Disable the watchdog during normal operation\nD. Kick it at the start of main before the scheduler\nAnswer with one letter.",
+      "scorer": {"type": "choice", "answer": "B"},
+      "tags": ["watchdog", "safety"],
+      "acceptable_routes": ["embedded-knowledge-v1"]
+    },
+    {
+      "id": "E06",
+      "category": "embedded",
+      "prompt": "What is generally the safest ISR structure?\nA. Perform blocking network I/O in the ISR\nB. Allocate from the heap and wait for a mutex\nC. Capture minimal state, acknowledge the source, and defer work\nD. Recompute the full application state\nAnswer with one letter.",
+      "scorer": {"type": "choice", "answer": "C"},
+      "tags": ["interrupts"],
+      "acceptable_routes": ["embedded-knowledge-v1"]
+    },
+    {
+      "id": "E07",
+      "category": "embedded",
+      "prompt": "On the Infineon/Siemens C167 family, what is the Peripheral Event Controller (PEC) primarily used for?\nA. Floating-point execution\nB. Fast peripheral data transfers with little or no CPU intervention\nC. Flash encryption\nD. Dynamic clock synthesis\nAnswer with one letter.",
+      "scorer": {"type": "choice", "answer": "B"},
+      "tags": ["c167", "pec"],
+      "acceptable_routes": ["embedded-knowledge-v1"]
+    },
+    {
+      "id": "E08",
+      "category": "embedded",
+      "prompt": "A memory-mapped peripheral status register can change independently of program flow. Which C qualifier is normally required on the register lvalue? Return one lowercase word.",
+      "scorer": {"type": "exact", "answer": "volatile", "casefold": false, "strip_punctuation": false},
+      "tags": ["c", "mmio"],
+      "acceptable_routes": ["embedded-knowledge-v1"]
+    },
+    {
+      "id": "E09",
+      "category": "embedded",
+      "prompt": "A bootloader occupies addresses 0x0000 through 0x1FFF inclusive. At what hexadecimal address should the non-overlapping application region begin? Return exactly 0x followed by four uppercase hex digits.",
+      "scorer": {"type": "exact", "answers": ["0x2000", "0X2000"], "strip_punctuation": false},
+      "tags": ["linker-script", "memory-map"],
+      "acceptable_routes": ["embedded-knowledge-v1", "software-architecture-v1"]
+    },
+    {
+      "id": "E10",
+      "category": "embedded",
+      "prompt": "A button debounce specification defines its stable-time requirement as consecutive-sample count multiplied by sampling period. It requires 20 consecutive identical samples at a 1 ms period. What stable time does the specification require? Return the number of milliseconds only.",
+      "scorer": {"type": "numeric", "answer": 20},
+      "tags": ["debounce", "timing"],
+      "acceptable_routes": ["embedded-knowledge-v1"]
+    },
+
+    {
+      "id": "T01",
+      "category": "terminal",
+      "prompt": "Write one PowerShell command that lists the contents of the exact directory stored in $targetPath without treating wildcard characters specially. Return only the command.",
+      "scorer": {"type": "command", "answers": ["Get-ChildItem -LiteralPath $targetPath", "Get-ChildItem -LiteralPath \"$targetPath\"", "gci -LiteralPath $targetPath", "gci -LiteralPath \"$targetPath\""]},
+      "tags": ["powershell", "literal-path"],
+      "acceptable_routes": ["software-architecture-v1"]
+    },
+    {
+      "id": "T02",
+      "category": "terminal",
+      "prompt": "Write a ripgrep command that lists tracked-or-untracked files under the current directory whose names match either *.c or *.h. Return only the command.",
+      "scorer": {"type": "command", "answers": ["rg --files -g '*.c' -g '*.h'", "rg --files -g \"*.c\" -g \"*.h\"", "rg --files -g *.c -g *.h", "rg --files -g '*.h' -g '*.c'", "rg --files -g \"*.h\" -g \"*.c\"", "rg --files -g *.h -g *.c", "rg --files --glob '*.c' --glob '*.h'", "rg --files --glob \"*.c\" --glob \"*.h\"", "rg --files --glob *.c --glob *.h", "rg --files --glob '*.h' --glob '*.c'", "rg --files --glob \"*.h\" --glob \"*.c\"", "rg --files --glob *.h --glob *.c"]},
+      "tags": ["ripgrep"],
+      "acceptable_routes": ["software-architecture-v1"]
+    },
+    {
+      "id": "T03",
+      "category": "terminal",
+      "prompt": "Write the git command that prints only the names of files changed between HEAD~1 and HEAD. Return only the command.",
+      "scorer": {"type": "command", "answers": ["git diff --name-only HEAD~1 HEAD", "git diff --name-only HEAD^ HEAD", "git diff HEAD~1 HEAD --name-only", "git diff HEAD^ HEAD --name-only", "git diff --name-only HEAD~1..HEAD", "git diff --name-only HEAD^..HEAD", "git diff HEAD~1..HEAD --name-only", "git diff HEAD^..HEAD --name-only"]},
+      "tags": ["git"],
+      "acceptable_routes": ["software-architecture-v1"]
+    },
+    {
+      "id": "T04",
+      "category": "terminal",
+      "prompt": "Write a ripgrep command that reports the count of matching lines containing ERROR in app.log. Return only the command.",
+      "scorer": {"type": "command", "answers": ["rg -c ERROR app.log", "rg -c 'ERROR' app.log", "rg -c \"ERROR\" app.log", "rg --count ERROR app.log", "rg --count 'ERROR' app.log", "rg --count \"ERROR\" app.log"]},
+      "tags": ["ripgrep", "logs"],
+      "acceptable_routes": ["software-architecture-v1"]
+    },
+    {
+      "id": "T05",
+      "category": "terminal",
+      "prompt": "In PowerShell, what expression reads the environment variable named MOLOR_MODEL? Return only the expression.",
+      "scorer": {"type": "exact", "answer": "$env:MOLOR_MODEL", "casefold": true, "strip_punctuation": false},
+      "tags": ["powershell", "environment"],
+      "acceptable_routes": ["software-architecture-v1", "base/null"]
+    },
+    {
+      "id": "T06",
+      "category": "terminal",
+      "prompt": "Write the PowerShell command that displays TCP connections whose local port is 8765. Return only the command.",
+      "scorer": {"type": "command", "answers": ["Get-NetTCPConnection -LocalPort 8765"]},
+      "tags": ["powershell", "network"],
+      "acceptable_routes": ["software-architecture-v1"]
+    },
+
+    {
+      "id": "A01",
+      "category": "architecture",
+      "prompt": "A service must atomically update its database and eventually publish an event without a distributed transaction. Which pattern best fits?\nA. Transactional outbox\nB. Global mutex\nC. Cache-aside\nD. Two independent best-effort writes\nAnswer with one letter.",
+      "scorer": {"type": "choice", "answer": "A"},
+      "tags": ["outbox", "messaging"],
+      "acceptable_routes": ["software-architecture-v1"]
+    },
+    {
+      "id": "A02",
+      "category": "architecture",
+      "prompt": "Which mechanism most directly makes retrying the same payment request safe?\nA. A larger timeout\nB. An idempotency key with a stored result\nC. Random backoff only\nD. A second load balancer\nAnswer with one letter.",
+      "scorer": {"type": "choice", "answer": "B"},
+      "tags": ["idempotency"],
+      "acceptable_routes": ["software-architecture-v1"]
+    },
+    {
+      "id": "A03",
+      "category": "architecture",
+      "prompt": "A bounded worker pool receives work faster than it can process it. Which response implements backpressure rather than unbounded memory growth?\nA. Grow the queue forever\nB. Reject, block, or shed work when the bounded queue is full\nC. Retry instantly in a tight loop\nD. Disable metrics\nAnswer with one letter.",
+      "scorer": {"type": "choice", "answer": "B"},
+      "tags": ["backpressure"],
+      "acceptable_routes": ["software-architecture-v1"]
+    },
+    {
+      "id": "A04",
+      "category": "architecture",
+      "prompt": "During a network partition, the CAP theorem says a distributed system must choose between which two properties?\nA. Latency and throughput\nB. Consistency and availability\nC. Encryption and compression\nD. Storage and compute\nAnswer with one letter.",
+      "scorer": {"type": "choice", "answer": "B"},
+      "tags": ["cap"],
+      "acceptable_routes": ["software-architecture-v1"]
+    },
+    {
+      "id": "A05",
+      "category": "architecture",
+      "prompt": "A query frequently filters equality on tenant_id and then a timestamp range on created_at. Which composite B-tree index order is normally most useful?\nA. (created_at, tenant_id) only\nB. (tenant_id, created_at)\nC. (payload, created_at)\nD. No index can help\nAnswer with one letter.",
+      "scorer": {"type": "choice", "answer": "B"},
+      "tags": ["database", "index"],
+      "acceptable_routes": ["software-architecture-v1"]
+    },
+    {
+      "id": "A06",
+      "category": "architecture",
+      "prompt": "With cache-aside, the database is updated but the cache entry is left unchanged until its long TTL expires. What failure is most likely?\nA. Stale reads\nB. SQL injection\nC. Dead code elimination\nD. Packet fragmentation\nAnswer with one letter.",
+      "scorer": {"type": "choice", "answer": "A"},
+      "tags": ["cache"],
+      "acceptable_routes": ["software-architecture-v1"]
+    },
+
+    {
+      "id": "B01",
+      "category": "business",
+      "prompt": "A company spends $50,000 on sales and marketing in a month and acquires 100 new customers. What is customer acquisition cost? Return only the number.",
+      "scorer": {"type": "numeric", "answer": 500},
+      "tags": ["cac"],
+      "acceptable_routes": ["base/null"]
+    },
+    {
+      "id": "B02",
+      "category": "business",
+      "prompt": "A unit sells for $120 and its variable costs total $45. What is contribution margin per unit? Return only the number.",
+      "scorer": {"type": "numeric", "answer": 75},
+      "tags": ["unit-economics"],
+      "acceptable_routes": ["base/null"]
+    },
+    {
+      "id": "B03",
+      "category": "business",
+      "prompt": "A startup has $600,000 cash and net burns $75,000 per month. Ignoring changes, how many months of runway remain? Return only the number.",
+      "scorer": {"type": "numeric", "answer": 8},
+      "tags": ["runway"],
+      "acceptable_routes": ["base/null"]
+    },
+    {
+      "id": "B04",
+      "category": "business",
+      "prompt": "Before scaling multiple acquisition channels, what should an early B2B go-to-market team define most clearly?\nA. Its ideal customer profile and urgent problem\nB. The office paint color\nC. A maximum number of social accounts\nD. A public-company dividend policy\nAnswer with one letter.",
+      "scorer": {"type": "choice", "answer": "A"},
+      "tags": ["gtm", "icp"],
+      "acceptable_routes": ["base/null"]
+    },
+    {
+      "id": "B05",
+      "category": "business",
+      "prompt": "All else equal, a large increase in inventory during the period has what immediate effect on operating cash flow?\nA. Increases it\nB. Decreases it\nC. No effect\nD. Converts it to financing cash flow\nAnswer with one letter.",
+      "scorer": {"type": "choice", "answer": "B"},
+      "tags": ["working-capital"],
+      "acceptable_routes": ["base/null"]
+    },
+    {
+      "id": "B06",
+      "category": "business",
+      "prompt": "In a properly randomized landing-page A/B test, which practice best avoids cherry-picking?\nA. Choose the primary metric and stopping rule before examining results\nB. Add metrics until one is significant\nC. Stop whenever the variant briefly leads\nD. Remove inconvenient users after the test\nAnswer with one letter.",
+      "scorer": {"type": "choice", "answer": "A"},
+      "tags": ["marketing", "experimentation"],
+      "acceptable_routes": ["base/null"]
+    },
+
+    {
+      "id": "F01",
+      "category": "finance",
+      "prompt": "A company raises $2 million at an $8 million pre-money valuation. What percentage of the post-money company do the new investors own? Return a decimal percentage number without the percent sign.",
+      "scorer": {"type": "numeric", "answer": 20, "atol": 0.000001},
+      "tags": ["funding", "dilution"],
+      "acceptable_routes": ["base/null"]
+    },
+    {
+      "id": "F02",
+      "category": "finance",
+      "prompt": "An investment costs $100 now and returns $110 exactly one year later. At a 10% discount rate, what is its net present value? Return only the number.",
+      "scorer": {"type": "numeric", "answer": 0, "atol": 0.000001},
+      "tags": ["npv"],
+      "acceptable_routes": ["base/null"]
+    },
+    {
+      "id": "F03",
+      "category": "finance",
+      "prompt": "For an existing fixed-rate bond, what generally happens to its market price when prevailing interest rates rise?\nA. It rises\nB. It falls\nC. It is guaranteed unchanged\nD. It becomes equity\nAnswer with one letter.",
+      "scorer": {"type": "choice", "answer": "B"},
+      "tags": ["bonds"],
+      "acceptable_routes": ["base/null"]
+    },
+    {
+      "id": "F04",
+      "category": "finance",
+      "prompt": "Holding many imperfectly correlated securities primarily reduces which risk?\nA. Market-wide systematic risk\nB. Security-specific unsystematic risk\nC. Inflation risk to zero\nD. All possible loss\nAnswer with one letter.",
+      "scorer": {"type": "choice", "answer": "B"},
+      "tags": ["diversification"],
+      "acceptable_routes": ["base/null"]
+    },
+    {
+      "id": "F05",
+      "category": "finance",
+      "prompt": "A stock price is $50 and trailing earnings per share are $5. What is its price-to-earnings ratio? Return only the number.",
+      "scorer": {"type": "numeric", "answer": 10},
+      "tags": ["valuation"],
+      "acceptable_routes": ["base/null"]
+    },
+
+    {
+      "id": "I01",
+      "category": "instruction",
+      "prompt": "Reply with exactly this uppercase word and nothing else: ORBIT",
+      "scorer": {"type": "exact", "answer": "ORBIT", "casefold": false, "strip_punctuation": false},
+      "tags": ["exact-format"],
+      "acceptable_routes": ["base/null"]
+    },
+    {
+      "id": "I02",
+      "category": "instruction",
+      "prompt": "Return exactly one valid minified JSON object with status equal to ok and count equal to 3. Do not use a Markdown fence.",
+      "scorer": {"type": "json", "expected": {"status": "ok", "count": 3}, "exact": true, "allow_fence": false, "minified": true},
+      "tags": ["json"],
+      "acceptable_routes": ["base/null"]
+    },
+    {
+      "id": "I03",
+      "category": "instruction",
+      "prompt": "Sort beta, alpha, gamma alphabetically. Return exactly: alpha | beta | gamma",
+      "scorer": {"type": "exact", "answer": "alpha | beta | gamma", "casefold": false, "strip_punctuation": false},
+      "tags": ["ordering", "exact-format"],
+      "acceptable_routes": ["base/null"]
+    },
+    {
+      "id": "I04",
+      "category": "instruction",
+      "prompt": "Return the first five positive square numbers as comma-separated digits with no spaces.",
+      "scorer": {"type": "exact", "answer": "1,4,9,16,25", "strip_punctuation": false},
+      "tags": ["formatting"],
+      "acceptable_routes": ["base/null"]
+    },
+    {
+      "id": "I05",
+      "category": "instruction",
+      "prompt": "Reply with exactly two uppercase letters: OK. Do not add punctuation.",
+      "scorer": {"type": "exact", "answer": "OK", "casefold": false, "strip_punctuation": false},
+      "tags": ["constraint"],
+      "acceptable_routes": ["base/null"]
+    },
+    {
+      "id": "I06",
+      "category": "instruction",
+      "prompt": "Convert the mapping name=Ada, active=true into a JSON object using exactly those two keys and no others. Output JSON only.",
+      "scorer": {"type": "json", "expected": {"name": "Ada", "active": true}, "exact": true, "allow_fence": false},
+      "tags": ["json", "schema"],
+      "acceptable_routes": ["base/null"]
+    },
+
+    {
+      "id": "X01",
+      "category": "context",
+      "prompt": "Read this project memo and answer the final question with only the requested value. The Atlas board uses revision D. The procurement contact is Mira Chen. Prototype cases are graphite gray. The radio test takes place in Lab 6. Firmware branch names begin with fw/. The internal project codename is ZIRCON. The first engineering sample used a 24 MHz oscillator, but production uses 40 MHz. The launch review was moved twice: first from 3 October 2031 to 9 November 2031, and finally to 17 November 2031. The old date is explicitly obsolete. Question: what is the final launch review date? Return day, full month, and year.",
+      "scorer": {"type": "exact", "answer": "17 November 2031"},
+      "tags": ["retrieval", "distractors"],
+      "acceptable_routes": ["base/null"]
+    },
+    {
+      "id": "X02",
+      "category": "context",
+      "prompt": "Inventory note: shelf A holds serials 4K1, 4K2, and 4K3. Shelf B holds 7P8 and 7P9. Shelf C was cleared. The blue diagnostic unit was moved from shelf A to the locked cabinet and has serial 9QX-441. A prior draft incorrectly called it 9QX-414; that draft is superseded. The green unit is 2LM-006. Question: return only the correct serial of the blue diagnostic unit.",
+      "scorer": {"type": "exact", "answer": "9QX-441", "casefold": false, "strip_punctuation": false},
+      "tags": ["retrieval", "correction"],
+      "acceptable_routes": ["base/null"]
+    },
+    {
+      "id": "X03",
+      "category": "context",
+      "prompt": "Contract summary: payment is net 30. Support hours are 08:00–18:00 Eastern on business days. Schedule A lists a 99.5% target, while Amendment 2, signed later, replaces it with a 99.9% monthly uptime commitment. The amendment states that conflicting earlier schedules are superseded. Credits begin at 99.8%. Question: what monthly uptime percentage is contractually committed after the amendment? Return only the percentage number without the percent sign.",
+      "scorer": {"type": "numeric", "answer": 99.9, "atol": 0.000001},
+      "tags": ["retrieval", "precedence"],
+      "acceptable_routes": ["base/null"]
+    },
+    {
+      "id": "X04",
+      "category": "context",
+      "prompt": "Test log excerpt: Run A produced 18 warnings and 2 errors. Run B produced 7 warnings and 0 errors. Run C produced 11 warnings and 5 errors. Run D was canceled and its preliminary counts must be ignored. Run E produced 4 warnings and 1 error. Question: how many errors occurred across completed Runs A, B, C, and E? Return only the integer.",
+      "scorer": {"type": "numeric", "answer": 8},
+      "tags": ["retrieval", "aggregation"],
+      "acceptable_routes": ["base/null"]
+    },
+    {
+      "id": "X05",
+      "category": "context",
+      "prompt": "Operations handoff: Rowan owns database migrations. Priya owns customer communications. Mateo owns rollback approval. Lin owns the deployment checklist. During incident class SEV-1, the incident commander may authorize emergency mitigation, but the handoff explicitly says rollback still requires Mateo's approval unless Mateo delegates in writing. No delegation is recorded. Question: who must approve rollback? Return only the first name.",
+      "scorer": {"type": "exact", "answer": "Mateo"},
+      "tags": ["retrieval", "policy"],
+      "acceptable_routes": ["base/null"]
+    }
+  ]
+}

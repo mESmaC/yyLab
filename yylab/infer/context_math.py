@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 KV_BYTES = {"bf16": 2.0, "fp16": 2.0, "int8": 1.0, "fp8": 1.0, "int4": 0.5}
 
 
@@ -21,6 +23,22 @@ def kv_gb(config, ctx_len: int, kv_quant: str = "bf16") -> float:
     return kv_bytes_per_token(config, kv_quant) * max(int(ctx_len), 0) / 2**30
 
 
+def quantized_kv_bytes_per_token(config, kv_quant: str, group_size: int = 64) -> float:
+    """Packed KV bytes including one fp16 scale per head-dimension group."""
+
+    if kv_quant not in {"int4", "int8"}:
+        raise ValueError("quantized KV storage must be int4 or int8")
+    layers, kv_heads, head_dim = kv_shape(config)
+    packed = kv_bytes_per_token(config, kv_quant)
+    scale_groups = math.ceil(head_dim / max(1, int(group_size)))
+    scale_bytes = 2.0 * layers * kv_heads * scale_groups * 2.0
+    return packed + scale_bytes
+
+
+def quantized_kv_gb(config, ctx_len: int, kv_quant: str, group_size: int = 64) -> float:
+    return quantized_kv_bytes_per_token(config, kv_quant, group_size) * max(int(ctx_len), 0) / 2**30
+
+
 def model_weight_gb(params_b: float, quant: str = "bf16") -> float:
     per_param = {"bf16": 2.0, "fp16": 2.0, "fp8": 1.0, "int8": 1.05, "nf4": 0.55}.get(quant, 2.0)
     return params_b * 1e9 * per_param / 2**30
@@ -37,13 +55,15 @@ def capacity_rows(
     ram_budget = max(ram_gb - 4.0, 0.0)
 
     rows = []
-    for label, quant, location in (
-        ("KV bf16", "bf16", "vram"),
-        ("KV int8 (quant cache)", "int8", "vram"),
-        ("KV int4 (quant cache)", "int4", "vram"),
-        ("KV offloaded", "bf16", "ram"),
+    for label, quant, location, quantized in (
+        ("KV bf16", "bf16", "vram", False),
+        ("KV int8 (quant cache)", "int8", "vram", True),
+        ("KV int4 (quant cache)", "int4", "vram", True),
+        ("KV offloaded", "bf16", "ram", False),
+        ("KV int8 offloaded", "int8", "ram", True),
+        ("KV int4 offloaded", "int4", "ram", True),
     ):
-        size = kv_gb(config, ctx_len, quant)
+        size = quantized_kv_gb(config, ctx_len, quant) if quantized else kv_gb(config, ctx_len, quant)
         if location == "vram":
             headroom = vram_budget - model_gb
             fits = size <= headroom

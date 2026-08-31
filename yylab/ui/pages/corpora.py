@@ -7,11 +7,13 @@ from nicegui import ui
 
 from ... import db
 from ...artifacts import corpus_dir, fmt_bytes
+from ...config import get_settings, update_settings
 from ...ingest.domains import DOMAINS
+from ...ingest.library import ingested_by_source, scan_dataset_folders
 from ...ingest.pipeline import IngestConfig, _iter_shards, run_ingest
 from ...ingest.tokenize_stats import SPEC_KEYS, SPEC_LABELS
 from ...jobs import JOBS
-from ..components import dir_browser, empty_state, status_badge
+from ..components import dir_browser, empty_state, hint, status_badge
 from ..shell import panel, shell, stat_card
 
 
@@ -45,12 +47,71 @@ def corpora_page():
             plabel = ui.label("").classes("text-xs text-gray-400 whitespace-nowrap")
             progress_row.visible = False
 
+        library_container = ui.column().classes("w-full")
         table_container = ui.column().classes("w-full")
         detail_container = ui.column().classes("w-full gap-4")
 
+        def start_library_ingest(path: str, name: str) -> None:
+            if state["job"]:
+                ui.notify("An ingest job is already running", type="warning")
+                return
+            cfg = IngestConfig(name=name, source_dir=path, tokenizer_keys=[])
+            state["job"] = JOBS.submit("ingest", run_ingest, cfg)
+            progress_row.visible = True
+            plabel.text = f"queued · {name}"
+            render_library()
+
+        def render_library() -> None:
+            library_container.clear()
+            root = (get_settings().get("datasets_root") or "").strip()
+            with library_container, panel():
+                with ui.row().classes("w-full items-end gap-2"):
+                    root_in = ui.input(
+                        "Datasets folder (one subfolder per corpus)", value=root,
+                        placeholder="D:\\datasets",
+                    ).props("dense outlined").classes("flex-1")
+                    browser = dir_browser("Select datasets folder", lambda p: root_in.set_value(p))
+                    ui.button(icon="folder", on_click=browser.open).props("dense outline")
+
+                    def save_root() -> None:
+                        update_settings(datasets_root=(root_in.value or "").strip())
+                        render_library()
+
+                    ui.button("Scan", icon="refresh", on_click=save_root).props("dense outline no-caps")
+                root = (get_settings().get("datasets_root") or "").strip()
+                if not root:
+                    hint("Point this at the parent folder containing your corpus folders, then Scan.")
+                    return
+                folders = scan_dataset_folders(root)
+                if not folders:
+                    hint("No subfolders found in that directory.")
+                    return
+                known = ingested_by_source()
+                ui.label(f"{len(folders)} dataset folders").classes("text-xs text-gray-500 mt-1")
+                for f in folders:
+                    ing = known.get(f.path)
+                    busy = state["job"] is not None
+                    with ui.row().classes("w-full items-center gap-3 py-1 border-b border-gray-800"):
+                        ui.label(f.name).classes("text-sm text-gray-200 flex-1 truncate")
+                        ui.label(f"{f.files} files · {fmt_bytes(f.size_bytes)}").classes(
+                            "text-xs text-gray-500 whitespace-nowrap"
+                        )
+                        if ing:
+                            status_badge(ing["status"])
+                        elif busy:
+                            ui.button("Ingest", on_click=lambda p=f.path, n=f.name: start_library_ingest(p, n)).props(
+                                "dense no-caps outline"
+                            ).classes("w-24").set_enabled(False)
+                        else:
+                            ui.button("Ingest", on_click=lambda p=f.path, n=f.name: start_library_ingest(p, n)).props(
+                                "dense no-caps outline"
+                            ).classes("w-24")
+
         def corpus_rows() -> list[dict]:
             rows = []
-            for c in db.q("SELECT * FROM corpora ORDER BY created_at DESC"):
+            for c in db.q(
+                "SELECT * FROM corpora WHERE COALESCE(kind,'ingested') != 'rejected' ORDER BY created_at DESC"
+            ):
                 stats = _stats(c)
                 dom_tokens = sorted(_domain_tokens(stats, state["tok"]).items(), key=lambda kv: -kv[1])
                 dom_str = ", ".join(f"{k}" for k, _ in dom_tokens[:3]) or "-"
@@ -59,6 +120,7 @@ def corpora_page():
                         "id": c["id"],
                         "name": c["name"],
                         "status": c["status"],
+                        "verdict": c.get("verdict") or "",
                         "domains": dom_str,
                         "docs": stats.get("docs_written", 0),
                         "size": fmt_bytes(stats.get("bytes_on_disk", 0)),
@@ -88,6 +150,7 @@ def corpora_page():
                     columns=[
                         {"name": "name", "label": "Name", "field": "name", "sortable": True, "align": "left"},
                         {"name": "status", "label": "Status", "field": "status", "sortable": True},
+                        {"name": "verdict", "label": "Verdict", "field": "verdict"},
                         {"name": "domains", "label": "Domains", "field": "domains", "align": "left"},
                         {"name": "docs", "label": "Docs", "field": "docs", "sortable": True},
                         {"name": "size", "label": "On disk", "field": "size"},
@@ -103,6 +166,17 @@ def corpora_page():
                     <q-td :props="props">
                       <q-badge :color="props.value === 'ready' ? 'green' : props.value === 'failed' ? 'red' : 'primary'"
                                :outline="props.value === 'processing'">
+                        {{ props.value }}
+                      </q-badge>
+                    </q-td>
+                    """,
+                )
+                table.add_slot(
+                    "body-cell-verdict",
+                    """
+                    <q-td :props="props">
+                      <q-badge v-if="props.value"
+                               :color="props.value === 'approved' ? 'teal' : 'red'" outline>
                         {{ props.value }}
                       </q-badge>
                     </q-td>
@@ -130,11 +204,18 @@ def corpora_page():
                     with ui.row().classes("items-center gap-3"):
                         ui.label(c["name"]).classes("text-lg font-semibold")
                         status_badge(c["status"])
-                    ui.button(
-                        "Delete",
-                        icon="delete",
-                        on_click=lambda cid=cid, name=c["name"]: ask_delete(cid, name),
-                    ).props("flat dense no-caps color=negative")
+                        if c.get("verdict"):
+                            v = ui.badge(c["verdict"], color="teal" if c["verdict"] == "approved" else "red")
+                            v.props("outline")
+                    with ui.row().classes("items-center gap-2"):
+                        ui.link("Review", f"/review?cid={cid}").props("no-caps dense outline").classes(
+                            "no-underline text-gray-300"
+                        )
+                        ui.button(
+                            "Delete",
+                            icon="delete",
+                            on_click=lambda cid=cid, name=c["name"]: ask_delete(cid, name),
+                        ).props("flat dense no-caps color=negative")
                 ui.label(f'source: {c["source_path"]}').classes("text-xs text-gray-500")
                 if c["error"]:
                     ui.label(c["error"]).classes("text-xs text-red-400")
@@ -146,6 +227,24 @@ def corpora_page():
                     stat_card("Exact dupes", f'{stats.get("exact_dupes_local", 0) + stats.get("exact_dupes_global", 0):,}')
                     stat_card("Near dupes", f'{stats.get("near_dupes", 0):,}')
                     stat_card("Filtered", f'{stats.get("filtered", 0):,}')
+                    if stats.get("non_english_docs"):
+                        stat_card("Non-English", f'{stats["non_english_docs"]:,}')
+                    if stats.get("quarantined_docs"):
+                        stat_card("Quarantined", f'{stats["quarantined_docs"]:,}')
+                    if stats.get("rejected_known_bad"):
+                        stat_card("Known-bad blocked", f'{stats["rejected_known_bad"]:,}')
+                langs = stats.get("langs") or {}
+                if langs:
+                    top = sorted(langs.items(), key=lambda kv: -kv[1])[:4]
+                    ui.label("Languages: " + ", ".join(f"{k} ({v:,})" for k, v in top)).classes(
+                        "text-xs text-gray-500 mt-1"
+                    )
+                qreasons = stats.get("quarantine_reasons") or {}
+                if qreasons:
+                    top = sorted(qreasons.items(), key=lambda kv: -kv[1])[:5]
+                    ui.label("Quarantine reasons: " + ", ".join(f"{k} ({v:,})" for k, v in top)).classes(
+                        "text-xs text-amber-400 mt-1"
+                    )
 
                 dom_tokens = _domain_tokens(stats, state["tok"])
                 totals = stats.get("totals", {}).get("tokens", {})
@@ -224,6 +323,7 @@ def corpora_page():
                 progress_row.visible = False
                 ui.notify("Corpus processed", type="positive")
                 refresh_table()
+                render_library()
                 if isinstance(job.result, str):
                     select_corpus(job.result)
             elif job.status == "error":
@@ -231,6 +331,7 @@ def corpora_page():
                 progress_row.visible = False
                 ui.notify(f"Ingest failed: {job.error.splitlines()[0]}", type="negative", multi_line=True)
                 refresh_table()
+                render_library()
 
         tok_select.on_value_change(lambda e: (state.update(tok=e.value), refresh_table(), render_detail()))
         ui.timer(1.0, poll_job)
@@ -269,6 +370,9 @@ def corpora_page():
             with ui.row().classes("w-full gap-6"):
                 nd_chk = ui.checkbox("Near-duplicate removal (MinHash)", value=True)
                 gd_chk = ui.checkbox("Global exact dedup", value=True)
+            with ui.row().classes("w-full gap-6"):
+                lang_chk = ui.checkbox("English-only (non-English kept in side bucket)", value=True)
+                qual_chk = ui.checkbox("Quality quarantine (score < 0.35)", value=True)
             tok_multi = ui.select(
                 SPEC_LABELS, multiple=True, value=list(SPEC_KEYS), label="Tokenizers for stats"
             ).props("dense outlined use-chips").classes("w-full")
@@ -289,6 +393,8 @@ def corpora_page():
                         domain_override=None if dom_sel.value == "auto" else dom_sel.value,
                         near_dedup=nd_chk.value,
                         global_dedup=gd_chk.value,
+                        language_filter=bool(lang_chk.value),
+                        quality_filter=bool(qual_chk.value),
                         tokenizer_keys=list(tok_multi.value or []),
                     )
                     state["job"] = JOBS.submit("ingest", run_ingest, cfg)
@@ -299,4 +405,5 @@ def corpora_page():
 
         ingest_btn.on_click(ingest_dlg.open)
 
+        render_library()
         refresh_table()
