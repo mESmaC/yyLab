@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from nicegui import ui
+from nicegui import run, ui
 
 from ... import db
 from ...config import PATHS
@@ -41,6 +41,27 @@ def _verdict_counts(verdicts: dict[str, dict]) -> tuple[int, int]:
     return good, bad
 
 
+async def _sample_review_queue(
+    cid: str,
+    *,
+    n: int,
+    include_quarantine: bool,
+    strategy: str,
+    ranker: object | None,
+    skip_reviewed: bool,
+) -> list[dict] | None:
+    """Build a queue off the UI event loop so websocket heartbeats stay responsive."""
+    return await run.io_bound(
+        sample_review_docs,
+        cid,
+        n=n,
+        include_quarantine=include_quarantine,
+        strategy=strategy,
+        ranker=ranker,
+        skip_reviewed=skip_reviewed,
+    )
+
+
 @ui.page("/review")
 def review_page(cid: str | None = None):
     ranker_error = ""
@@ -57,6 +78,7 @@ def review_page(cid: str | None = None):
         "review_id": None,
         "ranker": ranker,
         "ranker_error": ranker_error,
+        "starting": False,
     }
 
     with shell("Review", "/review"):
@@ -174,30 +196,48 @@ def review_page(cid: str | None = None):
 
                 train_btn.on_click(train_classifier)
 
-                def start() -> None:
+                async def start() -> None:
+                    if state["starting"]:
+                        return
                     if not corpus_sel.value:
                         ui.notify("Pick a corpus", type="warning")
                         return
-                    docs = sample_review_docs(
-                        corpus_sel.value,
-                        n=int(n_in.value or 50),
-                        include_quarantine=bool(q_chk.value),
-                        strategy=strategy_sel.value or "auto",
-                        ranker=state.get("ranker"),
-                        skip_reviewed=not bool(reviewed_chk.value),
-                    )
-                    if not docs:
-                        ui.notify("No unreviewed documents match this queue", type="warning")
+
+                    selected_cid = str(corpus_sel.value)
+                    selected_strategy = str(strategy_sel.value or "auto")
+                    state["starting"] = True
+                    start_btn.props("loading").disable()
+                    try:
+                        docs = await _sample_review_queue(
+                            selected_cid,
+                            n=int(n_in.value or 50),
+                            include_quarantine=bool(q_chk.value),
+                            strategy=selected_strategy,
+                            ranker=state.get("ranker"),
+                            skip_reviewed=not bool(reviewed_chk.value),
+                        )
+                        if docs is None:
+                            return
+                        if not docs:
+                            ui.notify("No unreviewed documents match this queue", type="warning")
+                            return
+                        review_id = start_session(
+                            selected_cid,
+                            sampling_strategy=selected_strategy,
+                            model_version=str(docs[0].get("model_version") or ""),
+                        )
+                    except Exception as exc:
+                        ui.notify(f"Could not start review session: {type(exc).__name__}: {exc}", type="negative")
                         return
-                    state["cid"] = corpus_sel.value
+                    finally:
+                        state["starting"] = False
+                        start_btn.props(remove="loading").enable()
+
+                    state["cid"] = selected_cid
                     state["docs"] = docs
                     state["idx"] = 0
                     state["verdicts"] = {}
-                    state["review_id"] = start_session(
-                        corpus_sel.value,
-                        sampling_strategy=strategy_sel.value or "auto",
-                        model_version=str(docs[0].get("model_version") or ""),
-                    )
+                    state["review_id"] = review_id
                     if docs[0].get("sampling_fallback_reason"):
                         ui.notify("No trained ranker found; using a uniform queue", type="info")
                     render_swipe()

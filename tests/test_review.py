@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+import asyncio
 import shutil
+import threading
 from pathlib import Path
 
 import orjson
 import pytest
 
+import yylab.review as review_module
 from yylab import db
 from yylab.artifacts import corpus_dir, read_json
 from yylab.config import PATHS
 from yylab.ingest.pipeline import IngestConfig, _iter_shards, run_ingest
 from yylab.review import finish_session, load_review_labels, record_verdict, sample_review_docs, start_session
+from yylab.ui.pages import review as review_ui
 from yylab.ui.pages.review import _verdict_counts
 
 
@@ -298,6 +302,7 @@ def test_active_queue_blends_uncertainty_audit_and_random_with_metadata(tmp_path
     components = {doc["sampling_component"] for doc in docs}
     assert components == {"uncertainty", "confidence_audit", "random_exploration"}
     assert all(doc["sampling_candidate_count"] == 23 for doc in docs)
+    assert all(doc["sampling_scored_candidate_count"] == 23 for doc in docs)
     assert all(doc["model_version"] == "test-ranker-v1" for doc in docs)
     assert all(doc["rank_score"] is not None and doc["uncertainty"] is not None for doc in docs)
     deterministic = [doc for doc in docs if doc["sampling_component"] != "random_exploration"]
@@ -312,6 +317,35 @@ def test_active_queue_blends_uncertainty_audit_and_random_with_metadata(tmp_path
     assert stored["model_version"] == "test-ranker-v1"
     assert stored["rank_score"] == pytest.approx(docs[0]["rank_score"])
     assert stored["uncertainty"] == pytest.approx(docs[0]["uncertainty"])
+
+
+def test_active_queue_bounds_expensive_ranker_scoring(tmp_path, monkeypatch):
+    extra = {
+        f"extra-{idx}.txt": (
+            f"Document {idx} provides a distinct technical account with measured results, "
+            "responsible owners, and enough prose to form a useful review candidate."
+        )
+        for idx in range(20)
+    }
+    cid = _make_corpus(tmp_path, "bounded-active", extra=extra)
+
+    class CountingRanker(_FakeRanker):
+        scored = 0
+
+        def score_docs(self, docs: list[dict]) -> list[dict]:
+            self.scored += len(docs)
+            return super().score_docs(docs)
+
+    monkeypatch.setattr(review_module, "_ACTIVE_MIN_CANDIDATES", 8)
+    monkeypatch.setattr(review_module, "_ACTIVE_MAX_CANDIDATES", 8)
+    ranker = CountingRanker()
+
+    docs = sample_review_docs(cid, n=5, strategy="active", ranker=ranker, seed=17)
+
+    assert len(docs) == 5
+    assert ranker.scored == 8
+    assert all(doc["sampling_candidate_count"] == 23 for doc in docs)
+    assert all(doc["sampling_scored_candidate_count"] == 8 for doc in docs)
 
 
 def test_auto_queue_without_ranker_falls_back_to_uniform(tmp_path):
@@ -346,3 +380,45 @@ def test_live_verdict_counts_read_stored_payloads():
         "c": {"text": BAD_DOC, "verdict": "bad"},
     }
     assert _verdict_counts(verdicts) == (2, 1)
+
+
+def test_review_queue_sampling_runs_off_ui_event_loop(monkeypatch):
+    loop_thread = threading.get_ident()
+    call: dict = {}
+    expected = [{"hash": "sampled"}]
+
+    def fake_sample(cid, n=50, include_quarantine=False, **kwargs):
+        call.update(
+            {
+                "thread": threading.get_ident(),
+                "cid": cid,
+                "n": n,
+                "include_quarantine": include_quarantine,
+                **kwargs,
+            }
+        )
+        return expected
+
+    monkeypatch.setattr(review_ui, "sample_review_docs", fake_sample)
+    docs = asyncio.run(
+        review_ui._sample_review_queue(
+            "corpus-id",
+            n=75,
+            include_quarantine=True,
+            strategy="active",
+            ranker="ranker",
+            skip_reviewed=False,
+        )
+    )
+
+    assert docs is expected
+    assert call == {
+        "thread": call["thread"],
+        "cid": "corpus-id",
+        "n": 75,
+        "include_quarantine": True,
+        "strategy": "active",
+        "ranker": "ranker",
+        "skip_reviewed": False,
+    }
+    assert call["thread"] != loop_thread

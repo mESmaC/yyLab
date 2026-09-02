@@ -24,6 +24,9 @@ SAMPLING_STRATEGIES = {"auto", "uniform", "active"}
 DEFAULT_EXPLORATION_FRACTION = 0.20
 DEFAULT_AUDIT_FRACTION = 0.10
 _SCORE_BATCH_SIZE = 256
+_ACTIVE_MIN_CANDIDATES = 1_024
+_ACTIVE_CANDIDATE_MULTIPLIER = 20
+_ACTIVE_MAX_CANDIDATES = 4_096
 
 
 def _buckets(cid: str, include_quarantine: bool) -> list[tuple[str, str, list[str]]]:
@@ -144,6 +147,31 @@ def _active_sample(
     exploration_fraction: float,
     audit_fraction: float,
 ) -> list[dict]:
+    # Stage-1 features deliberately inspect document text and are much more expensive
+    # than reading the compressed shards.  Ranking every document made a review click
+    # take minutes on ordinary corpora.  Draw a bounded, uniform candidate pool first;
+    # active learning then finds the most informative documents within that pool while
+    # retaining a representative random-exploration component.
+    candidate_limit = max(
+        n,
+        min(
+            _ACTIVE_MAX_CANDIDATES,
+            max(_ACTIVE_MIN_CANDIDATES, n * _ACTIVE_CANDIDATE_MULTIPLIER),
+        ),
+    )
+    candidate_heap: list[tuple[float, int, dict]] = []
+    population_size = 0
+    for population_size, doc in enumerate(docs, start=1):
+        _keep_smallest_random(
+            candidate_heap,
+            doc,
+            key=rng.random(),
+            counter=population_size,
+            limit=candidate_limit,
+        )
+    candidates = [entry[2] for entry in candidate_heap]
+    scored_candidate_count = len(candidates)
+
     exploration_target = min(n, round(n * exploration_fraction))
     if exploration_fraction > 0 and n > 1:
         exploration_target = max(1, exploration_target)
@@ -157,7 +185,7 @@ def _active_sample(
     audit_heap: list[tuple[float, int, dict]] = []
     random_heap: list[tuple[float, int, dict]] = []
     pending: list[tuple[int, dict]] = []
-    seen = 0
+    scored_seen = 0
     score_error = ""
 
     def consider_scored(batch: list[tuple[int, dict]]) -> None:
@@ -189,10 +217,16 @@ def _active_sample(
                 heapq.heapreplace(audit_heap, low_entry)
 
     random_limit = max(n, n + deterministic_target)
-    for seen, doc in enumerate(docs, start=1):
-        _keep_smallest_random(random_heap, doc, key=rng.random(), counter=seen, limit=random_limit)
+    for scored_seen, doc in enumerate(candidates, start=1):
+        _keep_smallest_random(
+            random_heap,
+            doc,
+            key=rng.random(),
+            counter=scored_seen,
+            limit=random_limit,
+        )
         if not score_error:
-            pending.append((seen, doc))
+            pending.append((scored_seen, doc))
             if len(pending) >= _SCORE_BATCH_SIZE:
                 consider_scored(pending)
                 pending = []
@@ -200,14 +234,15 @@ def _active_sample(
 
     if score_error:
         selected = [entry[2] for entry in sorted(random_heap, key=lambda entry: -entry[0])[:n]]
-        propensity = min(1.0, n / seen) if seen else None
+        propensity = min(1.0, n / population_size) if population_size else None
         for doc in selected:
             doc.update(
                 {
                     "sampling_strategy": "uniform",
                     "sampling_component": "uniform",
                     "sampling_propensity": propensity,
-                    "sampling_candidate_count": seen,
+                    "sampling_candidate_count": population_size,
+                    "sampling_scored_candidate_count": scored_candidate_count,
                     "sampling_requested_strategy": requested_strategy,
                     "sampling_fallback_reason": score_error,
                 }
@@ -235,12 +270,12 @@ def _active_sample(
                 break
 
     # Small candidate sets can collapse the planned components; fill any remaining slots uniformly.
-    if len(selected_hashes) < min(n, seen):
+    if len(selected_hashes) < min(n, scored_seen):
         for _, _, doc in sorted(random_heap, key=lambda entry: -entry[0]):
             if doc["hash"] not in selected_hashes:
                 random_docs.append(doc)
                 selected_hashes.add(doc["hash"])
-                if len(selected_hashes) >= min(n, seen):
+                if len(selected_hashes) >= min(n, scored_seen):
                     break
 
 
@@ -256,13 +291,14 @@ def _active_sample(
                     "sampling_component": component,
                     # Deterministic top/bottom-k selection has no meaningful random propensity.
                     "sampling_propensity": None,
-                    "sampling_candidate_count": seen,
+                    "sampling_candidate_count": population_size,
+                    "sampling_scored_candidate_count": scored_candidate_count,
                     "sampling_requested_strategy": requested_strategy,
                     "model_version": doc.get("model_version") or model_version,
                 }
             )
 
-    random_denominator = max(1, seen - len(uncertainty_docs) - len(audit_docs))
+    random_denominator = max(1, population_size - len(uncertainty_docs) - len(audit_docs))
     random_propensity = min(1.0, len(random_docs) / random_denominator)
     for doc in random_docs:
         doc.update(
@@ -270,7 +306,8 @@ def _active_sample(
                 "sampling_strategy": "active",
                 "sampling_component": "random_exploration",
                 "sampling_propensity": random_propensity,
-                "sampling_candidate_count": seen,
+                "sampling_candidate_count": population_size,
+                "sampling_scored_candidate_count": scored_candidate_count,
                 "sampling_requested_strategy": requested_strategy,
                 "model_version": doc.get("model_version") or model_version,
             }
@@ -469,6 +506,7 @@ def _prepared_verdict(cid: str, value: Mapping[str, Any]) -> dict:
         "quality_report",
         "quarantine_reasons",
         "sampling_candidate_count",
+        "sampling_scored_candidate_count",
         "sampling_requested_strategy",
         "sampling_fallback_reason",
     )
