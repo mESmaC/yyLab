@@ -1139,6 +1139,11 @@ def _validate_initialized_optimizer_offload(payload: Mapping[str, Any]) -> None:
     parameter_devices = [str(value) for value in dense.get("parameter_devices") or []]
     if not parameter_devices or any(not value.startswith("cuda") for value in parameter_devices):
         problems.append("BF16 master parameters are not accelerator-resident")
+    parameter_dtypes = [str(value) for value in dense.get("parameter_dtypes") or []]
+    if parameter_dtypes != ["bfloat16"]:
+        problems.append(
+            f"master parameter dtypes are {parameter_dtypes or ['missing']}, not BF16"
+        )
     if int(dense.get("moment_bytes") or 0) <= 0:
         problems.append("optimizer reports no physical moment storage")
     if problems:
@@ -1371,9 +1376,39 @@ def run_spalmer_base(config: Mapping[str, Any], rd: Path) -> dict[str, Any]:
     )
     last_metrics: Any = None
     exhausted = False
+    optimizer_offload_verified = False
     try:
         for metrics in trainer.run():
             last_metrics = metrics
+            if not optimizer_offload_verified:
+                # The configured policy is only a promise until Adam creates
+                # its moments on the first completed update.  Prove and
+                # persist the physical placement immediately instead of
+                # waiting for a periodic checkpoint or the end of a long run.
+                observed_placement = _optimizer_placement_payload(trainer.optimizer)
+                _validate_initialized_optimizer_offload(observed_placement)
+                first_step = int(
+                    _metric_value(metrics, "step", trainer.progress.completed_steps)
+                )
+                _write_json_atomic(
+                    rd / "optimizer_state_placement.json",
+                    {
+                        "schema_version": 1,
+                        "verified_after_step": first_step,
+                        "optimizer_state_placement": observed_placement,
+                    },
+                )
+                dense = observed_placement["dense"]
+                print(
+                    "SPALMER optimizer placement verified: "
+                    f"step={first_step}; parameters={dense.get('parameter_devices')}; "
+                    f"parameter_dtype={dense.get('parameter_dtypes')}; "
+                    f"moments={dense.get('devices')}/"
+                    f"{dense.get('moment_dtype')}; pinned={dense.get('cpu_pinned')}; "
+                    f"moment_bytes={int(dense.get('moment_bytes') or 0):,}",
+                    flush=True,
+                )
+                optimizer_offload_verified = True
     except CorpusExhausted as exc:
         exhausted = True
         zero_grad = getattr(getattr(trainer, "optimizer", None), "zero_grad", None)

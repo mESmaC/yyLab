@@ -356,6 +356,7 @@ class _FakeTrainer:
                     "devices": ["cpu"],
                     "cpu_pinned": False,
                     "parameter_devices": ["cuda:0"],
+                    "parameter_dtypes": ["bfloat16"],
                 },
                 "sparse": None,
             },
@@ -453,6 +454,9 @@ def test_run_writes_native_artifact_metadata_without_real_training(tmp_path, mon
     manifest = json.loads((output / "spalmer_manifest.json").read_text("utf-8"))
     recipe = json.loads((output / "yylab_recipe.json").read_text("utf-8"))
     token_view = json.loads((output / "tokenized_view_manifest.json").read_text("utf-8"))
+    placement_receipt = json.loads(
+        (tmp_path / "run" / "optimizer_state_placement.json").read_text("utf-8")
+    )
     assert manifest["model_family"] == "spalmer"
     assert manifest["checkpoint_file"] == "spalmer.pt"
     assert manifest["plan_fingerprint"] == "plan-fingerprint"
@@ -471,3 +475,5 @@ def test_run_writes_native_artifact_metadata_without_real_training(tmp_path, mon
         "optimizer_moments": "float32_cpu_offload",
     }
     assert manifest["optimizer_state_placement"]["dense"]["devices"] == ["cpu"]
+    assert placement_receipt["verified_after_step"] == 1
+    assert placement_receipt["optimizer_state_placement"]["dense"]["devices"] == ["cpu"]
