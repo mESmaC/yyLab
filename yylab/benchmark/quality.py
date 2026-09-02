@@ -121,6 +121,8 @@ def _artifact_lock(ref: str | None) -> dict[str, object] | None:
 
 
 def _stack_lock(cfg: Mapping[str, object]) -> dict[str, object]:
+    from ..models.families import family_from_reference
+
     checkpoint = _artifact_lock(str(cfg["checkpoint_ref"]))
     adapter = _artifact_lock(str(cfg.get("adapter_path") or ""))
     content_addressed = bool(checkpoint and checkpoint.get("content_addressed")) and (
@@ -132,6 +134,7 @@ def _stack_lock(cfg: Mapping[str, object]) -> dict[str, object]:
         "adapter": adapter,
         "quant": cfg.get("quant"),
         "adapter_arch": cfg.get("adapter_arch"),
+        "model_family": cfg.get("model_family") or family_from_reference(cfg.get("checkpoint_ref")),
         "fully_content_addressed": content_addressed,
     }
     value["stack_fingerprint"] = hashlib.sha256(canonical_json(value).encode()).hexdigest()
@@ -151,6 +154,7 @@ def _implementation_hashes() -> dict[str, str]:
             for relative in (
                 "infer/engine.py",
                 "models/loading.py",
+                "models/spalmer.py",
                 "mole/inject.py",
                 "mole/layer.py",
             )
@@ -179,7 +183,23 @@ def _gpu_snapshot() -> dict[str, object]:
 
 
 def policies_for_config(cfg: Mapping[str, object]) -> list[str]:
+    from ..models.families import family_from_reference
+
     policy = str(cfg.get("policy") or "base")
+    declared_family = str(cfg.get("model_family") or "").strip().casefold()
+    if declared_family not in {"", "hf", "spalmer", "spalmer_v1"}:
+        raise ValueError(f"unknown benchmark model family: {declared_family}")
+    model_family = (
+        "spalmer"
+        if declared_family in {"spalmer", "spalmer_v1"}
+        else ("hf" if declared_family else family_from_reference(cfg.get("checkpoint_ref")))
+    )
+    if model_family == "spalmer":
+        if policy not in {"base", "dynamic"}:
+            raise ValueError("SPALMER quality benchmarks support base or native dynamic-residency policy")
+        if cfg.get("adapter_path"):
+            raise ValueError("SPALMER quality benchmarks do not accept yyLab adapters")
+        return [policy]
     adapter_path = str(cfg.get("adapter_path") or "")
     adapter_arch = str(cfg.get("adapter_arch") or "")
     experts = int(cfg.get("num_experts") or 0)
@@ -204,10 +224,15 @@ def policies_for_config(cfg: Mapping[str, object]) -> list[str]:
 
 def _request(suite: BenchmarkSuite, case: BenchmarkCase, repetition: int, cfg: Mapping) -> dict:
     generation = suite.generation
+    prompt_mode = str(cfg.get("prompt_mode") or "chat").strip().casefold()
+    if prompt_mode not in {"chat", "raw"}:
+        raise ValueError(f"unknown benchmark prompt mode: {prompt_mode}")
     thinking_override = cfg.get("enable_thinking")
     enable_thinking = (
         bool(thinking_override) if thinking_override is not None else bool(generation["enable_thinking"])
     )
+    if prompt_mode == "raw" and enable_thinking:
+        raise ValueError("thinking requires chat prompt mode")
     return {
         "max_new_tokens": int(
             cfg.get("max_new_tokens") or case.max_new_tokens or generation["max_new_tokens"]
@@ -215,6 +240,7 @@ def _request(suite: BenchmarkSuite, case: BenchmarkCase, repetition: int, cfg: M
         "temperature": THINKING_TEMPERATURE if enable_thinking else float(generation["temperature"]),
         "top_p": THINKING_TOP_P if enable_thinking else float(generation["top_p"]),
         "top_k": THINKING_TOP_K if enable_thinking else int(generation["top_k"]),
+        "prompt_mode": prompt_mode,
         "enable_thinking": enable_thinking,
         "max_thinking_tokens": (
             int(cfg.get("max_thinking_tokens") or DEFAULT_THINKING_TOKENS) if enable_thinking else 0
@@ -255,6 +281,7 @@ def _canonical_generation_request(request: Mapping[str, object]) -> dict[str, ob
     """Normalize controls that have no effect for legacy comparison compatibility."""
 
     value = dict(request)
+    value.setdefault("prompt_mode", "chat")
     if not bool(value.get("enable_thinking")):
         value.pop("max_thinking_tokens", None)
     return value
@@ -298,6 +325,7 @@ def _workload_contract(
         "repetitions": repetitions,
         "generation": dict(suite.generation),
         "runtime_context_limit": "loaded_model.max_position_embeddings",
+        "prompt_mode": str(cfg.get("prompt_mode") or "chat").strip().casefold(),
         "context_mode": cfg.get("context_mode") or "native",
         "rope_scaling": cfg.get("rope_scaling") or "none",
         "rope_factor": cfg.get("rope_factor"),
@@ -1225,6 +1253,7 @@ def run_quality_benchmark(
             quant=str(cfg.get("quant") or "bf16"),
             adapter_path=str(cfg.get("adapter_path") or "") or None,
             adapter_arch=str(cfg.get("adapter_arch") or ""),
+            model_family=str(cfg.get("model_family") or "") or None,
             settings=backend_settings,
         )
     completed = len(completed_cells)

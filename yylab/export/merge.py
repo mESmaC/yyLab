@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from ..mole.inject import (
@@ -43,6 +44,14 @@ def _save(model, tokenizer, out_dir: Path) -> Path:
 def merge_lora(ref: str, adapter_path: str, out_dir: Path, dtype=None) -> Path:
     from peft import PeftModel
 
+    metadata_path = Path(adapter_path) / "yylab_antidoom.json"
+    if metadata_path.exists():
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if metadata.get("merge_safe") is False:
+            raise ValueError(
+                "this output-head AntiDoom adapter is intentionally adapter-only; "
+                "merging it into a tied-embedding base would double-apply its update"
+            )
     model, tokenizer = load_base_full(ref, dtype)
     model = PeftModel.from_pretrained(model, adapter_path)
     model = model.merge_and_unload()
@@ -61,7 +70,7 @@ def expert_usage_weights(model, calib_ids: list[list[int]]) -> dict[str, object]
         if indices.ndim != 2 or selected.shape != indices.shape:
             raise ValueError("router calibration expected matching [items, top_k] routes")
         num_experts = (
-            next(layer.num_experts for layer_name, layer in mole_layers(model) if layer_name == name)
+            next(layer.num_routes for layer_name, layer in mole_layers(model) if layer_name == name)
             if name != "__shared_prompt__"
             else selected.shape[-1]
         )
@@ -69,7 +78,7 @@ def expert_usage_weights(model, calib_ids: list[list[int]]) -> dict[str, object]
             prompt = shared_router(model)
             if prompt is None:
                 raise RuntimeError("shared prompt route disappeared during calibration")
-            num_experts = prompt.num_experts
+            num_experts = prompt.num_routes
         totals = torch.zeros(num_experts, dtype=torch.float32, device=indices.device)
         totals.scatter_add_(0, indices.reshape(-1), selected.float().reshape(-1))
         weights[name] = weights.get(name, torch.zeros_like(totals)) + totals
@@ -142,7 +151,7 @@ def materialize_mole(model, weights: dict[str, object] | None = None) -> int:
         base = layer.base
         w = weights.get("__shared_prompt__", weights.get(name)) if weights else None
         if w is None:
-            w = torch.full((layer.num_experts,), 1.0 / layer.num_experts)
+            w = torch.full((layer.num_routes,), 1.0 / layer.num_routes)
         w = w.to(torch.float32)
         w = w / w.sum()
         delta = None

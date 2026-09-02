@@ -24,6 +24,10 @@ def router_dir(rid: str) -> Path:
     return PATHS.routers / rid
 
 
+def tokenizer_dir(tid: str) -> Path:
+    return PATHS.tokenizers / tid
+
+
 def run_dir(rid: str) -> Path:
     return PATHS.runs / rid
 

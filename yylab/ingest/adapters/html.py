@@ -19,7 +19,9 @@ NL_RE = re.compile(r"\n{3,}")
 class HtmlAdapter(Adapter):
     name = "html"
     extensions = {".html", ".htm", ".xhtml"}
-    default_domain = "web"
+    # The container is HTML, but after scripts/styles/markup are removed the
+    # model-visible record is prose and should pass ordinary content analysis.
+    default_domain = "other"
 
     def extract(self, path: Path) -> Iterator[Doc]:
         from bs4 import BeautifulSoup

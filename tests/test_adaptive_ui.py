@@ -5,6 +5,7 @@ from yylab.ui.pages.chat import _engine_routing_telemetry, _routing_telemetry_te
 from yylab.ui.pages.train_mole import (
     ADAPTIVE_ROUTING_MODE,
     FIXED_ROUTING_MODE,
+    SOFT_LORA_ROUTING_MODE,
     _adaptive_ui_config,
     _estimate_adaptive_architecture,
     _routing_run_fields,
@@ -36,6 +37,13 @@ def test_adaptive_ui_values_serialize_to_runtime_contract() -> None:
 
 def test_routing_run_fields_leave_legacy_shape_unchanged() -> None:
     assert _routing_run_fields(FIXED_ROUTING_MODE) == {"training_strategy": "joint_per_token_v1"}
+
+
+def test_routing_run_fields_enable_soft_lora_identity_route() -> None:
+    assert _routing_run_fields(SOFT_LORA_ROUTING_MODE) == {
+        "training_strategy": "joint_soft_lora_identity_v1",
+        "identity_expert": True,
+    }
 
 
 def test_routing_run_fields_select_adaptive_strategy_and_validated_payload() -> None:

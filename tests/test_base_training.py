@@ -18,6 +18,10 @@ from yylab.train.base_config import (
     build_hf_config,
     estimate_parameter_count,
     fit_layers_to_parameter_target,
+    fit_scratch_to_parameter_target,
+    normalize_training_token_budget,
+    resolve_training_token_budget,
+    tokenizer_embedding_parameter_floor,
 )
 from yylab.train.low_precision import (
     EMULATED_QAT_BACKEND,
@@ -122,6 +126,124 @@ def test_parameter_target_solver_reports_achievable_shape():
     fitted = fit_layers_to_parameter_target(spec, target)
     assert fitted.num_hidden_layers == 7
     assert estimate_parameter_count(fitted) != target
+
+
+def test_flexible_parameter_target_solver_reaches_one_million_with_compact_vocab():
+    spec = ScratchModelSpec(vocab_size=0, vocab_padding_multiple=64)
+
+    fitted = fit_scratch_to_parameter_target(
+        spec,
+        1_000_000,
+        tokenizer_vocab_size=2048,
+    )
+    actual = estimate_parameter_count(fitted, tokenizer_vocab_size=2048)
+
+    fitted.validate(tokenizer_vocab_size=2048)
+    assert abs(actual - 1_000_000) / 1_000_000 < 0.01
+    assert (
+        fitted.hidden_size,
+        fitted.intermediate_size,
+        fitted.num_hidden_layers,
+    ) != (spec.hidden_size, spec.intermediate_size, spec.num_hidden_layers)
+
+
+@pytest.mark.parametrize("target", [100_000, 500_000, 3_000_000, 12_000_000, 27_000_000])
+def test_flexible_parameter_target_solver_supports_continuous_small_targets(target):
+    spec = ScratchModelSpec(vocab_size=0, vocab_padding_multiple=64)
+
+    fitted = fit_scratch_to_parameter_target(
+        spec,
+        target,
+        tokenizer_vocab_size=2048,
+    )
+    actual = estimate_parameter_count(fitted, tokenizer_vocab_size=2048)
+
+    fitted.validate(tokenizer_vocab_size=2048)
+    assert abs(actual - target) / target < 0.001
+
+
+def test_flexible_parameter_target_solver_keeps_nvfp4_alignment():
+    fitted = fit_scratch_to_parameter_target(
+        ScratchModelSpec(vocab_size=0, vocab_padding_multiple=64),
+        3_000_000,
+        tokenizer_vocab_size=2048,
+        qat_mode="nvfp4",
+    )
+
+    fitted.validate(tokenizer_vocab_size=2048, qat_mode="nvfp4")
+    assert fitted.hidden_size % 32 == 0
+    assert fitted.intermediate_size % 32 == 0
+    assert fitted.head_dim % 16 == 0
+
+
+def test_parameter_target_solver_enforces_large_tokenizer_embedding_floor():
+    spec = ScratchModelSpec(vocab_size=0, vocab_padding_multiple=64)
+
+    assert tokenizer_embedding_parameter_floor(spec, 151_680) == 1_213_440
+    with pytest.raises(ValueError, match=r"tokenizer embedding floor 1,213,440"):
+        fit_scratch_to_parameter_target(
+            spec,
+            1_000_000,
+            tokenizer_vocab_size=151_680,
+        )
+
+
+def test_training_token_budget_rounds_up_and_overrides_step_sources():
+    budget = resolve_training_token_budget(
+        requested_tokens=1_000_000,
+        seq_len=512,
+        micro_batch=8,
+        grad_accum=2,
+        max_steps=999,
+        estimated_steps=777,
+    )
+
+    assert budget == {
+        "requested_training_tokens": 1_000_000,
+        "tokens_per_optimizer_step": 8192,
+        "max_steps": 123,
+        "scheduled_training_tokens": 1_007_616,
+        "token_budget_rounding": 7616,
+        "step_cap_source": "token_budget",
+    }
+
+
+def test_training_budget_preserves_legacy_step_and_epoch_resolution():
+    explicit = resolve_training_token_budget(
+        seq_len=128,
+        micro_batch=2,
+        grad_accum=4,
+        max_steps=7,
+        estimated_steps=11,
+    )
+    epoch_derived = resolve_training_token_budget(
+        seq_len=128,
+        micro_batch=2,
+        grad_accum=4,
+        estimated_steps=11,
+    )
+
+    assert explicit["max_steps"] == 7
+    assert explicit["step_cap_source"] == "max_steps"
+    assert explicit["scheduled_training_tokens"] == 7168
+    assert epoch_derived["max_steps"] == 11
+    assert epoch_derived["step_cap_source"] == "epochs"
+
+
+def test_replayed_config_rederives_stale_step_cap_from_token_budget():
+    normalized = normalize_training_token_budget(
+        {
+            "requested_training_tokens": 1000,
+            "seq_len": 128,
+            "micro_batch": 2,
+            "grad_accum": 2,
+            "max_steps": 999,
+        }
+    )
+
+    assert normalized["max_steps"] == 2
+    assert normalized["scheduled_training_tokens"] == 1024
+    assert normalized["step_cap_source"] == "token_budget"
 
 
 def test_scratch_validation_separates_native_and_training_context():
@@ -459,6 +581,27 @@ class _OneBatch:
     def __iter__(self):
         return iter([{"input_ids": [[4, 5, 6, 7, 8, 9, 4, 5]]}])
 
+    def data_stats(self):
+        return {
+            "docs_seen": 1,
+            "rendered_tokens": 8,
+            "tokens": {
+                "rendered_content_tokens": 8,
+                "inserted_document_boundary_tokens": 0,
+                "rendered_token_positions": 8,
+                "covered_rendered_positions": 8,
+                "unforwarded_rendered_positions": 0,
+                "forwarded_real_inputs": 8,
+                "forwarded_model_slots": 8,
+                "padding_inputs": 0,
+                "packing_replay_inputs": 0,
+                "model_target_slots": 7,
+                "optimizer_supervised_targets": 7,
+                "ignored_target_slots": 0,
+            },
+            "per_corpus": {},
+        }
+
 
 def test_run_base_scratch_end_to_end_and_reload(tmp_path, monkeypatch):
     from yylab.models import loading
@@ -469,6 +612,25 @@ def test_run_base_scratch_end_to_end_and_reload(tmp_path, monkeypatch):
     db.execute(
         "INSERT INTO checkpoints(id, name, created_at, kind, source, ref) VALUES(?,?,?,?,?,?)",
         (out_id, "tiny-scratch", db.now_iso(), "pending", "pending", ""),
+    )
+    db.execute(
+        "INSERT OR REPLACE INTO corpora(id,name,created_at,updated_at,status,source_path,stats_json) "
+        "VALUES(?,?,?,?,?,?,?)",
+        (
+            "unused-by-test",
+            "unused-by-test",
+            db.now_iso(),
+            db.now_iso(),
+            "ready",
+            "",
+            json.dumps(
+                {
+                    "docs_written": 1,
+                    "chars_written": 80,
+                    "domains": {"language": {"docs": 1, "chars": 80}},
+                }
+            ),
+        ),
     )
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     monkeypatch.setattr(worker, "build_batches", lambda *_args, **_kwargs: _OneBatch())
@@ -522,9 +684,17 @@ def test_run_base_scratch_end_to_end_and_reload(tmp_path, monkeypatch):
     assert summary["result"]["steps"] == 1
     assert (out / "model.safetensors").is_file()
     assert (out / "yylab_recipe.json").is_file()
+    assert (out / "tokenized_view_manifest.json").is_file()
+    assert (tmp_path / "run" / "tokenized_view_manifest.json").is_file()
+    tokenized_view = json.loads((out / "tokenized_view_manifest.json").read_text("utf-8"))
+    assert tokenized_view["kind"] == "yylab_tokenized_training_view"
+    assert all(tokenized_view["reconciliation"].values())
+    assert summary["data_provenance"]["training"] == tokenized_view
     saved_config = json.loads((out / "config.json").read_text("utf-8"))
     assert saved_config["yylab_low_precision"]["format"] == "int4"
     assert saved_config["max_position_embeddings"] == 128
+    assert saved_config["yylab_training_recipe"]["objective"] == "causal_lm"
+    assert saved_config["yylab_training_recipe"]["precision"]["qat"] == "int4"
 
     model, tokenizer, cuda, quant, notes = loading.load_base(str(out), "fp32")
     assert not cuda
@@ -532,6 +702,15 @@ def test_run_base_scratch_end_to_end_and_reload(tmp_path, monkeypatch):
     assert len(tokenizer) > 0
     assert any(isinstance(module, QATLinear) for module in model.modules())
     assert any("restored int4 QAT" in note for note in notes)
+
+    dense_model, _, _, _, dense_notes = loading.load_base(
+        str(out),
+        "fp32",
+        restore_saved_qat=False,
+    )
+    assert not any(isinstance(module, QATLinear) for module in dense_model.modules())
+    assert not hasattr(dense_model.config, "yylab_low_precision")
+    assert any("without restoring inherited QAT" in note for note in dense_notes)
     row = db.q1("SELECT * FROM checkpoints WHERE id=?", (out_id,))
     metadata = json.loads(row["meta_json"])
     assert row["kind"] == "base"
@@ -606,17 +785,199 @@ def test_base_ui_recipe_builder_keeps_independent_training_axes():
         log_every=3,
         save_every=20,
         runtime={"torch_compile": True, "compile_mode": "reduce-overhead"},
+        objective="chat_sft",
+        splits=["train", "unspecified"],
+        target_parameters=12_345_678,
     )
     assert config["initialization"]["mode"] == "scratch"
+    assert config["objective"] == "chat_sft"
     assert config["architecture"]["max_position_embeddings"] == 128
     assert config["precision"]["qat"] == "ternary"
     assert config["optimizer"]["state"] == "cpu_offload"
     assert config["scheduler"]["warmup_ratio"] == 0.03
     assert config["corpora"] == ["corpus-z", "corpus-a"]
     assert config["corpus_mix"] == "round_robin"
+    assert config["splits"] == ["train", "unspecified"]
     assert config["seq_len"] == 128
+    assert config["max_steps"] == 99
+    assert config["step_cap_source"] == "max_steps"
+    assert config["tokens_per_optimizer_step"] == 2048
+    assert config["scheduled_training_tokens"] == 202_752
     assert config["save_every"] == 20
     assert config["torch_compile"] is True
+    assert config["shuffle_buffer"] == 8192
+    assert config["shuffle_buffer_bytes"] == 256 * 2**20
+    assert config["target_parameters"] == 12_345_678
+
+
+def test_base_ui_recipe_builder_persists_token_budget_rounding():
+    from yylab.ui.pages.train_base import _base_run_config
+
+    config = _base_run_config(
+        initialization={"mode": "scratch", "tokenizer_ref": "tokenizer"},
+        method="full",
+        architecture=_tiny_spec().to_dict(),
+        precision={"parameter_dtype": "bf16", "qat": "none"},
+        optimizer={"implementation": "torch_adamw", "state": "gpu", "lr": 1e-4},
+        scheduler={"name": "cosine", "warmup_ratio": 0.03},
+        corpora=["corpus"],
+        domains=None,
+        seq_len=512,
+        epochs=3,
+        micro_batch=8,
+        grad_accum=2,
+        max_steps=999,
+        seed=7,
+        grad_clip=1.0,
+        grad_ckpt=True,
+        log_every=1,
+        save_every=None,
+        runtime={"max_steps": 17, "scheduled_training_tokens": 17},
+        requested_training_tokens=1_000_000,
+        step_cap_source="token_budget",
+    )
+
+    assert config["requested_training_tokens"] == 1_000_000
+    assert config["max_steps"] == 123
+    assert config["scheduled_training_tokens"] == 1_007_616
+    assert config["token_budget_rounding"] == 7616
+
+
+def test_compact_preset_is_honest_about_its_required_vocabulary():
+    from yylab.ui.pages.train_base import SCRATCH_PRESETS, _tokenizer_vocab_hint
+
+    preset = SCRATCH_PRESETS["qwen_1m_compact"]
+    assert preset["compact_vocab_size"] == 2048
+    assert preset["vocab_size"] == 0
+    assert preset["hidden_size"] == 64
+    assert preset["num_hidden_layers"] == 18
+    preset_spec = ScratchModelSpec(
+        **{
+            key: value
+            for key, value in preset.items()
+            if key not in {"target_params_m", "compact_tokenizer", "compact_vocab_size"}
+        }
+    )
+    assert (
+        abs(estimate_parameter_count(preset_spec, tokenizer_vocab_size=2048) - 1_000_000)
+        / 1_000_000
+        < 0.03
+    )
+    assert preset_spec.resolved_vocab_size(151_680) == 151_680
+    with pytest.raises(ValueError, match="tokenizer embedding floor"):
+        fit_scratch_to_parameter_target(
+            preset_spec,
+            1_000_000,
+            tokenizer_vocab_size=151_680,
+        )
+    assert _tokenizer_vocab_hint({"ref": "missing", "meta_json": "{}"}, 2048) == 2048
+
+
+def test_small_parameter_target_names_preserve_requested_precision():
+    from yylab.ui.pages.train_base import _parameter_target_slug, _resolve_parameter_target
+
+    assert _parameter_target_slug(100_000) == "0.1m"
+    assert _parameter_target_slug(500_000) == "0.5m"
+    assert _parameter_target_slug(3_000_000) == "3m"
+    assert _parameter_target_slug(12_345_000) == "12.345m"
+    assert _parameter_target_slug(123_457) == "0.123457m"
+    assert _resolve_parameter_target(0.1) == 100_000
+    assert _resolve_parameter_target(0.1, 123_457) == 123_457
+
+
+def test_scratch_initialization_supports_existing_and_compact_tokenizers():
+    from yylab.ui.pages.train_base import (
+        TOKENIZER_SOURCE_COMPACT,
+        TOKENIZER_SOURCE_EXISTING,
+        _scratch_initialization,
+    )
+
+    assert _scratch_initialization(
+        TOKENIZER_SOURCE_EXISTING,
+        tokenizer_ref="tokenizer-ref",
+    ) == {"mode": "scratch", "tokenizer_ref": "tokenizer-ref"}
+    compact_initialization = _scratch_initialization(
+        TOKENIZER_SOURCE_COMPACT,
+        compact_tokenizer={
+            "vocab_size": 2048,
+            "min_frequency": 3,
+            "max_documents": 5000,
+            "lowercase": True,
+        },
+    )
+    assert compact_initialization["mode"] == "scratch"
+    assert compact_initialization["compact_tokenizer"] | {
+        "max_training_bytes": 0,
+        "special_token_profile": "chat",
+        "custom_special_tokens": (),
+    } == compact_initialization["compact_tokenizer"]
+    assert {
+        key: compact_initialization["compact_tokenizer"][key]
+        for key in ("vocab_size", "min_frequency", "max_documents", "lowercase")
+    } == {
+        "vocab_size": 2048,
+        "min_frequency": 3,
+        "max_documents": 5000,
+        "lowercase": True,
+    }
+    with pytest.raises(ValueError, match="requires a tokenizer reference"):
+        _scratch_initialization(TOKENIZER_SOURCE_EXISTING)
+
+
+def test_scratch_worker_trains_inline_compact_tokenizer_from_selected_data(
+    tmp_path, monkeypatch
+):
+    from yylab.workers import train as train_worker
+
+    calls = {}
+
+    def fake_docs(corpora, domains, **kwargs):
+        calls.update(corpora=corpora, domains=domains, **kwargs)
+        yield {"text": "system alpha user beta assistant gamma"}
+        yield {"text": "code math language delta epsilon"}
+
+    monkeypatch.setattr(train_worker, "iter_corpus_docs", fake_docs)
+    monkeypatch.setattr(train_worker, "checkpoint_dir", lambda _checkpoint_id: tmp_path)
+    spec = replace(
+        _tiny_spec(),
+        vocab_size=0,
+        vocab_padding_multiple=1,
+    )
+    model, tokenizer, cuda, quant, notes = train_worker._create_scratch_base(
+        {
+            "initialization": {
+                "mode": "scratch",
+                "compact_tokenizer": {
+                    "vocab_size": 264,
+                    "min_frequency": 1,
+                    "max_documents": 10,
+                    "lowercase": False,
+                    "special_token_profile": "chat",
+                },
+            },
+            "out_checkpoint_id": "checkpoint",
+            "corpora": ["corpus-b", "corpus-a"],
+            "domains": ["code"],
+            "splits": ["train", "unspecified"],
+            "corpus_mix": "round_robin",
+            "objective": "chat_sft",
+            "architecture": spec.to_dict(),
+            "precision": {"parameter_dtype": "fp32", "qat": "none"},
+            "seq_len": 64,
+            "seed": 7,
+        }
+    )
+
+    assert calls["corpora"] == ["corpus-b", "corpus-a"]
+    assert calls["domains"] == ["code"]
+    assert calls["splits"] == ["train", "unspecified"]
+    assert calls["shuffle_buffer"] == 1
+    assert (tmp_path / "tokenizer-source" / "tokenizer.json").is_file()
+    assert len(tokenizer) == 264
+    assert model.config.vocab_size == 264
+    assert cuda is torch.cuda.is_available()
+    assert quant == "fp32"
+    assert any("trained inline chat byte-BPE tokenizer" in note for note in notes)
 
 
 def test_base_ui_normalizes_legacy_single_corpus_and_preserves_multi_select_order():

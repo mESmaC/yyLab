@@ -839,6 +839,11 @@ def train_loop(
     window_micro = 0
     last_loss = torch.zeros((), dtype=torch.float32, device=device)
     tokens = 0
+    supervised_tokens = 0
+    sequences_forwarded = 0
+    forwarded_real_tokens = 0
+    padding_tokens = 0
+    model_target_slots = 0
     t0 = time.time()
     optimizer.zero_grad(set_to_none=True)
     use_cudnn_sdpa = opts.prefer_cudnn_sdpa and cudnn_sdpa_eligible(model, device)
@@ -862,10 +867,31 @@ def train_loop(
 
     for batch in batches:
         ids = torch.tensor(batch["input_ids"], dtype=torch.long, device=device)
+        labels = ids
+        batch_target_slots = ids.shape[0] * max(ids.shape[1] - 1, 0)
+        model_target_slots += int(batch_target_slots)
+        if batch.get("labels") is not None:
+            labels = torch.tensor(batch["labels"], dtype=torch.long, device=device)
+            if labels.shape != ids.shape:
+                raise ValueError("batch labels must have the same shape as input_ids")
+            # Hugging Face causal-LM heads shift internally and optimize
+            # labels[:, 1:]. The first column is context, never a target.
+            supervised_tokens += int(labels[:, 1:].ne(-100).sum().item())
+        else:
+            supervised_tokens += int(batch_target_slots)
+        model_inputs = {"input_ids": ids, "labels": labels}
+        if batch.get("attention_mask") is not None:
+            attention_mask = torch.tensor(batch["attention_mask"], dtype=torch.long, device=device)
+            if attention_mask.shape != ids.shape:
+                raise ValueError("batch attention_mask must have the same shape as input_ids")
+            model_inputs["attention_mask"] = attention_mask
+            real_tokens = int(attention_mask.sum().item())
+        else:
+            real_tokens = int(ids.numel())
         # Backward stays inside the context because gradient checkpointing
         # recomputes model forwards during this call.
         with attention_backend_context(model, device, enabled=opts.prefer_cudnn_sdpa):
-            out = model(input_ids=ids, labels=ids)
+            out = model(**model_inputs)
             loss_metric = out.loss.detach().float()
             loss = out.loss / opts.grad_accum
             aux_metric = None
@@ -889,6 +915,9 @@ def train_loop(
         window_micro += 1
         last_loss.copy_(loss_metric)
         tokens += ids.numel()
+        sequences_forwarded += int(ids.shape[0])
+        forwarded_real_tokens += real_tokens
+        padding_tokens += int(ids.numel()) - real_tokens
         micro_step += 1
 
         if micro_step % opts.grad_accum != 0:
@@ -965,6 +994,13 @@ def train_loop(
         "step_cap": opts.max_steps,
         "data_exhausted": data_exhausted,
         "tokens": tokens,
+        "sequences_forwarded": sequences_forwarded,
+        "forwarded_model_tokens": tokens,
+        "forwarded_real_tokens": forwarded_real_tokens,
+        "padding_tokens": padding_tokens,
+        "model_target_slots": model_target_slots,
+        "supervised_tokens": supervised_tokens,
+        "ignored_target_slots": model_target_slots - supervised_tokens,
         "elapsed_s": round(time.time() - t0, 1),
     }
     if device.type == "cuda":

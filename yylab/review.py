@@ -12,7 +12,7 @@ import zstandard as zstd
 from . import db
 from .artifacts import corpus_dir, write_json
 from .config import PATHS
-from .ingest.dedup import norm_sha256_hex, sha256_hex
+from .ingest.dedup import sha256_hex, training_hash_key
 from .ingest.pipeline import _iter_shards
 from .ingest.pipeline import _ShardWriter as ShardWriter
 
@@ -689,8 +689,7 @@ def load_review_labels() -> list[dict]:
 def _block_future_ingest(review_id: str, bad_docs: list[dict]) -> None:
     rows = []
     for d in bad_docs:
-        rows.append((d["hash"], db.now_iso(), f"review:{review_id}"))
-        rows.append((norm_sha256_hex(d["text"]), db.now_iso(), f"review:{review_id}"))
+        rows.append((training_hash_key(d["hash"]), db.now_iso(), f"review:{review_id}"))
     db.executemany("INSERT OR IGNORE INTO rejected_hashes(hash, added_at, source) VALUES(?,?,?)", rows)
 
 

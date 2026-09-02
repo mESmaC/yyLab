@@ -12,6 +12,7 @@ from ...config import get_settings
 from ...hw import best_gpu
 from ...infer.engine import ENGINE, LoadSpec
 from ...jobs import JOBS
+from ...models.families import checkpoint_family
 from ..components import empty_state
 from ..shell import ACCENT, PANEL, PANEL_EDGE, panel, shell
 
@@ -38,6 +39,11 @@ CHAT_CONTEXT_STRATEGIES = {
     "recency": "Recent turns only",
 }
 
+CHAT_PROMPT_MODES = {
+    "chat": "Chat template",
+    "raw": "Raw completion",
+}
+
 
 def _user_message(text: str, *, atxy_t: object = "", atxy_x: object = "", atxy_y: object = "") -> dict:
     message: dict = {"role": "user", "content": text}
@@ -49,6 +55,16 @@ def _user_message(text: str, *, atxy_t: object = "", atxy_x: object = "", atxy_y
     if any(address.values()):
         message["atxy"] = address
     return message
+
+
+def _generation_snapshot(history: list[dict], current: dict, prompt_mode: str) -> list[dict]:
+    """Build the engine payload without inventing history for raw completion."""
+
+    if prompt_mode == "raw":
+        return [{"content": str(current.get("content") or "")}]
+    if prompt_mode == "chat":
+        return [*(dict(message) for message in history), dict(current)]
+    raise ValueError(f"unknown prompt mode: {prompt_mode}")
 
 
 def _chat_load_settings(base_settings: dict, context_mode: str) -> dict:
@@ -69,9 +85,12 @@ def _chat_load_settings(base_settings: dict, context_mode: str) -> dict:
 
 
 def _context_telemetry_text(plan: dict) -> str:
+    raw = plan.get("prompt_mode") == "raw"
+    prompt_kind = "Raw prompt" if raw else "Prompt"
+    reserve_kind = "completion reserved" if raw else "answer reserved"
     text = (
-        f"Prompt {int(plan['prompt_tokens']):,}/{int(plan['prompt_budget']):,} tokens"
-        f" · answer reserved {int(plan['answer_budget']):,}"
+        f"{prompt_kind} {int(plan['prompt_tokens']):,}/{int(plan['prompt_budget']):,} tokens"
+        f" · {reserve_kind} {int(plan['answer_budget']):,}"
         f" · context {int(plan['context_limit']):,}"
     )
     if plan.get("compacted"):
@@ -189,7 +208,15 @@ def chat_page():
         }
         engine_settings = dict(get_settings()["engine"])
         messages: list[dict] = []
-        stream_state: dict = {"q": None, "col": None, "label": None, "active": False, "buf": "", "spin": None}
+        stream_state: dict = {
+            "q": None,
+            "col": None,
+            "label": None,
+            "active": False,
+            "buf": "",
+            "spin": None,
+            "prompt_mode": "chat",
+        }
         load_job: dict = {"id": None}
 
         with panel().classes("w-full"):
@@ -228,7 +255,22 @@ def chat_page():
                     )
                     + " · native context"
                 ).props("outline color=grey")
+                spalmer_dynamic = ui.checkbox(
+                    "Adaptive SPALMER residency (2–20 experts)", value=True
+                ).tooltip(
+                    "Starts at two resident experts and expands only when effective surprise warrants it."
+                )
+                spalmer_dynamic.visible = False
             with ui.row().classes("w-full gap-3 mt-2 items-end"):
+                prompt_mode = (
+                    ui.select(
+                        CHAT_PROMPT_MODES,
+                        value="chat",
+                        label="Prompt mode",
+                    )
+                    .props("dense outlined")
+                    .classes("w-40")
+                )
                 temp = (
                     ui.number("Temperature", value=0.7, min=0, max=2, step=0.1)
                     .props("dense outlined")
@@ -262,13 +304,19 @@ def chat_page():
                         "must accept them before the prompt is rebased into contiguous RoPE positions."
                     )
                 )
-                clear_btn = ui.button("Clear chat", icon="delete_sweep").props("dense flat no-caps")
+                clear_btn = ui.button("Clear output", icon="delete_sweep").props("dense flat no-caps")
             context_lbl = ui.label("Context usage will appear after the first message.").classes(
                 "text-xs text-gray-500 mt-1"
             )
+            prompt_mode_lbl = ui.label(
+                "Chat template applies the checkpoint tokenizer's role/control-token format and reuses prior turns."
+            ).classes("text-xs text-gray-500 mt-1")
             routing_lbl = ui.label("").classes("text-xs text-cyan-300 mt-1")
             routing_lbl.visible = False
-            with ui.expansion("ATXY address A=(T,X,Y) · optional", icon="hub").classes("w-full"):
+            atxy_panel = ui.expansion("ATXY address A=(T,X,Y) · optional", icon="hub").classes(
+                "w-full"
+            )
+            with atxy_panel:
                 with ui.row().classes("w-full gap-3"):
                     atxy_t = ui.input("T · table/type").props("dense outlined").classes("flex-1")
                     atxy_x = ui.input("X · entity/key").props("dense outlined").classes("flex-1")
@@ -288,22 +336,26 @@ def chat_page():
                 f"const el=document.getElementById('{chat_box.id}'); if(el) el.scrollTop=el.scrollHeight;"
             )
 
-        def add_user(text: str) -> None:
+        def add_user(text: str, *, raw: bool = False) -> None:
             with chat_box:
                 with ui.row().classes("w-full justify-end"):
                     with (
                         ui.row().classes("items-start gap-2 max-w-[80%]").style("flex-direction: row-reverse")
                     ):
-                        ui.icon("person", size="20px").classes("mt-1 text-gray-400")
+                        ui.icon("terminal" if raw else "person", size="20px").classes(
+                            "mt-1 text-gray-400"
+                        )
                         ui.label(text).classes(
                             "bg-[#2a2a3a] px-3 py-2 rounded-xl rounded-tr-sm text-sm whitespace-pre-wrap"
                         )
             scroll_down()
 
-        def add_assistant_start() -> None:
+        def add_assistant_start(*, raw: bool = False) -> None:
             with chat_box:
                 with ui.row().classes("w-full items-start gap-2"):
-                    ui.icon("smart_toy", size="20px").classes("mt-1").style(f"color: {ACCENT}")
+                    ui.icon("notes" if raw else "smart_toy", size="20px").classes("mt-1").style(
+                        f"color: {ACCENT}"
+                    )
                     with ui.column().classes("gap-1 flex-1 min-w-0 max-w-[85%]") as col:
                         spin = ui.spinner("dots", size="md")
                         lbl = (
@@ -336,17 +388,30 @@ def chat_page():
         def show_empty_hint() -> None:
             chat_box.clear()
             with chat_box:
-                empty_state(
-                    "chat",
-                    "Start a conversation",
-                    "Load a checkpoint (optionally with an adapter and router), then send a message below.",
-                )
+                if str(prompt_mode.value or "chat") == "raw":
+                    empty_state(
+                        "text_snippet",
+                        "Run a raw completion",
+                        "Each prompt is independent and is sent verbatim without chat-template control tokens.",
+                    )
+                else:
+                    empty_state(
+                        "chat",
+                        "Start a conversation",
+                        "Load a checkpoint (optionally with an adapter and router), then send a message below.",
+                    )
 
         show_empty_hint()
 
         def refresh_adapters(_e=None) -> None:
             opts = {"": "(none)"}
-            if ckpt_sel.value:
+            selected_checkpoint = (
+                db.q1("SELECT * FROM checkpoints WHERE id=?", (ckpt_sel.value,))
+                if ckpt_sel.value
+                else None
+            )
+            spalmer = checkpoint_family(selected_checkpoint) == "spalmer"
+            if ckpt_sel.value and not spalmer:
                 for a in db.q(
                     "SELECT * FROM adapters WHERE checkpoint_id=? AND status='trained' ORDER BY created_at DESC",
                     (ckpt_sel.value,),
@@ -355,10 +420,33 @@ def chat_page():
             adp_sel.options = opts
             adp_sel.value = ""
             adp_sel.update()
+            spalmer_dynamic.visible = spalmer
+            if spalmer:
+                adp_sel.disable()
+                rtr_sel.disable()
+                quant_sel.set_value("auto")
+                quant_sel.disable()
+                context_mode.set_value("native")
+                context_mode.disable()
+            else:
+                adp_sel.enable()
+                quant_sel.enable()
+                context_mode.enable()
             refresh_routers()
 
         def refresh_routers(_e=None) -> None:
             opts = {"": "(adapter router)"}
+            selected_checkpoint = (
+                db.q1("SELECT * FROM checkpoints WHERE id=?", (ckpt_sel.value,))
+                if ckpt_sel.value
+                else None
+            )
+            if checkpoint_family(selected_checkpoint) == "spalmer":
+                rtr_sel.options = {"": "(native SPALMER router)"}
+                rtr_sel.value = ""
+                rtr_sel.disable()
+                rtr_sel.update()
+                return
             if adp_sel.value:
                 adapter = db.q1("SELECT path, meta_json FROM adapters WHERE id=?", (adp_sel.value,))
                 router_type = "per_layer"
@@ -392,6 +480,8 @@ def chat_page():
         adp_sel.on_value_change(refresh_routers)
 
         def resolve_quant(ckpt_row, adapter_row) -> str:
+            if checkpoint_family(ckpt_row) == "spalmer":
+                return "checkpoint"
             if adapter_row:
                 return adapter_row["quant"]
             if ckpt_row["quant_locked"]:
@@ -421,16 +511,19 @@ def chat_page():
                 ui.notify("Router requires its adapter selected", type="warning")
                 return
 
+            load_settings = _chat_load_settings(
+                engine_settings,
+                str(context_mode.value or "native"),
+            )
+            load_settings["spalmer_dynamic_residency"] = bool(spalmer_dynamic.value)
             spec = LoadSpec(
                 ref=ckpt_row["ref"],
                 quant=resolve_quant(ckpt_row, adapter_row),
+                model_family=checkpoint_family(ckpt_row),
                 adapter_path=adapter_row["path"] if adapter_row else None,
                 adapter_arch=adapter_row["arch"] if adapter_row else "",
                 router_path=router_row["path"] if router_row else None,
-                settings=_chat_load_settings(
-                    engine_settings,
-                    str(context_mode.value or "native"),
-                ),
+                settings=load_settings,
             )
 
             def do_load(progress) -> list[str]:
@@ -457,11 +550,20 @@ def chat_page():
                     ui.notify(n, type="info")
                 resolved = ENGINE.spec.settings if ENGINE.spec else {}
                 loaded_mode = str(resolved.get("context_mode") or "native").replace("_", " ")
-                engine_badge.text = (
-                    f"{resolved.get('attn_implementation', 'sdpa')} · "
-                    f"cache {resolved.get('cache_implementation', 'dynamic')} · "
-                    f"{loaded_mode} · ctx {ENGINE.context_limit():,}"
-                )
+                if ENGINE.spec and ENGINE.spec.model_family == "spalmer":
+                    routing_mode = "adaptive 2–20" if resolved.get(
+                        "spalmer_dynamic_residency", True
+                    ) else "fixed learned route"
+                    engine_badge.text = (
+                        f"SPALMER · recurrent KDA/NoPE MLA · {routing_mode} · "
+                        f"ctx {ENGINE.context_limit():,}"
+                    )
+                else:
+                    engine_badge.text = (
+                        f"{resolved.get('attn_implementation', 'sdpa')} · "
+                        f"cache {resolved.get('cache_implementation', 'dynamic')} · "
+                        f"{loaded_mode} · ctx {ENGINE.context_limit():,}"
+                    )
                 context_lbl.text = (
                     f"Loaded context {ENGINE.context_limit():,} tokens; "
                     "the requested answer budget is reserved before each generation."
@@ -495,14 +597,17 @@ def chat_page():
                         stream_state["active"] = False
                         if not stream_state["buf"]:
                             pass
-                        messages.append({"role": "assistant", "content": stream_state["buf"]})
+                        if stream_state["prompt_mode"] == "chat":
+                            messages.append({"role": "assistant", "content": stream_state["buf"]})
                         finish_assistant(stream_state["buf"])
+                        prompt_mode.enable()
                         send_btn.enable()
                         return
                     if isinstance(item, tuple) and item[0] == "__error__":
                         stream_state["active"] = False
                         ui.notify(f"Generation error: {item[1]}", type="negative", multi_line=True)
                         finish_assistant(stream_state["buf"], error=True)
+                        prompt_mode.enable()
                         send_btn.enable()
                         return
                     if isinstance(item, tuple) and item[0] == "__context__":
@@ -534,32 +639,37 @@ def chat_page():
                 scroll_down()
 
         def on_send() -> None:
-            text = (inp.value or "").strip()
-            if not text:
+            active_prompt_mode = str(prompt_mode.value or "chat")
+            entered = str(inp.value or "")
+            if not entered.strip():
                 return
+            text = entered if active_prompt_mode == "raw" else entered.strip()
             if not ENGINE.is_loaded():
                 ui.notify("Load a model first", type="warning")
                 return
             if stream_state["active"]:
                 return
-            messages.append(
-                _user_message(
-                    text,
-                    atxy_t=atxy_t.value,
-                    atxy_x=atxy_x.value,
-                    atxy_y=atxy_y.value,
-                )
+            current = _user_message(
+                text,
+                atxy_t=atxy_t.value,
+                atxy_x=atxy_x.value,
+                atxy_y=atxy_y.value,
             )
-            add_user(text)
+            snapshot = _generation_snapshot(messages, current, active_prompt_mode)
+            if active_prompt_mode == "chat":
+                messages.append(current)
+            raw = active_prompt_mode == "raw"
+            add_user(text, raw=raw)
             inp.value = ""
-            add_assistant_start()
+            add_assistant_start(raw=raw)
             stream_state["buf"] = ""
             stream_state["q"] = queue_mod.Queue()
             stream_state["active"] = True
+            stream_state["prompt_mode"] = active_prompt_mode
+            prompt_mode.disable()
             send_btn.disable()
 
             q = stream_state["q"]
-            snapshot = list(messages)
             temperature = float(temp.value or 0.0)
             nucleus = float(top_p.value or 0.9)
             answer_budget = int(max_new.value or 512)
@@ -568,9 +678,10 @@ def chat_page():
 
             def gen_worker() -> None:
                 try:
-                    plan = ENGINE.plan_chat_context(
+                    plan = ENGINE.plan_context(
                         snapshot,
                         max_new_tokens=answer_budget,
+                        prompt_mode=active_prompt_mode,
                         compact=compact,
                         strategy=compaction_strategy,
                     )
@@ -580,6 +691,7 @@ def chat_page():
                         temperature=temperature,
                         top_p=nucleus,
                         max_new_tokens=answer_budget,
+                        prompt_mode=active_prompt_mode,
                     ):
                         q.put(chunk)
                     q.put(None)
@@ -593,8 +705,10 @@ def chat_page():
             if stream_state["active"]:
                 stream_state["active"] = False
                 buf = stream_state["buf"]
-                messages.append({"role": "assistant", "content": buf})
+                if stream_state["prompt_mode"] == "chat":
+                    messages.append({"role": "assistant", "content": buf})
                 finish_assistant(buf)
+                prompt_mode.enable()
                 send_btn.enable()
                 ui.notify("Generation stopped", type="info")
 
@@ -604,6 +718,26 @@ def chat_page():
             refresh_routing_telemetry()
             show_empty_hint()
 
+        def on_prompt_mode_change(_e=None) -> None:
+            raw = str(prompt_mode.value or "chat") == "raw"
+            if raw:
+                auto_compact.disable()
+                context_strategy.disable()
+                atxy_panel.visible = False
+                prompt_mode_lbl.text = (
+                    "Raw completion sends each prompt verbatim and independently. History, ATXY retrieval, "
+                    "and automatic compaction are not used; oversized prompts are rejected, not truncated."
+                )
+            else:
+                auto_compact.enable()
+                context_strategy.enable()
+                atxy_panel.visible = True
+                prompt_mode_lbl.text = (
+                    "Chat template applies the checkpoint tokenizer's role/control-token format and reuses "
+                    "prior turns."
+                )
+            on_clear()
+
         with ui.row().classes("w-full items-end gap-2"):
             inp = ui.input(placeholder="Message…").props("outlined autogrow").classes("flex-1")
             send_btn = ui.button(icon="send", on_click=on_send).props("dense")
@@ -612,6 +746,7 @@ def chat_page():
         load_btn.on_click(on_load)
         unload_btn.on_click(on_unload)
         clear_btn.on_click(on_clear)
+        prompt_mode.on_value_change(on_prompt_mode_change)
         inp.on("keydown.enter", lambda e: on_send() if not e.args.get("shiftKey") else None)
         ui.timer(0.05, drain)
         ui.timer(0.25, refresh_routing_telemetry)

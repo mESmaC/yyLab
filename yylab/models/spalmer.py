@@ -1,0 +1,781 @@
+"""Compatibility boundary between native SPALMER bundles and yyLab runtimes.
+
+SPALMER checkpoints are trusted local ``.pt`` bundles, not Hugging Face
+directories.  This module deliberately keeps their detection and execution
+separate from ``AutoModelForCausalLM`` while presenting the small HF-shaped
+surface used by yyLab's existing chat and benchmark paths.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterable, Mapping, Sequence
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import torch
+from torch import Tensor, nn
+
+SPALMER_FORMAT = "spalmer.prototype.checkpoint"
+SPALMER_FILENAME = "spalmer.pt"
+DEFAULT_CONTEXT_LIMIT = 8_192
+
+
+def resolve_spalmer_checkpoint(ref: str | Path) -> Path:
+    """Resolve either a direct ``.pt`` bundle or ``directory/spalmer.pt``."""
+
+    path = Path(ref).expanduser()
+    if path.is_dir():
+        path = path / SPALMER_FILENAME
+    if not path.is_file():
+        raise FileNotFoundError(f"SPALMER checkpoint not found: {path}")
+    if path.suffix.casefold() != ".pt":
+        raise ValueError("a SPALMER checkpoint must be a .pt bundle")
+    return path.resolve()
+
+
+def is_spalmer_checkpoint(ref: str | Path) -> bool:
+    """Return whether ``ref`` resolves to a valid, safely inspectable bundle."""
+
+    try:
+        scan_spalmer_checkpoint(ref)
+    except (FileNotFoundError, KeyError, OSError, RuntimeError, TypeError, ValueError):
+        return False
+    return True
+
+
+def scan_spalmer_checkpoint(ref: str | Path) -> dict[str, Any]:
+    """Inspect a trusted local SPALMER bundle without constructing its model.
+
+    ``weights_only=True`` constrains unpickling to PyTorch's safe allowlist and
+    ``mmap=True`` prevents registration from materializing a second in-memory
+    copy of all checkpoint tensors.  SPALMER's checkpoint payload is required
+    to remain a plain mapping of primitive metadata and tensors.
+    """
+
+    path = resolve_spalmer_checkpoint(ref)
+    payload = torch.load(
+        str(path),
+        map_location="cpu",
+        weights_only=True,
+        mmap=True,
+    )
+    if not isinstance(payload, dict):
+        raise TypeError("SPALMER checkpoint payload must be a plain dictionary")
+    if payload.get("format") != SPALMER_FORMAT:
+        raise ValueError("not a SPALMER checkpoint")
+
+    model_config = _plain_dict(payload.get("model_config"), "model_config")
+    model_state = _tensor_mapping(payload.get("model_state"), "model_state")
+    metadata = _plain_dict(payload.get("metadata") or {}, "metadata")
+    experts_config = _optional_plain_dict(payload.get("experts_config"), "experts_config")
+    kda_config = _optional_plain_dict(payload.get("kda_config"), "kda_config")
+    mla_config = _optional_plain_dict(payload.get("mla_config"), "mla_config")
+    directional_config = _optional_plain_dict(
+        payload.get("directional_config"), "directional_config"
+    )
+    atxy_config = _optional_plain_dict(payload.get("atxy_config"), "atxy_config")
+
+    hidden_size = _positive_int(model_config.get("d_model"), "model_config.d_model")
+    num_layers = _positive_int(model_config.get("n_layers"), "model_config.n_layers")
+    vocab_size = _positive_int(model_config.get("vocab_size"), "model_config.vocab_size")
+    state_tensor_count = _unique_tensor_numel(model_state.values())
+    planned_parameter_count = _metadata_parameter_count(metadata)
+    parameter_count = planned_parameter_count or state_tensor_count
+    trained_context = _metadata_context_limit(metadata)
+    base_cfg = {
+        **model_config,
+        "model_type": "spalmer",
+        "architectures": ["SPALMERCausalLM"],
+        "hidden_size": hidden_size,
+        "num_hidden_layers": num_layers,
+        "vocab_size": vocab_size,
+        # This is a yyLab safety budget, not a RoPE limit: SPALMER is NoPE.
+        "max_position_embeddings": trained_context or DEFAULT_CONTEXT_LIMIT,
+        "spalmer_format_version": payload.get("format_version"),
+        "spalmer_parameter_dtype": payload.get("model_parameter_dtype"),
+        "spalmer_experts_config": experts_config,
+        "spalmer_kda_config": kda_config,
+        "spalmer_mla_config": mla_config,
+        "spalmer_directional_config": directional_config,
+        "spalmer_atxy_config": atxy_config,
+    }
+    return {
+        "family": "spalmer",
+        "model_family": "spalmer",
+        "format": SPALMER_FORMAT,
+        "format_version": payload.get("format_version"),
+        "arch": "SPALMERCausalLM",
+        "params_b": parameter_count / 1_000_000_000,
+        "parameter_count": parameter_count,
+        "parameter_count_source": (
+            "metadata.plan.parameters.total"
+            if planned_parameter_count is not None
+            else "model_state tensors (parameters and persistent buffers)"
+        ),
+        "state_tensor_count": state_tensor_count,
+        "hidden_size": hidden_size,
+        "num_layers": num_layers,
+        "vocab_size": vocab_size,
+        "parameter_dtype": payload.get("model_parameter_dtype"),
+        "trained_context_length": trained_context,
+        "base_cfg": base_cfg,
+        "metadata": metadata,
+        "experts_config": experts_config,
+        "kda_config": kda_config,
+        "mla_config": mla_config,
+        "directional_config": directional_config,
+        "atxy_config": atxy_config,
+        "tokenizer_binding": _optional_plain_dict(
+            payload.get("tokenizer_binding"), "tokenizer_binding"
+        ),
+        "checkpoint_ref": str(path),
+        "path": str(path.parent),
+    }
+
+
+class SpalmerTokenizerFacade:
+    """Expose a generic SPALMER tokenizer through yyLab's HF-like subset."""
+
+    def __init__(
+        self,
+        backend: object,
+        *,
+        model_max_length: int,
+        default_kind: str = "mixed",
+    ) -> None:
+        self.backend = backend
+        self.model_max_length = model_max_length
+        self.default_kind = default_kind if default_kind in {"mixed", "prose", "code"} else "mixed"
+        specials = getattr(backend, "special_tokens", None)
+        self.bos_token_id = getattr(specials, "bos_id", None)
+        self.eos_token_id = getattr(specials, "eos_id", None)
+        self.pad_token_id = getattr(specials, "pad_id", None)
+        if self.pad_token_id is None:
+            self.pad_token_id = self.eos_token_id
+        self.bos_token = "<|bos|>" if self.bos_token_id is not None else None
+        self.eos_token = "<|eos|>" if self.eos_token_id is not None else None
+        self.pad_token = "<|pad|>" if self.pad_token_id is not None else self.eos_token
+        self.vocab_size = int(getattr(backend, "vocab_size", 0) or len(backend))
+
+    def __len__(self) -> int:
+        return self.vocab_size
+
+    def encode(self, text: str, *, add_special_tokens: bool = False, **_kwargs: Any) -> list[int]:
+        encode = getattr(self.backend, "encode", None)
+        if not callable(encode):
+            raise TypeError("SPALMER tokenizer backend does not implement encode")
+        try:
+            values = encode(
+                text,
+                add_special_tokens=add_special_tokens,
+                kind=self.default_kind,
+            )
+        except TypeError:
+            values = encode(text, add_special_tokens=add_special_tokens)
+        return [int(value) for value in values]
+
+    def decode(
+        self,
+        token_ids: Iterable[int] | Tensor,
+        *,
+        skip_special_tokens: bool = False,
+        **_kwargs: Any,
+    ) -> str:
+        values = _flat_token_ids(token_ids)
+        decode = getattr(self.backend, "decode", None)
+        if not callable(decode):
+            raise TypeError("SPALMER tokenizer backend does not implement decode")
+        try:
+            return str(
+                decode(
+                    values,
+                    skip_special_tokens=skip_special_tokens,
+                    errors="replace",
+                )
+            )
+        except TypeError:
+            return str(decode(values, skip_special_tokens=skip_special_tokens))
+
+    def batch_decode(
+        self,
+        sequences: Iterable[Iterable[int]] | Tensor,
+        *,
+        skip_special_tokens: bool = False,
+        **kwargs: Any,
+    ) -> list[str]:
+        if isinstance(sequences, Tensor):
+            sequences = sequences.detach().cpu().tolist()
+        return [
+            self.decode(row, skip_special_tokens=skip_special_tokens, **kwargs)
+            for row in sequences
+        ]
+
+    def __call__(
+        self,
+        texts: str | Sequence[str],
+        *,
+        return_tensors: str | None = None,
+        add_special_tokens: bool = False,
+        return_attention_mask: bool = True,
+        padding: bool | str = False,
+        **_kwargs: Any,
+    ) -> dict[str, Any]:
+        single = isinstance(texts, str)
+        inputs = [texts] if single else list(texts)
+        encoded = [self.encode(text, add_special_tokens=add_special_tokens) for text in inputs]
+        if not encoded:
+            raise ValueError("tokenizer input batch cannot be empty")
+
+        needs_padding = bool(padding) or return_tensors == "pt"
+        width = max((len(row) for row in encoded), default=0)
+        if needs_padding and any(len(row) != width for row in encoded) and self.pad_token_id is None:
+            raise ValueError("batched tokenization needs a pad or EOS token")
+        padded: list[list[int]] = []
+        masks: list[list[int]] = []
+        for row in encoded:
+            missing = width - len(row) if needs_padding else 0
+            padded.append([*row, *([int(self.pad_token_id)] * missing)])
+            masks.append([1] * len(row) + [0] * missing)
+
+        if return_tensors is None:
+            ids: Any = padded[0] if single else padded
+            mask: Any = masks[0] if single else masks
+        elif return_tensors == "pt":
+            ids = torch.tensor(padded, dtype=torch.long)
+            mask = torch.tensor(masks, dtype=torch.long)
+        else:
+            raise ValueError("SPALMER tokenizer facade supports only return_tensors='pt'")
+        result = {"input_ids": ids}
+        if return_attention_mask:
+            result["attention_mask"] = mask
+        return result
+
+    def apply_chat_template(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        *,
+        tokenize: bool = False,
+        add_generation_prompt: bool = True,
+        enable_thinking: bool = False,
+        **_kwargs: Any,
+    ) -> str | list[int]:
+        if enable_thinking:
+            raise TypeError("generic SPALMER tokenizers do not define a thinking protocol")
+        parts = [
+            f"### {str(message.get('role') or 'user').capitalize()}\n"
+            f"{str(message.get('content') or '')}"
+            for message in messages
+        ]
+        if add_generation_prompt:
+            parts.append("### Assistant\n")
+        prompt = "\n\n".join(parts)
+        return self.encode(prompt) if tokenize else prompt
+
+
+class _ForwardOutputFacade:
+    """Attach HF's ``hidden_states`` field without copying SPALMER outputs."""
+
+    __slots__ = ("_output", "hidden_states")
+
+    def __init__(self, output: object, hidden_states: Tensor) -> None:
+        self._output = output
+        self.hidden_states = (hidden_states,)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._output, name)
+
+
+class SpalmerCausalLMFacade(nn.Module):
+    """HF-shaped inference facade over one native :class:`SPALMERCausalLM`."""
+
+    def __init__(
+        self,
+        model: nn.Module,
+        tokenizer: object,
+        *,
+        checkpoint_path: Path,
+        metadata: Mapping[str, Any],
+        dynamic_residency: bool,
+        max_context_tokens: int,
+        cuda_available: bool,
+        notes: Sequence[str] = (),
+    ) -> None:
+        super().__init__()
+        self.model = model
+        self.tokenizer = tokenizer
+        self.spalmer_config = model.config
+        self.checkpoint_path = checkpoint_path
+        self.metadata = dict(metadata)
+        self.dynamic_residency = bool(dynamic_residency)
+        self.cuda_available = bool(cuda_available)
+        self.cuda = self.cuda_available
+        self.notes = list(notes)
+        self.last_routing_telemetry: dict[str, object] | None = None
+        self.config = SimpleNamespace(
+            model_type="spalmer",
+            architectures=["SPALMERCausalLM"],
+            vocab_size=int(model.config.vocab_size),
+            hidden_size=int(model.config.d_model),
+            num_hidden_layers=int(model.config.n_layers),
+            max_position_embeddings=int(max_context_tokens),
+            use_cache=True,
+            is_encoder_decoder=False,
+        )
+
+    @property
+    def device(self) -> torch.device:
+        parameter = next(self.model.parameters(), None)
+        if parameter is not None:
+            return parameter.device
+        buffer = next(self.model.buffers(), None)
+        return buffer.device if buffer is not None else torch.device("cpu")
+
+    def set_dynamic_residency(self, enabled: bool) -> None:
+        self.dynamic_residency = bool(enabled)
+
+    def routing_telemetry(self) -> dict[str, object] | None:
+        return None if self.last_routing_telemetry is None else dict(self.last_routing_telemetry)
+
+    def forward(
+        self,
+        input_ids: Tensor,
+        *,
+        attention_mask: Tensor | None = None,
+        labels: Tensor | None = None,
+        output_hidden_states: bool = False,
+        use_cache: bool | None = None,
+        return_dict: bool | None = None,
+        **kwargs: Any,
+    ) -> object:
+        del use_cache, return_dict
+        if not output_hidden_states:
+            return self.model(
+                input_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                **kwargs,
+            )
+
+        lm_head = getattr(self.model, "lm_head", None)
+        if not isinstance(lm_head, nn.Module):
+            raise TypeError("SPALMER model does not expose its language-model head")
+        captured: list[Tensor] = []
+
+        def capture_hidden(_module: nn.Module, args: tuple[object, ...]) -> None:
+            if args and isinstance(args[0], Tensor):
+                captured.append(args[0])
+
+        handle = lm_head.register_forward_pre_hook(capture_hidden)
+        try:
+            output = self.model(
+                input_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                **kwargs,
+            )
+        finally:
+            handle.remove()
+        if not captured:
+            raise RuntimeError("SPALMER language-model head did not receive hidden states")
+        return _ForwardOutputFacade(output, captured[-1])
+
+    @torch.inference_mode()
+    def generate(
+        self,
+        input_ids: Tensor,
+        *,
+        attention_mask: Tensor | None = None,
+        max_new_tokens: int = 20,
+        do_sample: bool = False,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        top_k: int | None = None,
+        eos_token_id: int | Sequence[int] | Tensor | None = None,
+        pad_token_id: int | None = None,
+        streamer: object | None = None,
+        stopping_criteria: object | None = None,
+        logits_processor: object | None = None,
+        generator: torch.Generator | None = None,
+        seed: int | None = None,
+        dynamic_residency: bool | None = None,
+        use_cache: bool | None = None,
+        **kwargs: Any,
+    ) -> Tensor:
+        """Generate one sequence with SPALMER's explicit recurrent state."""
+
+        del pad_token_id, use_cache
+        unsupported = sorted(
+            key
+            for key in kwargs
+            if key
+            in {
+                "cache_config",
+                "cache_implementation",
+                "past_key_values",
+                "prefill_chunk_size",
+            }
+        )
+        if unsupported:
+            raise ValueError(
+                "SPALMER owns recurrent KDA/MLA state; unsupported HF cache options: "
+                + ", ".join(unsupported)
+            )
+        _validate_generation_inputs(input_ids, attention_mask, max_new_tokens)
+        if do_sample and temperature <= 0:
+            raise ValueError("sampling temperature must be positive")
+        if not 0 < top_p <= 1:
+            raise ValueError("top_p must be in (0, 1]")
+        if top_k is not None and top_k < 0:
+            raise ValueError("top_k cannot be negative")
+
+        generated = input_ids.to(device=self.device, dtype=torch.long)
+        mask = None if attention_mask is None else attention_mask.to(device=self.device)
+        eos_ids = _eos_ids(
+            self.tokenizer.eos_token_id if eos_token_id is None else eos_token_id
+        )
+        if generator is None:
+            generator = torch.Generator(device=self.device)
+            generator.manual_seed(int(torch.initial_seed() if seed is None else seed))
+
+        use_dynamic = self.dynamic_residency if dynamic_residency is None else dynamic_residency
+        request_open = False
+        was_training = self.model.training
+        decision = None
+        self.last_routing_telemetry = None
+        self.model.eval()
+        try:
+            if streamer is not None:
+                streamer.put(generated.detach().cpu())
+            if max_new_tokens == 0:
+                return generated
+
+            if use_dynamic:
+                from spalmer.experts import choose_inference_residency
+
+                decision = choose_inference_residency(self.model, generated)
+                output = decision.output
+                request_open = True
+                # Publish the request receipt as soon as residency selection
+                # finishes so chat can display it while recurrent decoding is
+                # still streaming, rather than only after the final token.
+                self.last_routing_telemetry = _residency_telemetry(self.model, decision)
+            else:
+                output = self.model(generated, attention_mask=mask)
+            token_states = output.token_mixer_states
+            channel_states = output.channel_mixer_states
+
+            for index in range(max_new_tokens):
+                scores = output.logits[:, -1]
+                scores = _apply_logits_processors(logits_processor, generated, scores)
+                next_token = _select_token(
+                    scores,
+                    do_sample=do_sample,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    generator=generator,
+                )
+                generated = torch.cat((generated, next_token), dim=-1)
+                if streamer is not None:
+                    streamer.put(next_token.detach().cpu())
+                reached_eos = bool(eos_ids and int(next_token.item()) in eos_ids)
+                externally_stopped = _stopping_requested(
+                    stopping_criteria,
+                    generated,
+                    scores,
+                )
+                if reached_eos or externally_stopped or index + 1 == max_new_tokens:
+                    break
+                output = self.model(
+                    next_token,
+                    token_mixer_states=token_states,
+                    channel_mixer_states=channel_states,
+                    execution_mode="decode",
+                )
+                token_states = output.token_mixer_states
+                channel_states = output.channel_mixer_states
+            return generated
+        finally:
+            if request_open:
+                self.model.end_residency_request()
+            self.model.train(was_training)
+            if streamer is not None:
+                streamer.end()
+
+
+def load_spalmer_runtime(
+    ref: str | Path,
+    *,
+    dynamic_residency: bool = True,
+    max_context_tokens: int | None = None,
+) -> SpalmerCausalLMFacade:
+    """Load a native bundle and return an HF-shaped inference facade."""
+
+    checkpoint_path = resolve_spalmer_checkpoint(ref)
+    if max_context_tokens is not None and max_context_tokens <= 0:
+        raise ValueError("max_context_tokens must be positive")
+
+    # Keep SPALMER optional for yyLab installations that only use HF models.
+    from spalmer import load_checkpoint
+
+    model, loaded_tokenizer, metadata = load_checkpoint(checkpoint_path, map_location="cpu")
+    cuda = torch.cuda.is_available()
+    device = torch.device("cuda" if cuda else "cpu")
+    dtype = torch.bfloat16 if cuda else torch.float32
+    model.to(device=device, dtype=dtype)
+    model.eval()
+
+    context_limit = int(
+        max_context_tokens or _metadata_context_limit(metadata) or DEFAULT_CONTEXT_LIMIT
+    )
+    identity = getattr(loaded_tokenizer, "identity", None)
+    if getattr(identity, "backend", None) == "huggingface" and hasattr(
+        loaded_tokenizer, "tokenizer"
+    ):
+        tokenizer = loaded_tokenizer.tokenizer
+        if getattr(tokenizer, "pad_token", None) is None and getattr(
+            tokenizer, "eos_token", None
+        ) is not None:
+            tokenizer.pad_token = tokenizer.eos_token
+    else:
+        tokenizer_backend = _runtime_tokenizer_backend(loaded_tokenizer)
+        tokenizer = SpalmerTokenizerFacade(
+            tokenizer_backend,
+            model_max_length=context_limit,
+            default_kind=str(metadata.get("kind") or "mixed"),
+        )
+
+    notes = [
+        "Loaded native SPALMER checkpoint.",
+        "SPALMER uses NoPE and native recurrent KDA/MLA state; HF RoPE and KV-cache modes do not apply.",
+        f"SPALMER parameters run as {'BF16 on CUDA' if cuda else 'FP32 on CPU'}.",
+    ]
+    return SpalmerCausalLMFacade(
+        model,
+        tokenizer,
+        checkpoint_path=checkpoint_path,
+        metadata=metadata,
+        dynamic_residency=dynamic_residency,
+        max_context_tokens=context_limit,
+        cuda_available=cuda,
+        notes=notes,
+    )
+
+
+def _runtime_tokenizer_backend(tokenizer: object) -> object:
+    if callable(getattr(tokenizer, "encode", None)) and callable(
+        getattr(tokenizer, "decode", None)
+    ):
+        return tokenizer
+    # Legacy/current embedded Vocab bundles expose entries rather than the
+    # runtime protocol. Wrap them without changing checkpoint identity.
+    from spalmer.tokenizer import RPDTokenizerAdapter, Vocab
+
+    if isinstance(tokenizer, Vocab):
+        return RPDTokenizerAdapter(tokenizer)
+    raise TypeError(f"unsupported SPALMER checkpoint tokenizer: {type(tokenizer).__name__}")
+
+
+def _plain_dict(value: object, name: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise TypeError(f"SPALMER checkpoint {name} must be a plain dictionary")
+    return dict(value)
+
+
+def _optional_plain_dict(value: object, name: str) -> dict[str, Any] | None:
+    return None if value is None else _plain_dict(value, name)
+
+
+def _tensor_mapping(value: object, name: str) -> Mapping[str, Tensor]:
+    if not isinstance(value, Mapping):
+        raise TypeError(f"SPALMER checkpoint {name} must be a tensor mapping")
+    if any(not isinstance(key, str) or not isinstance(tensor, Tensor) for key, tensor in value.items()):
+        raise TypeError(f"SPALMER checkpoint {name} must map names to tensors")
+    return value
+
+
+def _positive_int(value: object, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"SPALMER checkpoint {name} must be a positive integer")
+    return value
+
+
+def _optional_positive_int(value: object) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
+def _metadata_context_limit(metadata: Mapping[str, Any]) -> int | None:
+    """Read context safety metadata from legacy and yyLab-native bundles."""
+
+    for value in (
+        metadata.get("max_context_tokens"),
+        metadata.get("sequence_length"),
+        metadata.get("training_sequence_length"),
+    ):
+        resolved = _optional_positive_int(value)
+        if resolved is not None:
+            return resolved
+    training_config = metadata.get("training_config")
+    if isinstance(training_config, Mapping):
+        return _optional_positive_int(training_config.get("sequence_length"))
+    return None
+
+
+def _metadata_parameter_count(metadata: Mapping[str, Any]) -> int | None:
+    """Return SPALMER's planned trainable count when the bundle records it."""
+
+    plan = metadata.get("plan")
+    if not isinstance(plan, Mapping):
+        return None
+    parameters = plan.get("parameters")
+    if not isinstance(parameters, Mapping):
+        return None
+    return _optional_positive_int(parameters.get("total"))
+
+
+def _unique_tensor_numel(tensors: Iterable[Tensor]) -> int:
+    seen: set[tuple[int, int, int, torch.dtype]] = set()
+    total = 0
+    for tensor in tensors:
+        key = (tensor.data_ptr(), tensor.storage_offset(), tensor.numel(), tensor.dtype)
+        if key in seen:
+            continue
+        seen.add(key)
+        total += tensor.numel()
+    return total
+
+
+def _flat_token_ids(values: Iterable[int] | Tensor) -> list[int]:
+    if isinstance(values, Tensor):
+        values = values.detach().cpu().reshape(-1).tolist()
+    return [int(value) for value in values]
+
+
+def _validate_generation_inputs(
+    input_ids: Tensor,
+    attention_mask: Tensor | None,
+    max_new_tokens: int,
+) -> None:
+    if input_ids.ndim != 2 or input_ids.shape[0] != 1 or input_ids.shape[1] == 0:
+        raise ValueError("SPALMER generation requires one non-empty input sequence")
+    if max_new_tokens < 0:
+        raise ValueError("max_new_tokens cannot be negative")
+    if attention_mask is not None:
+        if attention_mask.shape != input_ids.shape:
+            raise ValueError("attention_mask must match input_ids")
+        if not bool(attention_mask.bool().all().item()):
+            raise ValueError("SPALMER generation does not accept padded input")
+
+
+def _eos_ids(value: int | Sequence[int] | Tensor | None) -> frozenset[int]:
+    if value is None:
+        return frozenset()
+    if isinstance(value, Tensor):
+        values = value.detach().cpu().reshape(-1).tolist()
+    elif isinstance(value, int):
+        values = [value]
+    else:
+        values = list(value)
+    return frozenset(int(item) for item in values)
+
+
+def _apply_logits_processors(processors: object, input_ids: Tensor, scores: Tensor) -> Tensor:
+    if processors is None:
+        return scores
+    if callable(processors):
+        return processors(input_ids, scores)
+    for processor in processors:  # type: ignore[union-attr]
+        scores = processor(input_ids, scores)
+    return scores
+
+
+def _select_token(
+    logits: Tensor,
+    *,
+    do_sample: bool,
+    temperature: float,
+    top_p: float,
+    top_k: int | None,
+    generator: torch.Generator,
+) -> Tensor:
+    if not do_sample:
+        return logits.argmax(dim=-1, keepdim=True)
+    scores = logits.float() / temperature
+    if top_k:
+        count = min(int(top_k), scores.shape[-1])
+        cutoff = scores.topk(count, dim=-1).values[:, -1:]
+        scores = scores.masked_fill(scores < cutoff, float("-inf"))
+    if top_p < 1:
+        ordered, order = scores.sort(dim=-1, descending=True)
+        cumulative = ordered.softmax(dim=-1).cumsum(dim=-1)
+        remove = cumulative > top_p
+        remove[:, 1:] = remove[:, :-1].clone()
+        remove[:, 0] = False
+        ordered = ordered.masked_fill(remove, float("-inf"))
+        scores = torch.full_like(scores, float("-inf")).scatter(-1, order, ordered)
+    probabilities = scores.softmax(dim=-1)
+    if not bool(torch.isfinite(probabilities).all().item()) or bool(
+        (probabilities.sum(dim=-1) <= 0).any().item()
+    ):
+        raise RuntimeError("SPALMER sampling produced invalid probabilities")
+    return torch.multinomial(probabilities, num_samples=1, generator=generator)
+
+
+def _stopping_requested(criteria: object, input_ids: Tensor, scores: Tensor) -> bool:
+    if criteria is None:
+        return False
+    result = criteria(input_ids, scores) if callable(criteria) else False
+    if isinstance(result, Tensor):
+        return bool(result.bool().all().item())
+    return bool(result)
+
+
+def _residency_telemetry(model: nn.Module, decision: object) -> dict[str, object]:
+    resident_ids = tuple(int(value) for value in decision.resident_ids)
+    active = int(decision.active_experts)
+    residency = getattr(model, "residency", None)
+    config = getattr(residency, "config", None)
+    num_experts = int(getattr(config, "num_experts", len(resident_ids)) or len(resident_ids))
+    minimum = int(getattr(config, "min_active_experts", active) or active)
+    maximum = int(getattr(config, "max_active_experts", active) or active)
+    resident_cap = int(getattr(config, "resident_cap", maximum) or maximum)
+    trace = tuple((int(count), float(signal)) for count, signal in decision.trace)
+    expansions = tuple(tuple(int(value) for value in group) for group in decision.expansions)
+    effective_nll = getattr(decision, "effective_nll", None)
+    signal = float(decision.predictive_entropy if effective_nll is None else effective_nll)
+    return {
+        "routing_mode": "adaptive_surprise",
+        "active_experts": active,
+        "minimum_experts": minimum,
+        "maximum_experts": maximum,
+        "active_fraction": active / max(1, num_experts),
+        "mean_active_experts": float(active),
+        "peak_active_experts": active,
+        "surprise": signal,
+        "signal_kind": "predictive entropy" if effective_nll is None else "prompt NLL",
+        "surprise_ema": float(decision.average_surprise),
+        "resident_expert_count": len(resident_ids),
+        "resident_experts": list(resident_ids),
+        "resident_capacity": resident_cap,
+        "expansions": len(expansions),
+        "contractions": 0,
+        "recomputations": max(0, len(trace) - 1),
+        "trace": [{"active_experts": count, "signal": signal} for count, signal in trace],
+        "expansion_groups": [list(group) for group in expansions],
+        "stop_reason": "request capacity selected at prefill",
+    }
+
+
+__all__ = [
+    "SpalmerCausalLMFacade",
+    "SpalmerTokenizerFacade",
+    "is_spalmer_checkpoint",
+    "load_spalmer_runtime",
+    "resolve_spalmer_checkpoint",
+    "scan_spalmer_checkpoint",
+]

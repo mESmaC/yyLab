@@ -8,6 +8,7 @@ from nicegui import ui
 
 from ... import db
 from ...artifacts import checkpoint_dir, read_json
+from ...models.families import checkpoint_family
 from ...models.loading import scan_checkpoint as scan_local_checkpoint
 from ...workers.launch import launch_worker
 from ..components import dir_browser, empty_state
@@ -18,13 +19,80 @@ PER_TOKEN_ROUTER = "per_token"
 STATIC_TOKEN_EXPORT_MODE = "calibrated_static_mole_v1"
 
 
-def _adapter_router_type(adapter: dict) -> str:
-    """Resolve routing from registry metadata, then the artifact itself."""
+def _parameter_label(params_b: float) -> str:
+    count = float(params_b or 0.0) * 1e9
+    if count >= 1e9:
+        return f"{count / 1e9:.2f} B"
+    if count >= 1e6:
+        return f"{count / 1e6:.1f} M"
+    if count > 0:
+        return f"{count / 1e3:.1f} K"
+    return "?"
 
+
+def _precision_label(value: object, fallback: str) -> str:
+    normalized = str(value or fallback).strip().casefold()
+    aliases = {
+        "bfloat16": "BF16",
+        "float16": "FP16",
+        "float32": "FP32",
+    }
+    return aliases.get(normalized, normalized.upper())
+
+
+def _spalmer_base_recipe(metadata: dict) -> str:
+    """Describe either a yyLab registry receipt or a directly scanned bundle."""
+
+    precision = metadata.get("precision")
+    precision = precision if isinstance(precision, dict) else {}
+    native_metadata = metadata.get("metadata")
+    native_metadata = native_metadata if isinstance(native_metadata, dict) else {}
+    native_precision = native_metadata.get("precision")
+    native_precision = native_precision if isinstance(native_precision, dict) else {}
+    experts = metadata.get("experts_config")
+    experts = experts if isinstance(experts, dict) else {}
+
+    weight_format = (
+        precision.get("expert_weights")
+        or precision.get("expert_weight_format")
+        or native_precision.get("expert_weights")
+        or native_precision.get("expert_weight_format")
+        or experts.get("expert_weight_format")
+        or metadata.get("expert_weight_format")
+    )
+    activation_format = (
+        precision.get("expert_activations")
+        or precision.get("expert_activation_format")
+        or native_precision.get("expert_activations")
+        or native_precision.get("expert_activation_format")
+        or experts.get("expert_activation_format")
+    )
+    master_dtype = (
+        precision.get("master_weights")
+        or precision.get("expert_master_dtype")
+        or native_precision.get("master_weights")
+        or native_precision.get("expert_master_dtype")
+        or experts.get("expert_master_dtype")
+    )
+    return (
+        f"SPALMER · {_precision_label(weight_format, 'fp4')}/"
+        f"{_precision_label(activation_format, 'mxfp8')} · "
+        f"{_precision_label(master_dtype, 'bfloat16')} master"
+    )
+
+
+def _adapter_metadata(adapter: dict) -> dict:
     try:
         metadata = json.loads(adapter.get("meta_json") or "{}")
     except (TypeError, ValueError):
-        metadata = {}
+        return {}
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _adapter_router_type(adapter: dict) -> str:
+    """Resolve routing from registry metadata, then the artifact itself."""
+
+    metadata = _adapter_metadata(adapter)
     if metadata.get("training_strategy") == JOINT_PER_TOKEN_STRATEGY:
         return PER_TOKEN_ROUTER
     if metadata.get("router_arch") == "shared_per_block_per_token_v1":
@@ -93,6 +161,8 @@ def checkpoints_page():
             except (TypeError, ValueError):
                 metadata = {}
             precision = metadata.get("precision") or {}
+            if checkpoint_family(c) == "spalmer":
+                return _spalmer_base_recipe(metadata)
             qat = str(precision.get("qat") or "none")
             dtype = str(precision.get("parameter_dtype") or "")
             initialization = str(metadata.get("initialization") or "")
@@ -110,7 +180,7 @@ def checkpoints_page():
                         "id": c["id"],
                         "name": c["name"],
                         "arch": c["arch"],
-                        "params": f'{c["params_b"]:.2f} B' if c["params_b"] else "?",
+                        "params": _parameter_label(c["params_b"]),
                         "source": f'{c["source"]}: {c["ref"]}',
                         "recipe": base_recipe(c),
                         "quant_locked": c["quant_locked"] or "-",
@@ -179,10 +249,18 @@ def checkpoints_page():
                         icon="delete",
                         on_click=lambda cid=cid, name=c["name"]: ask_remove(cid, name),
                     ).props("flat dense no-caps color=negative")
-                ui.label(f'arch: {c["arch"]} · hidden {c["hidden_size"]} · {c["num_layers"]} layers · {c["params_b"]:.2f} B params')
+                ui.label(
+                    f'arch: {c["arch"]} · hidden {c["hidden_size"]} · '
+                    f'{c["num_layers"]} layers · {_parameter_label(c["params_b"])} params'
+                )
                 ui.label(f'source: {c["source"]} → {c["ref"]}')
                 ui.label(f"base recipe: {base_recipe(c)}").classes("text-sm text-gray-400")
-                if c["quant_locked"]:
+                if checkpoint_family(c) == "spalmer":
+                    ui.label(
+                        "Native recurrent KDA/NoPE MLA with its checkpointed micro-expert "
+                        "routing and precision recipe. yyLab PEFT adapters do not apply."
+                    ).classes("text-cyan-300 text-sm")
+                elif c["quant_locked"]:
                     ui.label(
                         f'Quantization locked to {c["quant_locked"]} for all adapters on this checkpoint.'
                     ).classes("text-amber-400 text-sm")
@@ -190,11 +268,18 @@ def checkpoints_page():
                     ui.label("Quantization not locked yet — set when the first adapter is trained.").classes(
                         "text-xs text-gray-500"
                     )
-                adapters = db.q("SELECT * FROM adapters WHERE checkpoint_id=?", (cid,))
+                adapters = (
+                    []
+                    if checkpoint_family(c) == "spalmer"
+                    else db.q("SELECT * FROM adapters WHERE checkpoint_id=?", (cid,))
+                )
                 if adapters:
                     ui.label("Adapters").classes("text-sm font-semibold mt-2")
                     for a in adapters:
                         joint_per_token = _adapter_router_type(a) == PER_TOKEN_ROUTER
+                        adapter_metadata = _adapter_metadata(a)
+                        merge_safe = adapter_metadata.get("merge_safe") is not False
+                        diagnostic = adapter_metadata.get("diagnostic_verdict") or {}
                         with ui.row().classes("w-full items-center justify-between gap-2"):
                             with ui.column().classes("gap-0"):
                                 ui.label(
@@ -204,8 +289,24 @@ def checkpoints_page():
                                     ui.label(
                                         "Export calibrates a static expert blend; dynamic per-token routing is not preserved."
                                     ).classes("text-[11px] text-amber-400")
+                                if diagnostic.get("label"):
+                                    recommended = bool(
+                                        diagnostic.get("recommended_for_inference")
+                                    )
+                                    ui.label(
+                                        f"AntiDoom diagnostic: {diagnostic['label']} — "
+                                        f"{diagnostic.get('explanation', '')}"
+                                    ).classes(
+                                        "text-[11px] text-green-400"
+                                        if recommended
+                                        else "text-[11px] text-red-400"
+                                    )
+                                if not merge_safe:
+                                    ui.label(
+                                        "Adapter-only artifact: merging is disabled for tied-output safety."
+                                    ).classes("text-[11px] text-amber-400")
                             with ui.row().classes("items-center gap-1"):
-                                if a["status"] == "trained":
+                                if a["status"] == "trained" and merge_safe:
                                     export_button = ui.button(
                                         (
                                             "Export calibrated static approximation"
@@ -226,6 +327,14 @@ def checkpoints_page():
                                 ).props("dense flat no-caps color=negative").tooltip("Delete adapter + its routers")
 
         def export_adapter(ckpt_row: dict, a: dict) -> None:
+            if _adapter_metadata(a).get("merge_safe") is False:
+                ui.notify(
+                    "This output-head AntiDoom adapter is intentionally adapter-only and "
+                    "cannot be merged safely into the tied-embedding base.",
+                    type="warning",
+                    multi_line=True,
+                )
+                return
             joint_per_token = _adapter_router_type(a) == PER_TOKEN_ROUTER
             router = None
             if not joint_per_token:
@@ -338,9 +447,9 @@ def checkpoints_page():
         with ui.dialog() as add_dlg, ui.card().classes("w-[560px]").style("background: #16161d; border: 1px solid #262633"):
             ui.label("Add checkpoint").classes("text-base font-semibold")
             name_in = ui.input("Name").props("dense outlined").classes("w-full")
-            mode = ui.radio(["Local folder", "HuggingFace Hub"], value="Local folder").props("dense inline")
+            mode = ui.radio(["Local checkpoint", "HuggingFace Hub"], value="Local checkpoint").props("dense inline")
             with ui.row().classes("w-full items-end gap-2") as local_row:
-                ref_in = ui.input("Folder path").props("dense outlined").classes("flex-1")
+                ref_in = ui.input("HF folder or SPALMER .pt path").props("dense outlined").classes("flex-1")
                 browser = dir_browser("Select checkpoint folder", lambda p: ref_in.set_value(p))
                 ui.button(icon="folder", on_click=browser.open).props("dense outline")
             hub_hint = ui.label("Hub id, e.g. Qwen/Qwen2.5-1.5B-Instruct (weights downloaded on first use)").classes(
@@ -349,10 +458,12 @@ def checkpoints_page():
             hub_hint.visible = False
 
             def mode_changed(e) -> None:
-                local = e.value == "Local folder"
+                local = e.value == "Local checkpoint"
                 local_row.visible = local
                 hub_hint.visible = not local
-                ref_in.props(f'label={"Folder path" if local else "Hub model id"}')
+                ref_in.props(
+                    f'label={"HF folder or SPALMER .pt path" if local else "Hub model id"}'
+                )
 
             mode.on_value_change(mode_changed)
             status_lbl = ui.label("").classes("text-xs text-gray-400")
@@ -366,18 +477,11 @@ def checkpoints_page():
                         return
                     name = (name_in.value or "").strip() or ref.split("/")[-1].split("\\")[-1]
                     meta = {"arch": "", "params_b": 0, "hidden_size": 0, "num_layers": 0}
-                    if mode.value == "Local folder":
+                    if mode.value == "Local checkpoint":
                         try:
-                            status_lbl.text = "scanning safetensors..."
+                            status_lbl.text = "scanning checkpoint metadata..."
                             info = scan_local_checkpoint(Path(ref))
-                            meta.update(
-                                {
-                                    "arch": info["arch"],
-                                    "params_b": info["params_b"],
-                                    "hidden_size": info["hidden_size"],
-                                    "num_layers": info["num_layers"],
-                                }
-                            )
+                            meta.update(info)
                         except Exception as e:  # noqa: BLE001
                             ui.notify(f"Scan failed: {e}", type="negative")
                             return
@@ -390,13 +494,24 @@ def checkpoints_page():
                             name,
                             db.now_iso(),
                             "base",
-                            "local" if mode.value == "Local folder" else "hub",
-                            ref,
+                            "local" if mode.value == "Local checkpoint" else "hub",
+                            str(meta.get("checkpoint_ref") or ref),
                             meta["arch"],
                             meta["params_b"],
                             meta["hidden_size"],
                             meta["num_layers"],
-                            ref if mode.value == "Local folder" else str(checkpoint_dir(cid)),
+                            (
+                                str(
+                                    meta.get("path")
+                                    or (
+                                        Path(str(meta.get("checkpoint_ref") or ref)).parent
+                                        if Path(str(meta.get("checkpoint_ref") or ref)).is_file()
+                                        else Path(str(meta.get("checkpoint_ref") or ref))
+                                    )
+                                )
+                                if mode.value == "Local checkpoint"
+                                else str(checkpoint_dir(cid))
+                            ),
                             json.dumps(meta),
                         ),
                     )

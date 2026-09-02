@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import pytest
 
-from yylab.ui.pages.chat import _chat_load_settings, _context_telemetry_text, _user_message
+from yylab.ui.pages.chat import (
+    _chat_load_settings,
+    _context_telemetry_text,
+    _generation_snapshot,
+    _user_message,
+)
 
 
 @pytest.mark.parametrize(
@@ -35,6 +40,21 @@ def test_chat_user_message_carries_optional_factorized_address() -> None:
         "content": "addressed",
         "atxy": {"t": "voltage", "x": "0", "y": "night"},
     }
+
+
+def test_raw_generation_snapshot_is_one_independent_literal_prompt() -> None:
+    history = [
+        {"role": "user", "content": "old prompt"},
+        {"role": "assistant", "content": "old completion"},
+    ]
+    current = {
+        "role": "user",
+        "content": "  #include\n",
+        "atxy": {"t": "code", "x": "c", "y": "header"},
+    }
+
+    assert _generation_snapshot(history, current, "raw") == [{"content": "  #include\n"}]
+    assert _generation_snapshot(history, current, "chat") == [*history, current]
 
 
 def test_chat_context_telemetry_reports_compaction():
@@ -77,3 +97,19 @@ def test_chat_context_telemetry_reports_nll_selection() -> None:
     assert "omitted 3 prior turns" in text
     assert "ΔNLL +0.250 nats" in text
     assert "ATXY candidates 1" in text
+
+
+def test_raw_context_telemetry_names_the_literal_prompt() -> None:
+    text = _context_telemetry_text(
+        {
+            "prompt_tokens": 2,
+            "prompt_budget": 1536,
+            "answer_budget": 512,
+            "context_limit": 2048,
+            "prompt_mode": "raw",
+            "compacted": False,
+        }
+    )
+
+    assert text.startswith("Raw prompt 2/1,536 tokens")
+    assert "completion reserved 512" in text

@@ -140,7 +140,7 @@ def router_usage_metrics(model: nn.Module) -> dict:
             continue
         if totals is None:
             totals = torch.zeros(
-                module.num_experts,
+                module.num_routes,
                 dtype=torch.float32,
                 device=indices.device,
             )
@@ -159,11 +159,19 @@ def router_usage_metrics(model: nn.Module) -> dict:
     else:
         entropy = share.new_tensor(1.0)
     bank_entropy = round(float(entropy.item()), 4)
+    adapter_count = next(
+        module.num_experts
+        for module in model.modules()
+        if isinstance(module, (SharedPromptRouter, SharedTokenRouter))
+    )
+    adapter_share = share[:adapter_count]
     result = {
         "router_entropy": bank_entropy,
-        "dead_experts": int((totals == 0).sum().item()),
-        "expert_token_share": [round(float(value), 4) for value in share.tolist()],
+        "dead_experts": int((totals[:adapter_count] == 0).sum().item()),
+        "expert_token_share": [round(float(value), 4) for value in adapter_share.tolist()],
     }
+    if totals.numel() > adapter_count:
+        result["identity_token_share"] = round(float(share[adapter_count].item()), 4)
     if adaptive_pool is not None:
         active = torch.tensor(adaptive_pool, dtype=torch.long, device=totals.device)
         active_totals = totals.index_select(0, active)

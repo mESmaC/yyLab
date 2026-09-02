@@ -30,6 +30,7 @@ yylab/
     low_precision.py state-compatible STE QAT and saved-format restoration
     data.py        shard streaming + EOS-packed sequence batches
     loop.py        generic training loop (metrics, aux loss, saves)
+    preference.py  normalized pair/trace schemas, provenance, collator, DPO objective
   benchmark/
     models.py      strict immutable suite schema + canonical fingerprints
     scoring.py     deterministic choice/numeric/exact/command/JSON scorers
@@ -37,7 +38,7 @@ yylab/
     quality.py     resumable runs, matrices, provenance, reports, comparisons
     performance.py synthetic complete-step joint MoLE performance benchmark
     suites/        frozen benchmark prompt resources (never training data)
-  workers/         detached training subprocesses (train.py, launch.py)
+  workers/         detached training subprocesses (train.py, preference.py, launch.py)
   models/loading.py  shared base loader (bnb quant, SDPA, RoPE scaling) + checkpoint scanner
   infer/engine.py  chat inference engine (base + MoLE/LoRA + router, KV settings)
   export/merge.py  merge adapters into standalone HF checkpoints (RL-ready)
@@ -77,6 +78,10 @@ does not participate in ingest admission or the permanent rejected-hash list.
 
 MoLE artifact compatibility is explicit:
 
+- Format v5 (`identity_expert=true`) extends a fixed learned route bank with
+  one parameter-free identity index. Its router tensor therefore has `E + 1`
+  rows while the expert tensor bank remains exactly `E` LoRA pairs. Loading
+  validates that identity policy before applying any state.
 - Format v4 (`adaptive.enabled=true`) stores the cheap block-router tensors in
   `mole_weights.safetensors` and one complete global expert lane per
   `experts/expert_NNN.safetensors` shard. The ordered manifest records each
@@ -140,6 +145,15 @@ for every adapted projection `p` in that block:
 y_l,p,t = W_l,p,frozen(x_l,p,t)
           + Σ_{e∈I_l,t} g_l,t,e · B_l,p,e A_l,p,e x_l,p,t
 ```
+
+Soft LoRA mode adds a sentinel route `∅` to that same gate, with
+`B_∅ A_∅ x ≡ 0`. The selected top-K weights are still normalized across
+experts and identity, so identity probability continuously reduces adapter
+influence while the frozen base term remains unscaled. Identity usage is
+reported separately from expert balance, and calibrated static export keeps
+the measured identity share as zero delta. This is the LoRA/identity routing
+mechanism described by [SLIM](https://arxiv.org/abs/2410.07739); yyLab does not claim its additional sliding
+clustering or dynamic adapter-merging procedures.
 
 This is the default `router_type="per_token"` architecture:
 
@@ -218,11 +232,26 @@ up to the requested multiple and that resolved value is saved.
 
 The parameter calculator is exact for yyLab's supported Qwen3, Llama, and
 BitNet Hugging Face configurations, including tied versus untied embeddings
-and family-specific norms. The target-parameter solver changes only the number
-of transformer layers (within its configured bounds), rounds to the nearest
-achievable layer count, and reports the resulting exact parameter total. It
-does not imply that every arbitrary target can be hit exactly or silently
-change width, heads, vocabulary, or context to manufacture a match.
+and family-specific norms. The deterministic target solver may change hidden
+width, MLP width, attention/KV layout, and transformer depth while preserving
+the selected family, vocabulary, context, embedding tying, and numerical
+controls. Targets are continuous from 0.100M upward (including sizes such as
+0.5M, 3M, 12M, and 27M), with an exact integer override for arbitrary counts
+and presets serving only as shortcuts. Scratch runs
+can train a configurable compact byte-level BPE tokenizer directly from the
+selected corpora; 2048 vocabulary entries is the UI default, while the minimum
+is 257 for causal text or 264 when chat role tokens are required. The tokenizer
+vocabulary remains a hard lower bound: preflight
+reports its embedding floor and rejects a target below that floor instead of
+pretending a 151K-token tokenizer can back a sub-million-parameter decoder.
+
+Base recipes may specify `requested_training_tokens`. Because optimizer steps
+consume `seq_len * micro_batch * grad_accum` tokens, yyLab deterministically
+rounds the request up to a whole step and persists the requested total, rounded
+scheduled total, tokens per optimizer step, resolved `max_steps`, and cap
+source. A nonzero token request overrides both an explicit step cap and the
+epoch estimate. Recipes without it retain the historical explicit-`max_steps`
+or epoch-derived behavior.
 
 ### Parameter state, QAT numerics, and optimizer state
 
@@ -354,12 +383,24 @@ Legacy stage-2 prompt-router training uses the same guarded planner.
    file to the first adapter that claims it (by extension).
 2. Extract `Doc(text, source, domain)` → NFKC normalize + length/printable
    filters.
-3. Exact dedup (sha256, per-run set + optional global `doc_hashes` table).
-4. Optional MinHash LSH near-dedup (threshold 0.8, word 5-grams).
+3. Exact dedup (canonical normalized sha256, per-run set + optional global
+   `doc_hashes` table). New records persist one canonical hash; lookups retain
+   compatibility with older two-hash corpora and rejection tables.
+4. Optional MinHash LSH near-dedup (threshold 0.8, word 5-grams). The default
+   lane keeps datasketch-compatible 9×13 band decisions as band-qualified
+   XXH3-128 fingerprints, avoiding per-document keys and candidate sets.
 5. Domain: adapter hint if trusted (code/web/math/science), else content
    heuristics.
-6. Stream to zstd JSONL shards (20k docs each).
-7. Token counts per enabled tokenizer, per domain + totals → `stats.json`.
+6. Stream to zstd JSONL shards (20k docs each). JSONL is parsed one physical
+   record at a time; Parquet reads projected columns in bounded record batches.
+7. Count accepted documents inline with each enabled tokenizer, per domain +
+   totals → `stats.json` (no decompression/reread pass over new shards).
+
+The corpus-library **Fast ingest** action assumes a published dataset is already
+curated and runs steps 1–3 plus domain tagging/sharding, with tokenizer stats
+disabled. Language, quality, and MinHash cleaning remain explicit controls in
+the full ingest dialog; the dialog warns that MinHash is a full-corpus CPU/RAM
+pass. Parquet metadata supplies row-level progress inside large files.
 
 ### Adding a filetype adapter
 
@@ -432,6 +473,22 @@ Run kinds:
   document-level round-robin mixing; legacy configs that omit `corpus_mix`
   retain their historical concatenate replay. Saved QAT bases carry
   reloadable fake-quant metadata and high-precision shadow tensors.
+- `preference_dpo` — a dedicated worker normalizes JSONL/JSON/Parquet files or
+  recursive shard directories into canonical `prompt`, `chosen`, and
+  `rejected` pairs. Direct pair rows and explicitly labelled/scored/ranked
+  candidate traces share the same contract. Equivalent cross-format pairs are
+  exact-deduplicated, source splits remain isolated, structured reasoning/tool
+  context is retained, and a checksum detects changes after UI validation.
+  Unary traces and divergent tool trajectories fail with an SFT-oriented
+  diagnostic. The worker renders each valid branch with the checkpoint's exact
+  chat template, masks prompt tokens, and caches base-policy sequence log
+  probabilities with a newly attached PEFT adapter disabled. It then optimizes
+  only that LoRA/QLoRA adapter with the reference-relative DPO objective.
+  Pair order is deterministically reshuffled each epoch, quant locks commit
+  only after the adapter is saved, and progress includes DPO loss, preference
+  accuracy, and reward margin. The resulting artifact has ordinary PEFT LoRA
+  files plus `yylab_preference.json`, so existing LoRA inference/export paths
+  remain applicable. This path has no reward model or online rollouts.
 - `benchmark_quality` — load a fresh, worker-local model stack and run the
   frozen MoLoR core suite using base, dynamic learned routing, one forced
   expert, or a rack matrix. It never mutates adapter state.
@@ -439,7 +496,8 @@ Run kinds:
   IDs and time complete optimizer steps after warmup. It never writes an
   adapter artifact or silently resizes an OOM candidate.
 
-Data path: zstd shards → domain filter → corpus mixing/shuffling → tokenize →
+Data path: zstd shards → source-split filter → domain filter → corpus
+mixing/shuffling → tokenize →
 EOS-separated packing into fixed-length sequences → micro batches
 (`train/data.py`). For new multi-corpus base runs, each corpus has an isolated
 bounded shuffle and the mixer visits one eligible document from each
@@ -448,11 +506,16 @@ remaining corpora as shorter sources exhaust; therefore a complete epoch still
 consumes every eligible document exactly once. Steps prefer the intake
 tokenizer counts matching the model family (for example Qwen 2.5 counts for
 Qwen2/Qwen3), with a per-domain character fallback for old or incomplete
-corpus statistics. The loop stops early when packed data is exhausted.
+corpus statistics. Train Base defaults to the `train` and `unspecified` source
+splits, which excludes explicit validation/test shards without stranding older
+corpora that predate split metadata. The loop stops early when packed data is
+exhausted.
 
-Checkpoint loading streams weights with `low_cpu_mem_usage=True`; shuffle is
-bounded at 128 documents / 64 MB, raw text is chunked at 64K characters, and
-tokenization batches at most 8 chunks. Raw tokenizer encodings are never
+Checkpoint loading streams weights with `low_cpu_mem_usage=True`; the general
+shuffle default is bounded at 128 documents / 64 MB, while Chat SFT base recipes
+use 8192 documents / 256 MiB to avoid preserving leading shard ordering. Raw
+text is chunked at 64K characters, and tokenization batches at most 8 chunks.
+Raw tokenizer encodings are never
 truncated; packing consumes every ID and only fixed-length sequences reach the
 model. Qwen3
 training applies Liger RoPE, RMSNorm, SwiGLU, and fused linear cross entropy, so
@@ -575,6 +638,41 @@ experts. Concurrent desktop GPU load was present, so its throughput is not
 recorded as a reference result; the UI's default idle-GPU preflight prevents
 that kind of contaminated timing run.
 
+## Tokenizer artifacts
+
+`/tokenizers` is a first-class artifact laboratory rather than a scratch-model
+form detail. The `tokenizers` registry stores identity, status, kind, vocabulary
+size, artifact path, corpus/split selection, exact config, evaluation stats,
+and errors. A stable tokenizer ID resolves to its self-contained Hugging Face
+directory; direct paths remain supported for legacy/programmatic recipes.
+
+The detached `tokenizer` worker has two actions:
+
+- **Train** streams `iter_corpus_docs` into the Rust tokenizers byte-level BPE
+  trainer with bounded document/byte intake. Source splits default to
+  `train + unspecified`, domains and multiple corpora are selectable, and
+  validation/test are preferred for evaluation. If no held-out records exist,
+  a deterministic second pass over the training selection supplies a clearly
+  labelled compression sample.
+- **Import** loads an existing fast HF directory or a raw `tokenizer.json`,
+  attaches usable Transformers EOS/PAD/chat metadata, then saves and reloads a
+  separate copy. Source files are never modified. Raw CDAS-style byte BPEs with
+  `<|endoftext|>` already in vocabulary retain their vocabulary size and use
+  that token as shared EOS/PAD.
+
+Every trained tokenizer includes the full 256-byte alphabet. Minimal causal
+mode therefore starts at 257 entries (one shared EOS/PAD), built-in chat mode
+at 264, and custom mode at 256 plus its unique special tokens. Vocabularies
+above those floors are arbitrary. Normalization is an explicit recipe axis:
+`none` is byte-lossless and recommended for code/mixed Unicode experiments;
+`nfkc` and `nfkc_lowercase` intentionally trade exact round trip for
+normalization. Evaluation records UTF-8 bytes/token, token count, vocabulary
+utilization, exact round-trip failures without storing failed text, payload
+SHA-256, and corpus provenance. The payload digest covers every HF tokenizer
+file with stable path framing and excludes only the yyLab metadata manifest
+that stores the digest, so it remains reproducible after publication. Progress
+and logs use the normal Runs-page live contract.
+
 ## Inference engine + chat (phase 3)
 
 `yylab/infer/engine.py` holds a singleton `ENGINE` in the GUI process:
@@ -637,8 +735,10 @@ that kind of contaminated timing run.
   evaluated and accepted turns, ATXY candidates, marginal NLL, and any safe
   recency fallback.
 - Streaming: `TextIteratorStreamer` in a thread; chat page drains a queue via
-  `ui.timer` into message bubbles. Chat template via
-  `apply_chat_template` with a plain-text fallback.
+  `ui.timer` into message bubbles. Chat mode uses `apply_chat_template` with a
+  plain-text fallback. Raw-completion mode sends one independent prompt without
+  a chat template, history, ATXY retrieval, or compaction; an oversized raw
+  prompt fails closed instead of being silently truncated.
 - Stop: chat Stop calls `ENGINE.cancel()`, which sets an event checked by a
   `StoppingCriteria` so `generate()` halts on the next token (frees the GPU
   instead of just abandoning the stream).

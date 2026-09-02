@@ -115,6 +115,7 @@ def runs_page():
         "log_identity": None,
         "log_mtime_ns": None,
         "log_has_content": False,
+        "token_view_mtime_ns": None,
     }
     detail_refs: dict[str, Any] = {}
 
@@ -132,6 +133,7 @@ def runs_page():
                     meta = json.loads(r["metrics_json"] or "{}")
                 except Exception:  # noqa: BLE001
                     pass
+                diagnostic = meta.get("diagnostic_verdict") or {}
                 out.append(
                     {
                         "id": r["id"],
@@ -140,6 +142,7 @@ def runs_page():
                         "created": r["created_at"],
                         "progress": _progress_of(r),
                         "pid": meta.get("pid", ""),
+                        "diagnostic": diagnostic.get("label", ""),
                         "error": (r["error"] or "")[:80],
                     }
                 )
@@ -158,7 +161,18 @@ def runs_page():
                 "UPDATE runs SET status='cancelled', finished_at=?, error=? WHERE id=?",
                 (db.now_iso(), "cancelled by user", row["id"]),
             )
-            if run and run["kind"] in {"mole_stage1", "router_stage2", "base"} and config.get("adapter_id"):
+            if (
+                run
+                and run["kind"]
+                in {
+                    "mole_stage1",
+                    "router_stage2",
+                    "base",
+                    "preference_dpo",
+                    "antidoom_ftpo",
+                }
+                and config.get("adapter_id")
+            ):
                 db.execute(
                     "UPDATE adapters SET status='failed' WHERE id=? AND status='training'",
                     (config["adapter_id"],),
@@ -168,6 +182,21 @@ def runs_page():
                     "UPDATE routers SET status='failed' WHERE id=? AND status='training'",
                     (config["router_id"],),
                 )
+            if run and run["kind"] == "tokenizer" and config.get("tokenizer_id"):
+                db.execute(
+                    "UPDATE tokenizers SET status='failed',error=? "
+                    "WHERE id=? AND status IN ('queued','processing')",
+                    ("cancelled by user", config["tokenizer_id"]),
+                )
+            if (
+                run
+                and run["kind"] in {"base", "spalmer_base"}
+                and config.get("out_checkpoint_id")
+            ):
+                db.execute(
+                    "DELETE FROM checkpoints WHERE id=? AND kind='pending'",
+                    (config["out_checkpoint_id"],),
+                )
 
         with table_container:
             table = ui.table(
@@ -175,6 +204,12 @@ def runs_page():
                     {"name": "kind", "label": "Kind", "field": "kind", "sortable": True},
                     {"name": "status", "label": "Status", "field": "status", "sortable": True},
                     {"name": "progress", "label": "Progress", "field": "progress", "align": "left"},
+                    {
+                        "name": "diagnostic",
+                        "label": "Diagnostic",
+                        "field": "diagnostic",
+                        "align": "left",
+                    },
                     {"name": "created", "label": "Created", "field": "created", "sortable": True},
                     {"name": "error", "label": "Error", "field": "error", "align": "left"},
                 ],
@@ -196,13 +231,22 @@ def runs_page():
                 empty_state(
                     "history",
                     "No runs yet",
-                    "Training, benchmark, router, base, and export jobs appear here with live progress, logs, and metrics.",
+                    "Training, tokenizer, benchmark, router, base, and export jobs appear here with live progress, logs, and metrics.",
                 )
 
         def refresh_table(*, force: bool = False) -> bool:
             data = rows()
             signature = tuple(
-                (r["id"], r["kind"], r["status"], r["created"], r["progress"], r["pid"], r["error"])
+                (
+                    r["id"],
+                    r["kind"],
+                    r["status"],
+                    r["created"],
+                    r["progress"],
+                    r["pid"],
+                    r["diagnostic"],
+                    r["error"],
+                )
                 for r in data
             )
             if force or signature != state["table_signature"]:
@@ -244,6 +288,7 @@ def runs_page():
             state["log_identity"] = None
             state["log_mtime_ns"] = None
             state["log_has_content"] = False
+            state["token_view_mtime_ns"] = None
             if not run_id:
                 update_timer_interval()
                 return
@@ -268,6 +313,12 @@ def runs_page():
                         ui.label(orjson.dumps(cfg, option=orjson.OPT_INDENT_2).decode()).classes(
                             "text-xs font-mono whitespace-pre-wrap text-gray-300"
                         )
+                token_view_expansion = ui.expansion("tokenized data view").classes("w-full")
+                with token_view_expansion:
+                    token_view_label = ui.label("").classes(
+                        "text-xs font-mono whitespace-pre-wrap text-gray-300"
+                    )
+                token_view_expansion.visible = False
                 with ui.expansion(
                     "log (live tail)", value=r["status"] in ACTIVE_RUN_STATUSES or r["status"] == "failed"
                 ).classes("w-full"):
@@ -286,6 +337,8 @@ def runs_page():
                 log=log_view,
                 log_placeholder=log_placeholder,
                 error=error_label,
+                token_view_expansion=token_view_expansion,
+                token_view=token_view_label,
             )
             refresh_detail(force=True)
             update_timer_interval()
@@ -310,6 +363,27 @@ def runs_page():
                 detail_refs["error"].text = error
                 detail_refs["error"].visible = bool(error)
                 state["detail_signature"] = signature
+
+            token_view_path = run_dir(run_id) / "tokenized_view_manifest.json"
+            try:
+                token_view_mtime = token_view_path.stat().st_mtime_ns
+            except OSError:
+                token_view_mtime = None
+            if token_view_mtime != state["token_view_mtime_ns"]:
+                state["token_view_mtime_ns"] = token_view_mtime
+                if token_view_mtime is not None:
+                    try:
+                        token_view = orjson.loads(token_view_path.read_bytes())
+                    except (OSError, orjson.JSONDecodeError):
+                        token_view = None
+                    if token_view:
+                        detail_refs["token_view"].text = orjson.dumps(
+                            token_view,
+                            option=orjson.OPT_INDENT_2,
+                        ).decode()
+                        detail_refs["token_view_expansion"].visible = True
+                    else:
+                        detail_refs["token_view_expansion"].visible = False
 
             log_path = Path(r["log_path"]) if r["log_path"] else run_dir(run_id) / "train.log"
             path_key = str(log_path)

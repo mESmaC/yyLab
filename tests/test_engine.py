@@ -138,6 +138,27 @@ def test_chat_template_fallback():
     assert "### User" in out and "### Assistant" in out
 
 
+def test_raw_completion_format_is_literal_and_skips_chat_template():
+    class TemplateSpy:
+        called = False
+
+        def apply_chat_template(self, *_args, **_kwargs):
+            self.called = True
+            return "templated"
+
+    tokenizer = TemplateSpy()
+    prompt = "  #include <stdio.h>\nint main("
+
+    rendered = format_messages(tokenizer, [{"content": prompt}], prompt_mode="raw")
+
+    assert rendered == prompt
+    assert tokenizer.called is False
+    with pytest.raises(ValueError, match="exactly one independent prompt"):
+        format_messages(tokenizer, [{"content": "one"}, {"content": "two"}], prompt_mode="raw")
+    with pytest.raises(ValueError, match="unknown prompt mode"):
+        format_messages(tokenizer, [{"content": prompt}], prompt_mode="other")
+
+
 def test_quantized_offload_cache_kwargs_are_user_cache_not_transformers_alias() -> None:
     kwargs, notes = _cache_kwargs(
         {
@@ -250,6 +271,37 @@ def test_engine_generate_plain(tmp_path, monkeypatch):
     assert not eng.is_loaded()
 
 
+def test_engine_generate_raw_uses_literal_prompt(tmp_path, monkeypatch):
+    class RecordingTok(FakeTok):
+        def __init__(self) -> None:
+            super().__init__()
+            self.encoded: list[str] = []
+
+        def __call__(self, texts, return_tensors=None, **kwargs):
+            if isinstance(texts, str):
+                self.encoded.append(texts)
+            return super().__call__(texts, return_tensors=return_tensors, **kwargs)
+
+    model_dir = _fake_loader(tmp_path, monkeypatch)
+    eng = Engine()
+    eng.load(LoadSpec(ref=str(model_dir), quant="bf16"))
+    tokenizer = RecordingTok()
+    eng.tokenizer = tokenizer
+    prompt = "  #include\n"
+
+    chunks = list(
+        eng.generate_stream(
+            [{"content": prompt}],
+            temperature=0.0,
+            max_new_tokens=4,
+            prompt_mode="raw",
+        )
+    )
+
+    assert isinstance("".join(chunks), str)
+    assert tokenizer.encoded == [prompt]
+
+
 def test_engine_applies_selected_yarn_context_target(tmp_path, monkeypatch):
     model_dir = _fake_loader(tmp_path, monkeypatch)
     eng = Engine()
@@ -348,6 +400,46 @@ def test_chat_context_plan_rejects_current_turn_that_cannot_fit():
         )
 
 
+def test_raw_context_plan_is_independent_and_never_compacts():
+    eng = _planning_engine(8)
+    prompt = {"content": "one two three"}
+
+    plan = eng.plan_context(
+        [prompt],
+        max_new_tokens=3,
+        prompt_mode="raw",
+        compact=True,
+        strategy="nll_atxy",
+    )
+
+    assert list(plan.messages) == [prompt]
+    assert plan.prompt_tokens == 3
+    assert plan.prompt_budget == 5
+    assert plan.prompt_mode == "raw"
+    assert plan.strategy == "none"
+    assert plan.compacted is False
+    assert plan.to_dict()["prompt_mode"] == "raw"
+
+    with pytest.raises(ValueError, match="never compacted or truncated"):
+        eng.plan_context(
+            [{"content": "one two three four five six"}],
+            max_new_tokens=3,
+            prompt_mode="raw",
+            compact=True,
+        )
+
+
+def test_raw_context_plan_rejects_multi_turn_payload():
+    eng = _planning_engine(8)
+
+    with pytest.raises(ValueError, match="exactly one independent prompt"):
+        eng.plan_context(
+            [{"content": "first"}, {"content": "second"}],
+            max_new_tokens=3,
+            prompt_mode="raw",
+        )
+
+
 def test_engine_with_mole_adapter(tmp_path, monkeypatch):
     from transformers import AutoModelForCausalLM
 
@@ -435,3 +527,17 @@ def test_engine_context_budget(tmp_path, monkeypatch):
         raise AssertionError("expected context budget error")
     except ValueError as e:
         assert "context" in str(e).lower()
+
+
+def test_engine_generation_kwargs_allow_exactly_one_remaining_token(tmp_path, monkeypatch):
+    import torch
+
+    model_dir = _fake_loader(tmp_path, monkeypatch)
+    eng = Engine()
+    eng.load(LoadSpec(ref=str(model_dir), quant="bf16", settings={"max_context_tokens": 8}))
+    input_ids = torch.ones((1, 7), dtype=torch.long)
+    attention_mask = torch.ones_like(input_ids)
+
+    kwargs = eng._generate_kwargs(input_ids, attention_mask, 0.0, 0.9, 1)
+
+    assert kwargs["max_new_tokens"] == 1

@@ -29,13 +29,17 @@ class MoLEConfig:
     router_type: str = "per_layer"
     router_hidden_size: int | None = 256
     router_max_tokens: int = 256
+    identity_expert: bool = False
     adaptive: AdaptiveOccupancyConfig = field(default_factory=AdaptiveOccupancyConfig)
 
     def __post_init__(self) -> None:
         if self.num_experts < 1 or self.rank < 1:
             raise ValueError("MoLE expert count and rank must be positive")
-        if not 1 <= self.top_k <= self.num_experts:
+        route_count = self.num_experts + int(self.identity_expert)
+        if not 1 <= self.top_k <= route_count:
             raise ValueError("MoLE top-k must be within the expert bank")
+        if self.adaptive.enabled and self.identity_expert:
+            raise ValueError("adaptive occupancy and the Soft LoRA identity route are separate policies")
         if self.adaptive.enabled and self.router_type != "per_token":
             raise ValueError("adaptive occupancy requires per-token routing")
         if self.adaptive.enabled:
@@ -51,6 +55,7 @@ class MoLEConfig:
             "router_type": self.router_type,
             "router_hidden_size": self.router_hidden_size,
             "router_max_tokens": self.router_max_tokens,
+            "identity_expert": self.identity_expert,
             "adaptive": self.adaptive.to_dict(),
         }
 
@@ -67,6 +72,7 @@ class MoLEConfig:
             router_type=d.get("router_type", "per_layer"),
             router_hidden_size=d.get("router_hidden_size", 256),
             router_max_tokens=d.get("router_max_tokens", 256),
+            identity_expert=bool(d.get("identity_expert", False)),
             adaptive=AdaptiveOccupancyConfig.from_dict(d.get("adaptive")),
         )
 
@@ -143,6 +149,7 @@ def attach_token_routers(
                 top_k=cfg.top_k,
                 device=reference.weight.device,
                 adaptive=cfg.adaptive.enabled,
+                identity_expert=cfg.identity_expert,
             )
             block.add_module(TOKEN_ROUTER_MODULE, router)
 
@@ -184,6 +191,7 @@ def attach_shared_router(
         hidden_width=cfg.router_hidden_size,
         max_prompt_tokens=cfg.router_max_tokens,
         device=weight.device,
+        identity_expert=cfg.identity_expert,
     )
     model.add_module(SHARED_ROUTER_MODULE, router)
     if install_hooks:
@@ -258,6 +266,7 @@ def inject_mole(
                 block_routers.get(_block_name_for_projection(name)) if block_routers else None
             ),
             adaptive=cfg.adaptive.enabled,
+            identity_expert=cfg.identity_expert,
         )
         setattr(parent, attr, mole)
         replaced.append((name, mole))

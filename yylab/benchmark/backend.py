@@ -57,8 +57,25 @@ def _thinking_token_counts(
     return 0, len(values), None
 
 
-def _format_messages(tokenizer, messages: list[dict[str, str]], enable_thinking: bool) -> str:
-    """Render the exact benchmark prompt, including Qwen's thinking switch."""
+def _format_messages(
+    tokenizer,
+    messages: list[dict[str, str]],
+    enable_thinking: bool,
+    prompt_mode: str = "chat",
+) -> str:
+    """Render a chat-template or literal completion benchmark prompt."""
+
+    normalized_mode = str(prompt_mode or "chat").strip().casefold()
+    if normalized_mode == "raw":
+        if enable_thinking:
+            raise ValueError("thinking requires chat prompt mode")
+        parts = [str(message.get("content") or "").strip() for message in messages]
+        prompt = "\n\n".join(part for part in parts if part)
+        if not prompt:
+            raise ValueError("raw benchmark prompt cannot be empty")
+        return prompt
+    if normalized_mode != "chat":
+        raise ValueError(f"unknown benchmark prompt mode: {prompt_mode}")
 
     try:
         return tokenizer.apply_chat_template(
@@ -218,9 +235,7 @@ def _adaptive_generation_phase(
             after.h2d_bytes,
         )
         if after_transfers != before_transfers:
-            raise RuntimeError(
-                "adaptive benchmark generation transferred expert weights during decode"
-            )
+            raise RuntimeError("adaptive benchmark generation transferred expert weights during decode")
     return generated, dict(runtime.telemetry())
 
 
@@ -234,15 +249,25 @@ class YyLabBenchmarkBackend:
         quant: str,
         adapter_path: str | None,
         adapter_arch: str,
+        model_family: str | None = None,
         settings: dict[str, Any] | None = None,
     ) -> None:
         from ..infer.engine import Engine
+        from ..models.families import family_from_reference
 
         self.checkpoint_ref = checkpoint_ref
         self.quant = quant
         self.adapter_path = adapter_path
         self.adapter_arch = adapter_arch
         self.settings = dict(settings or {})
+        declared_family = str(model_family or "").strip().casefold()
+        if declared_family and declared_family not in {"hf", "spalmer", "spalmer_v1"}:
+            raise ValueError(f"unknown benchmark model family: {model_family}")
+        self.model_family = (
+            "spalmer"
+            if declared_family in {"spalmer", "spalmer_v1"}
+            else ("hf" if declared_family else family_from_reference(checkpoint_ref))
+        )
         self.engine = Engine()
         self._stack = ""
         self._policy = ""
@@ -250,6 +275,7 @@ class YyLabBenchmarkBackend:
     def identity(self) -> dict[str, object]:
         return {
             "backend": "yylab-direct",
+            "model_family": self.model_family,
             "checkpoint_ref": self.checkpoint_ref,
             "quant": self.quant,
             "adapter_path": self.adapter_path,
@@ -260,6 +286,7 @@ class YyLabBenchmarkBackend:
                 "temperature",
                 "top_p",
                 "top_k",
+                "prompt_mode",
                 "enable_thinking",
                 "max_thinking_tokens",
                 "cache_mode",
@@ -271,12 +298,37 @@ class YyLabBenchmarkBackend:
         from ..infer.engine import LoadSpec
         from ..mole.inject import set_active_expert
 
+        if self.model_family == "spalmer":
+            if policy not in {"base", "dynamic"}:
+                raise ValueError(
+                    "SPALMER benchmarks support its fixed base route or native dynamic "
+                    "2–20 expert residency; yyLab adapter/forced-expert policies do not apply"
+                )
+            stack = f"spalmer:{policy}"
+            if self._stack != stack:
+                settings = dict(self.settings)
+                settings["spalmer_dynamic_residency"] = policy == "dynamic"
+                notes = self.engine.load(
+                    LoadSpec(
+                        ref=self.checkpoint_ref,
+                        quant="checkpoint",
+                        model_family="spalmer",
+                        settings=settings,
+                    )
+                )
+                self._stack = stack
+            else:
+                notes = []
+            self._policy = policy
+            return notes
+
         if policy == "base":
             if self._stack != "base":
                 notes = self.engine.load(
                     LoadSpec(
                         ref=self.checkpoint_ref,
                         quant=self.quant,
+                        model_family=self.model_family,
                         settings=self.settings,
                     )
                 )
@@ -291,6 +343,7 @@ class YyLabBenchmarkBackend:
                     LoadSpec(
                         ref=self.checkpoint_ref,
                         quant=self.quant,
+                        model_family=self.model_family,
                         adapter_path=self.adapter_path,
                         adapter_arch=self.adapter_arch,
                         settings=self.settings,
@@ -331,6 +384,7 @@ class YyLabBenchmarkBackend:
         cache_mode: str,
         seed: int,
         max_thinking_tokens: int = 1024,
+        prompt_mode: str = "chat",
     ) -> GenerationResponse:
         import torch
 
@@ -340,7 +394,7 @@ class YyLabBenchmarkBackend:
             raise RuntimeError("benchmark backend has no loaded model")
         tokenizer = self.engine.tokenizer
         model = self.engine.model
-        prompt = _format_messages(tokenizer, messages, enable_thinking)
+        prompt = _format_messages(tokenizer, messages, enable_thinking, prompt_mode)
         encoded = tokenizer(prompt, return_tensors="pt")
         input_ids = encoded["input_ids"].to(model.device)
         attention_mask = encoded.get("attention_mask")
@@ -437,12 +491,20 @@ class YyLabBenchmarkBackend:
             )
             reserved_tokens += thinking_budget + continuation_overhead
         if prompt_tokens + reserved_tokens > max_context_tokens:
+            if self.model_family == "spalmer":
+                guidance = "increase the SPALMER native context limit or reduce the requested budgets"
+            elif enable_thinking:
+                guidance = (
+                    "select a YaRN context extension or reduce the thinking budget because "
+                    "yyLab will not reduce the answer budget"
+                )
+            else:
+                guidance = "select a YaRN context extension or reduce the answer budget"
             raise ValueError(
                 "benchmark budgets exceed the configured context: "
                 f"prompt {prompt_tokens} + thinking {thinking_budget} + answer {answer_budget}"
                 + (f" + continuation {continuation_overhead}" if enable_thinking else "")
-                + f" > {max_context_tokens}; select a YaRN context extension or reduce the "
-                "thinking budget because yyLab will not reduce the answer budget"
+                + f" > {max_context_tokens}; {guidance}"
             )
 
         kwargs: dict[str, object] = {
@@ -506,9 +568,7 @@ class YyLabBenchmarkBackend:
                 "adaptive MoLE v4 benchmark generation requires the 'dynamic' or 'adapter' policy"
             )
         accumulator = (
-            _RouteAccumulator(model)
-            if self._policy == "dynamic" and adaptive_runtime is None
-            else None
+            _RouteAccumulator(model) if self._policy == "dynamic" and adaptive_runtime is None else None
         )
         adaptive_phases: list[dict[str, object]] = []
         if self.engine.cuda:
@@ -594,11 +654,15 @@ class YyLabBenchmarkBackend:
                         else:
                             continuation_mask = continuation_mask.to(model.device)
                         if int(continuation_ids.shape[1]) + answer_budget > max_context_tokens:
+                            guidance = (
+                                "increase the SPALMER native context limit or reduce the thinking budget"
+                                if self.model_family == "spalmer"
+                                else "select a YaRN context extension or reduce the thinking budget"
+                            )
                             raise ValueError(
                                 "forced benchmark answer continuation exceeds the configured "
                                 f"context: prompt {int(continuation_ids.shape[1])} + answer "
-                                f"{answer_budget} > {max_context_tokens}; select a YaRN context "
-                                "extension or reduce the thinking budget"
+                                f"{answer_budget} > {max_context_tokens}; {guidance}"
                             )
                         continuation_kwargs = {
                             key: value
@@ -650,6 +714,10 @@ class YyLabBenchmarkBackend:
                 adaptive_receipt["generation_phases"] = adaptive_phases
                 routing = dict(routing or {})
                 routing["adaptive"] = adaptive_receipt
+            telemetry_getter = getattr(self.engine, "routing_telemetry", None)
+            native_routing = telemetry_getter() if callable(telemetry_getter) else None
+            if native_routing is not None:
+                routing = native_routing
         if self.engine.cuda:
             torch.cuda.synchronize()
         elapsed = time.perf_counter() - started

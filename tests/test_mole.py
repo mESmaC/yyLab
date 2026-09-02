@@ -107,6 +107,41 @@ def test_top1():
     assert out.shape == (2, 2, 16)
 
 
+def test_soft_lora_config_roundtrip_and_validation():
+    config = MoLEConfig(num_experts=2, rank=4, top_k=3, identity_expert=True)
+    restored = MoLEConfig.from_dict(config.to_dict())
+
+    assert restored.identity_expert is True
+    assert restored.top_k == 3
+    try:
+        MoLEConfig(num_experts=2, rank=4, top_k=3)
+        raise AssertionError("top-k should require the explicitly configured identity route")
+    except ValueError as exc:
+        assert "top-k" in str(exc)
+
+
+def test_soft_lora_artifact_uses_identity_aware_v5_contract(tmp_path):
+    config = MoLEConfig(
+        num_experts=2,
+        rank=4,
+        top_k=3,
+        identity_expert=True,
+        target_modules=("q_proj", "v_proj"),
+    )
+    model = TinyModel()
+    inject_mole(model, config)
+    save_mole(tmp_path, model, config, base_ref="tiny")
+
+    payload = load_mole_config(tmp_path, expected_base_ref="tiny")
+    fresh = TinyModel()
+    inject_mole(fresh, MoLEConfig.from_dict(payload["config"]))
+    applied = apply_mole_weights(fresh, load_mole_weights(tmp_path))
+
+    assert payload["format_version"] == 5
+    assert applied == 4
+    assert all(layer.router.gate.out_features == 3 for _, layer in mole_layers(fresh))
+
+
 def test_stage_freezing():
     model = _inject()
     set_stage(model, "router")

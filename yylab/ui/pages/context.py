@@ -6,6 +6,7 @@ from ... import db
 from ...config import get_settings, update_settings
 from ...hw import best_gpu, system_report
 from ...infer.context_math import capacity_rows, kv_bytes_per_token, max_context_for_budget, model_weight_gb
+from ...models.families import checkpoint_family
 from ..shell import panel, shell
 
 CTX_PRESETS = [8_192, 32_768, 131_072, 524_288, 1_048_576, 2_500_000]
@@ -269,6 +270,13 @@ def context_page():
             c = db.q1("SELECT * FROM checkpoints WHERE id=?", (cap_ckpt.value,))
             if not c:
                 cap_info.text = "Checkpoint not found."
+                return
+            if checkpoint_family(c) == "spalmer":
+                cap_info.text = (
+                    "SPALMER uses fixed recurrent KDA state plus compressed MLA state, not a "
+                    "standard per-token K/V cache. Chat context compaction works, but this HF KV "
+                    "capacity formula is intentionally not applied."
+                )
                 return
             try:
                 cfg = _load_model_config(c["ref"])

@@ -10,7 +10,16 @@ from torch import nn
 from torch.nn import functional as F
 
 from yylab import db
-from yylab.train.data import PackedBatches, estimate_steps, plan_expert_data
+from yylab.train.data import (
+    CORPUS_ID_FIELD,
+    ChatSFTBatches,
+    PackedBatches,
+    estimate_steps,
+    parse_role_transcript,
+    plan_expert_data,
+    tokenize_chat_examples,
+    tokenize_chat_messages,
+)
 from yylab.train.loop import LoopOpts, attention_backend_context, make_optimizer, train_loop
 from yylab.train.planner import PlanInput, estimate_adapter_trainable_params, plan_training
 
@@ -27,6 +36,331 @@ class WhitespaceTok:
         return {"input_ids": ids}
 
 
+class TemplateTokenizer:
+    pad_token_id = 0
+    eos_token_id = 1
+
+    role_ids = {"system": 10, "user": 20, "assistant": 30}
+
+    def apply_chat_template(
+        self,
+        messages,
+        *,
+        tokenize,
+        add_generation_prompt,
+        return_dict=False,
+        return_assistant_tokens_mask=False,
+    ):
+        assert tokenize is True
+        input_ids: list[int] = []
+        assistant_mask: list[int] = []
+        for message in messages:
+            block = [self.role_ids[message["role"]]]
+            block.extend(40 + len(word) for word in message["content"].split())
+            block.append(self.eos_token_id)
+            input_ids.extend(block)
+            assistant_mask.extend(
+                [int(message["role"] == "assistant")] * len(block)
+            )
+        if add_generation_prompt:
+            input_ids.append(self.role_ids["assistant"])
+            assistant_mask.append(0)
+        if return_dict:
+            result = {"input_ids": input_ids}
+            if return_assistant_tokens_mask:
+                result["assistant_masks"] = assistant_mask
+            return result
+        return input_ids
+
+
+class NonPrefixStableQwenLikeTokenizer:
+    """Small token-level model of Qwen's last-query thinking rewrite."""
+
+    pad_token_id = 0
+    eos_token_id = 1
+    role_ids = {"system": 10, "user": 20, "assistant": 30}
+    think_start_id = 31
+    think_end_id = 32
+
+    @staticmethod
+    def _words(content: str) -> list[int]:
+        return [40 + len(word) for word in content.split() if word]
+
+    def apply_chat_template(
+        self,
+        messages,
+        *,
+        tokenize,
+        add_generation_prompt,
+        **_kwargs,
+    ):
+        assert tokenize is True
+        last_user = max(
+            (index for index, message in enumerate(messages) if message["role"] == "user"),
+            default=-1,
+        )
+        input_ids: list[int] = []
+        for index, message in enumerate(messages):
+            input_ids.append(self.role_ids[message["role"]])
+            content = message["content"]
+            if message["role"] == "assistant" and index > last_user:
+                if "</think>" in content:
+                    reasoning, answer = content.split("</think>", 1)
+                    reasoning = reasoning.split("<think>", 1)[-1]
+                    input_ids.extend([self.think_start_id, *self._words(reasoning), self.think_end_id])
+                    input_ids.extend(self._words(answer))
+                else:
+                    input_ids.extend([self.think_start_id, self.think_end_id])
+                    input_ids.extend(self._words(content))
+            else:
+                input_ids.extend(self._words(content))
+            input_ids.append(self.eos_token_id)
+        if add_generation_prompt:
+            input_ids.append(self.role_ids["assistant"])
+        return input_ids
+
+
+def test_role_transcript_parser_accepts_multiline_multi_turn_chat_only_at_line_starts():
+    messages = parse_role_transcript(
+        "System: Keep answers short.\n"
+        "User: What does x:y mean?\nMore context.\n"
+        "Assistant: First answer.\n"
+        "user: Follow up.\n"
+        "ASSISTANT: Second answer."
+    )
+    assert [message["role"] for message in messages] == [
+        "system",
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+    ]
+    assert messages[1]["content"] == "What does x:y mean?\nMore context."
+    assert parse_role_transcript("ordinary pretraining text\nuser: not a transcript") == []
+    assert parse_role_transcript("user:\nassistant: answer") == []
+
+
+def test_chat_template_mask_supervises_content_and_eot_but_not_assistant_header():
+    tokenizer = TemplateTokenizer()
+    messages = parse_role_transcript(
+        "system: policy\nuser: first prompt\nassistant: first reply\n"
+        "user: next\nassistant: second reply"
+    )
+    input_ids, labels = tokenize_chat_messages(tokenizer, messages)
+    assert len(input_ids) == len(labels)
+    assistant_role_positions = [index for index, token in enumerate(input_ids) if token == 30]
+    user_role_positions = [index for index, token in enumerate(input_ids) if token == 20]
+    assert len(assistant_role_positions) == 2
+    assert all(labels[index] == -100 for index in assistant_role_positions)
+    assert all(labels[index] == -100 for index in user_role_positions)
+    assert sum(label != -100 for label in labels) == 6
+
+
+def test_non_prefix_stable_qwen_turns_keep_thinking_content_and_eot_targets():
+    tokenizer = NonPrefixStableQwenLikeTokenizer()
+    messages = parse_role_transcript(
+        "user: first\nassistant: <think>reason one</think>answer one\n"
+        "user: second\nassistant: <think>reason two</think>answer two"
+    )
+
+    examples = tokenize_chat_examples(tokenizer, messages)
+
+    assert len(examples) == 2
+    for input_ids, labels in examples:
+        targets = [label for label in labels if label != -100]
+        assert targets[0] == tokenizer.think_start_id
+        assert tokenizer.think_end_id in targets
+        assert targets[-1] == tokenizer.eos_token_id
+        assert tokenizer.role_ids["assistant"] not in targets
+        assert len(input_ids) == len(labels)
+
+
+def test_chat_sft_windows_long_prompt_with_context_and_never_targets_column_zero():
+    tokenizer = NonPrefixStableQwenLikeTokenizer()
+    prompt = " ".join(f"prompt{i}" for i in range(20))
+    batches = ChatSFTBatches(
+        [{"text": f"user: {prompt}\nassistant: answer one two"}],
+        tokenizer,
+        seq_len=8,
+        micro_batch=1,
+    )
+
+    materialized = list(batches)
+    rows = [
+        (batch["input_ids"][0], batch["labels"][0], batch["attention_mask"][0])
+        for batch in materialized
+    ]
+    assert len(rows) >= 2
+    assert all(len(ids) == len(labels) == len(mask) == 8 for ids, labels, mask in rows)
+    assert all(labels[0] == -100 and any(label != -100 for label in labels[1:]) for _, labels, _ in rows)
+    assert sum(label != -100 for _, labels, _ in rows for label in labels) == 6
+    first_labels = rows[0][1]
+    first_target = next(index for index, label in enumerate(first_labels) if label != -100)
+    assert first_target > 0
+    assert all(value == 1 for value in rows[0][2][: first_target + 1])
+
+
+def test_chat_sft_batches_are_fixed_length_and_track_supervised_data():
+    batches = ChatSFTBatches(
+        [
+            {"text": "plain text"},
+            {
+                "text": (
+                    "system: policy\nuser: first prompt\nassistant: first reply\n"
+                    "user: next\nassistant: second reply"
+                )
+            },
+        ],
+        TemplateTokenizer(),
+        seq_len=6,
+        micro_batch=2,
+    )
+    materialized = list(batches)
+    assert materialized
+    assert all(
+        len(row) == 6
+        for batch in materialized
+        for field in ("input_ids", "labels", "attention_mask")
+        for row in batch[field]
+    )
+    assert batches.docs_seen == 2
+    assert batches.parseable_docs == 1
+    assert batches.skipped_docs == 1
+    assert batches.supervised_tokens_seen == 6
+    assert batches.supervised_tokens_batched == 6
+    assert sum(
+        label != -100 for batch in materialized for row in batch["labels"] for label in row
+    ) == 6
+
+
+def test_chat_sft_tokenized_view_separates_replay_padding_and_supervision():
+    batches = ChatSFTBatches(
+        [
+            {
+                CORPUS_ID_FIELD: "antidoom",
+                "messages": [
+                    {"role": "user", "content": "Diagnose the repetitive response."},
+                    {
+                        "role": "assistant",
+                        "content": " ".join(f"repair-{index}" for index in range(24)),
+                    },
+                ],
+            }
+        ],
+        TemplateTokenizer(),
+        seq_len=8,
+        micro_batch=2,
+    )
+
+    assert list(batches)
+    stats = batches.data_stats()
+    tokens = stats["tokens"]
+    assert tokens["packing_replay_inputs"] > 0
+    assert tokens["padding_inputs"] >= 0
+    assert tokens["forwarded_real_inputs"] == (
+        tokens["covered_rendered_positions"] + tokens["packing_replay_inputs"]
+    )
+    assert tokens["rendered_token_positions"] == (
+        tokens["covered_rendered_positions"]
+        + tokens["unforwarded_rendered_positions"]
+    )
+    assert tokens["model_target_slots"] == (
+        tokens["optimizer_supervised_targets"] + tokens["ignored_target_slots"]
+    )
+    assert stats["per_corpus"]["antidoom"]["packing_replay_inputs"] > 0
+
+
+def test_chat_sft_prefers_structured_messages_over_flattened_text():
+    batches = ChatSFTBatches(
+        [
+            {
+                "text": "this is deliberately not a parseable role transcript",
+                "messages": [
+                    {"from": "human", "value": "Say hello"},
+                    {"from": "gpt", "value": "Hello there"},
+                ],
+            }
+        ],
+        TemplateTokenizer(),
+        seq_len=8,
+        micro_batch=1,
+    )
+
+    materialized = list(batches)
+
+    assert materialized
+    assert batches.structured_docs == 1
+    assert batches.legacy_transcript_docs == 0
+    assert batches.parseable_docs == 1
+    assert batches.skipped_docs == 0
+
+
+def test_chat_sft_skips_one_unrenderable_record_and_continues():
+    class RejectingTokenizer(TemplateTokenizer):
+        def apply_chat_template(self, messages, **kwargs):
+            if any("reject-me" in message["content"] for message in messages):
+                raise ValueError("record-specific template rejection")
+            return super().apply_chat_template(messages, **kwargs)
+
+    batches = ChatSFTBatches(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "reject-me"},
+                    {"role": "assistant", "content": "bad"},
+                ]
+            },
+            {
+                "messages": [
+                    {"role": "user", "content": "render this"},
+                    {"role": "assistant", "content": "good answer"},
+                ]
+            },
+        ],
+        RejectingTokenizer(),
+        seq_len=8,
+        micro_batch=1,
+    )
+
+    materialized = list(batches)
+    stats = batches.data_stats()
+
+    assert materialized
+    assert stats["docs_seen"] == 2
+    assert stats["parseable_docs"] == 1
+    assert stats["skipped_docs"] == 1
+    assert stats["unrenderable_docs"] == 1
+    assert stats["failure_reasons"] == {
+        "ValueError: record-specific template rejection": 1
+    }
+
+
+def test_chat_sft_bounds_distinct_failure_reasons():
+    class AlwaysRejectingTokenizer(TemplateTokenizer):
+        def apply_chat_template(self, messages, **_kwargs):
+            raise ValueError(messages[0]["content"])
+
+    batches = ChatSFTBatches(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": f"failure-{index}"},
+                    {"role": "assistant", "content": "answer"},
+                ]
+            }
+            for index in range(15)
+        ],
+        AlwaysRejectingTokenizer(),
+        seq_len=8,
+        micro_batch=1,
+    )
+
+    assert list(batches) == []
+    assert batches.unrenderable_docs == 15
+    assert len(batches.failure_reasons) == 12
+    assert batches.failure_reason_overflow == 3
+
+
 def test_packed_batches():
     docs = [{"text": "a b c d e f g"} for _ in range(10)]
     tok = WhitespaceTok()
@@ -38,6 +372,57 @@ def test_packed_batches():
     assert first[-1] == 1
     assert pb.docs_seen == 10
     assert pb.tokens_seen == 70
+
+
+def test_packed_tokenized_view_reconciles_sources_boundaries_and_targets():
+    packed = PackedBatches(
+        [
+            {"text": "alpha beta gamma", CORPUS_ID_FIELD: "corpus-a"},
+            {"text": "delta epsilon zeta", CORPUS_ID_FIELD: "corpus-b"},
+        ],
+        lambda texts: WhitespaceTok()(texts)["input_ids"],
+        seq_len=4,
+        eos_token_id=1,
+        micro_batch=2,
+    )
+
+    batches = list(packed)
+    stats = packed.data_stats()
+
+    assert len(batches) == 1
+    assert stats["tokens"] == {
+        "rendered_content_tokens": 6,
+        "inserted_document_boundary_tokens": 2,
+        "rendered_token_positions": 8,
+        "covered_rendered_positions": 8,
+        "unforwarded_rendered_positions": 0,
+        "forwarded_real_inputs": 8,
+        "forwarded_model_slots": 8,
+        "padding_inputs": 0,
+        "packing_replay_inputs": 0,
+        "model_target_slots": 6,
+        "optimizer_supervised_targets": 6,
+        "ignored_target_slots": 0,
+    }
+    assert stats["per_corpus"]["corpus-a"]["forwarded_real_inputs"] == 4
+    assert stats["per_corpus"]["corpus-b"]["forwarded_real_inputs"] == 4
+
+
+def test_packed_tokenized_view_reports_step_cap_tail():
+    packed = PackedBatches(
+        [{"text": " ".join(f"token-{index}" for index in range(10))}],
+        lambda texts: WhitespaceTok()(texts)["input_ids"],
+        seq_len=4,
+        eos_token_id=1,
+        micro_batch=1,
+        max_batches=1,
+    )
+
+    assert len(list(packed)) == 1
+    stats = packed.data_stats()["tokens"]
+    assert stats["rendered_token_positions"] == 11
+    assert stats["forwarded_real_inputs"] == 4
+    assert stats["unforwarded_rendered_positions"] == 7
 
 
 def test_packed_batches_max_batches():
@@ -100,10 +485,10 @@ def test_packed_batches_adds_eos_once_per_document_not_per_text_chunk():
 def test_build_batches_replays_each_epoch(monkeypatch):
     from yylab.workers import train as worker
 
-    seeds: list[int] = []
+    calls: list[tuple[int, object]] = []
 
-    def fake_docs(_corpora, _domains, *, seed, **_kwargs):
-        seeds.append(seed)
+    def fake_docs(_corpora, _domains, *, seed, splits, **_kwargs):
+        calls.append((seed, splits))
         yield {"text": " ".join("word" for _ in range(20))}
 
     monkeypatch.setattr(worker, "iter_corpus_docs", fake_docs)
@@ -115,10 +500,11 @@ def test_build_batches_replays_each_epoch(monkeypatch):
         "micro_batch": 1,
         "grad_accum": 1,
         "seed": 7,
+        "splits": ["train"],
     }
     batches = worker.build_batches(cfg, WhitespaceTok(), max_steps=100)
     list(batches)
-    assert seeds == [7, 8, 9]
+    assert calls == [(7, ["train"]), (8, ["train"]), (9, ["train"])]
 
 
 def test_build_batches_suppresses_raw_length_warning_without_truncating(monkeypatch):
@@ -164,6 +550,35 @@ def test_build_batches_suppresses_raw_length_warning_without_truncating(monkeypa
     ]
     assert len(batches) == 5
     assert all(len(sequence) == 8 for batch in batches for sequence in batch["input_ids"])
+
+
+def test_build_batches_wires_chat_sft_objective_to_labeled_batcher(monkeypatch):
+    from yylab.workers import train as worker
+
+    monkeypatch.setattr(
+        worker,
+        "iter_corpus_docs",
+        lambda *_args, **_kwargs: iter(
+            [{"text": "system: concise\nuser: say hi\nassistant: hello there"}]
+        ),
+    )
+    batches = worker.build_batches(
+        {
+            "objective": "chat_sft",
+            "corpora": ["corpus"],
+            "seq_len": 8,
+            "micro_batch": 1,
+            "grad_accum": 1,
+            "epochs": 1,
+        },
+        TemplateTokenizer(),
+        max_steps=3,
+    )
+    assert isinstance(batches, ChatSFTBatches)
+    batch = next(iter(batches))
+    assert "labels" in batch
+    assert "attention_mask" in batch
+    assert any(label != -100 for label in batch["labels"][0])
 
 
 class TinyLM(nn.Module):
@@ -213,8 +628,54 @@ def test_train_loop_reports_data_exhaustion_below_step_cap(tmp_path):
     assert result["steps"] == 2
     assert result["step_cap"] == 5
     assert result["data_exhausted"] is True
+    assert result["sequences_forwarded"] == 2
+    assert result["forwarded_model_tokens"] == 8
+    assert result["forwarded_real_tokens"] == 8
+    assert result["supervised_tokens"] == 6
+    assert result["ignored_target_slots"] == 0
     assert progress["step"] == 2
     assert "data exhausted" in progress["msg"]
+
+
+def test_train_loop_honors_explicit_sft_labels_and_attention_mask(tmp_path):
+    class RecordingLM(TinyLM):
+        def __init__(self):
+            super().__init__()
+            self.seen_labels = None
+            self.seen_attention_mask = None
+
+        def forward(self, input_ids=None, labels=None, attention_mask=None, **kwargs):
+            self.seen_labels = labels.detach().clone()
+            self.seen_attention_mask = attention_mask.detach().clone()
+            return super().forward(input_ids=input_ids, labels=labels, **kwargs)
+
+    model = RecordingLM()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+    result = train_loop(
+        model,
+        iter(
+            [
+                {
+                    "input_ids": [[2, 3, 4, 0]],
+                    "labels": [[2, -100, 4, -100]],
+                    "attention_mask": [[1, 1, 1, 0]],
+                }
+            ]
+        ),
+        optimizer,
+        scheduler,
+        LoopOpts(grad_accum=1, max_steps=1, device="cpu", run_dir=tmp_path),
+    )
+    assert model.seen_labels.tolist() == [[2, -100, 4, -100]]
+    assert model.seen_attention_mask.tolist() == [[1, 1, 1, 0]]
+    assert result["supervised_tokens"] == 1
+    assert result["sequences_forwarded"] == 1
+    assert result["forwarded_model_tokens"] == 4
+    assert result["forwarded_real_tokens"] == 3
+    assert result["padding_tokens"] == 1
+    assert result["model_target_slots"] == 3
+    assert result["ignored_target_slots"] == 2
 
 
 def test_attention_context_prioritizes_cudnn_and_retains_fallbacks(monkeypatch):
@@ -640,7 +1101,7 @@ def test_run_base_qlora_peft(tmp_path, monkeypatch):
         (adapter_id, "tiny-lora", db.now_iso(), ckpt_id, "lora", "nf4", "training"),
     )
 
-    def fake_load(ref, quant):
+    def fake_load(ref, quant, **_options):
         from transformers import AutoModelForCausalLM
 
         m = AutoModelForCausalLM.from_pretrained(ref)
@@ -676,6 +1137,30 @@ def test_run_base_qlora_peft(tmp_path, monkeypatch):
     from yylab.artifacts import adapter_dir
 
     assert (adapter_dir(adapter_id) / "adapter_config.json").exists()
+
+
+def test_worker_load_base_forwards_loader_options(monkeypatch):
+    from yylab.models import loading as loading_module
+    from yylab.workers import train as worker
+
+    model = SimpleNamespace(config=SimpleNamespace(use_cache=True))
+    captured = {}
+
+    def fake_load(ref, quant, **options):
+        captured.update(ref=ref, quant=quant, options=options)
+        return model, "tokenizer", False, quant, ["loaded"]
+
+    monkeypatch.setattr(loading_module, "load_base", fake_load)
+
+    result = worker.load_base("checkpoint", "bf16", restore_saved_qat=False)
+
+    assert captured == {
+        "ref": "checkpoint",
+        "quant": "bf16",
+        "options": {"restore_saved_qat": False},
+    }
+    assert result == (model, "tokenizer", False, "bf16", ["loaded"])
+    assert model.config.use_cache is False
 
 
 def test_estimate_steps(tmp_path):

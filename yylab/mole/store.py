@@ -47,7 +47,11 @@ def _write_mole_config(
     expert_manifest: list[dict] | None = None,
     routing_sha256: str | None = None,
 ) -> None:
-    format_version = 4 if cfg.adaptive.enabled else (3 if cfg.router_type == "per_token" else 2)
+    format_version = (
+        4
+        if cfg.adaptive.enabled
+        else (5 if cfg.identity_expert else (3 if cfg.router_type == "per_token" else 2))
+    )
     payload = {
         "arch": "mole",
         "format_version": format_version,
@@ -207,7 +211,7 @@ def assemble_mole_experts(
         key = name.replace(".", "__")
         gate = layer.router.gate.weight
         state[f"{key}.router.gate.weight"] = torch.zeros(
-            cfg.num_experts,
+            gate.shape[0],
             layer.in_features,
             dtype=gate.dtype,
             device="cpu",
@@ -229,7 +233,7 @@ def load_mole_config(directory: Path, *, expected_base_ref: str | None = None) -
     if not isinstance(payload, dict) or payload.get("arch") != "mole":
         raise ValueError("invalid MoLE artifact config")
     version = int(payload.get("format_version", 1))
-    if version not in {1, 2, 3, 4}:
+    if version not in {1, 2, 3, 4, 5}:
         raise ValueError(f"unsupported MoLE artifact format version: {version}")
     if not isinstance(payload.get("config"), dict):
         raise ValueError("MoLE artifact config is missing its architecture settings")
@@ -287,6 +291,10 @@ def load_mole_config(directory: Path, *, expected_base_ref: str | None = None) -
                 raise ValueError("MoLE v4 expert manifest has an invalid byte count")
             if not isinstance(checksum, str) or len(checksum) != 64:
                 raise ValueError("MoLE v4 expert manifest has no valid SHA-256 digest")
+    if version == 5:
+        mole_cfg = MoLEConfig.from_dict(payload["config"])
+        if not mole_cfg.identity_expert:
+            raise ValueError("MoLE v5 artifact must enable its Soft LoRA identity route")
     return payload
 
 

@@ -17,5 +17,24 @@ class Adapter:
     def extract(self, path: Path) -> Iterator[Doc]:
         raise NotImplementedError
 
+    def estimated_records(self, path: Path) -> int | None:
+        """Return a cheap record-count estimate when the container provides one."""
+
+        return None
+
+    def _reset_issues(self) -> None:
+        self._extraction_issues: list[tuple[str, str, str]] = []
+
+    def _record_issue(self, locator: str, reason_code: str, detail: str) -> None:
+        if not hasattr(self, "_extraction_issues"):
+            self._reset_issues()
+        self._extraction_issues.append((locator, reason_code, detail[:2000]))
+
+    def drain_issues(self) -> list[tuple[str, str, str]]:
+        issues = list(getattr(self, "_extraction_issues", ()))
+        self._extraction_issues = []
+        return issues
+
     def _read_text(self, path: Path) -> str:
-        return path.read_text("utf-8", errors="ignore")
+        text = path.read_text("utf-8", errors="ignore").removeprefix("\ufeff")
+        return text.replace("\r\n", "\n").replace("\r", "\n")

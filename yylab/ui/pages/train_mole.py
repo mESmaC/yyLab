@@ -19,6 +19,7 @@ from ..shell import ACCENT, panel, shell
 
 FIXED_ROUTING_MODE = "fixed_top_k"
 ADAPTIVE_ROUTING_MODE = "adaptive_surprise"
+SOFT_LORA_ROUTING_MODE = "soft_lora_identity"
 
 
 def _adaptive_ui_config(
@@ -65,6 +66,11 @@ def _routing_run_fields(mode: str, adaptive: dict | None = None) -> dict:
 
     if mode == FIXED_ROUTING_MODE:
         return {"training_strategy": "joint_per_token_v1"}
+    if mode == SOFT_LORA_ROUTING_MODE:
+        return {
+            "training_strategy": "joint_soft_lora_identity_v1",
+            "identity_expert": True,
+        }
     if mode != ADAPTIVE_ROUTING_MODE:
         raise ValueError(f"unknown MoLE routing mode: {mode}")
     resolved = AdaptiveOccupancyConfig.from_dict(adaptive)
@@ -301,18 +307,36 @@ def render_plan(
             ui.label(f"· {n}").classes("text-xs text-gray-400")
 
 
+def _corpus_option_label(corpus: dict) -> str:
+    stats = orjson.loads(corpus.get("stats_json") or b"{}")
+    doms = stats.get("domains", {})
+    top = ""
+    if doms:
+        top = max(doms.items(), key=lambda item: item[1].get("chars", 0))[0]
+    cdas = stats.get("cdas") or {}
+    profile = str((stats.get("ingest_config") or {}).get("selection_profile") or "")
+    kind = str(corpus.get("kind") or "ingested")
+    verdict = str(corpus.get("verdict") or "")
+    if cdas:
+        lineage = f"CDAS {profile or 'catalogued'}"
+    elif kind == "approved":
+        lineage = "approved store; no CDAS audit"
+    elif verdict == "approved":
+        lineage = "legacy reviewed; no CDAS audit"
+    else:
+        lineage = "legacy unreviewed; no CDAS audit"
+    details = "; ".join(value for value in (top, lineage) if value)
+    return f"{corpus['name']} [{details}]" if details else str(corpus["name"])
+
+
 def corpus_options() -> dict[str, str]:
     out = {}
     for c in db.q(
-        "SELECT id, name, stats_json FROM corpora WHERE status='ready'"
-        " AND COALESCE(kind,'ingested') != 'rejected' ORDER BY name"
+        "SELECT id, name, kind, verdict, stats_json FROM corpora WHERE status='ready'"
+        " AND COALESCE(kind,'ingested') != 'rejected'"
+        " AND COALESCE(verdict,'') != 'rejected' ORDER BY name"
     ):
-        stats = orjson.loads(c["stats_json"] or b"{}")
-        doms = stats.get("domains", {})
-        top = ""
-        if doms:
-            top = max(doms.items(), key=lambda kv: kv[1].get("chars", 0))[0]
-        out[c["id"]] = f"{c['name']}" + (f" [{top}]" if top else "")
+        out[c["id"]] = _corpus_option_label(c)
     return out
 
 
@@ -436,12 +460,17 @@ def train_mole_page():
                         {
                             FIXED_ROUTING_MODE: "Legacy fixed top-K",
                             ADAPTIVE_ROUTING_MODE: "Adaptive surprise occupancy (recommended)",
+                            SOFT_LORA_ROUTING_MODE: "Soft LoRA + identity bypass",
                         },
                         value=ADAPTIVE_ROUTING_MODE,
                         label="Routing policy",
                     )
                     .props("dense outlined")
                     .classes("w-full")
+                )
+                hint(
+                    "Soft LoRA adds one parameter-free identity route to the learned token gate. "
+                    "Selecting it applies no adapter delta; set K to all routes for a dense soft mixture."
                 )
                 with field_grid(3):
                     n_exp = (
@@ -775,10 +804,16 @@ def train_mole_page():
                 return
             experts = int(n_exp.value or 1)
             expert_rank = int(rank.value or 1)
-            active = min(int(top_k.value or 1), experts)
+            soft_identity = routing_mode.value == SOFT_LORA_ROUTING_MODE
+            active = min(int(top_k.value or 1), experts + int(soft_identity))
+            identity_note = (
+                " The additional identity route contributes zero delta, so tokens can keep the frozen base output."
+                if soft_identity
+                else ""
+            )
             capacity_lbl.text = (
-                f"Total adapter width E×r = {experts * expert_rank}; active routed rank/token "
-                f"K×r = {active * expert_rank}. E8/r8 and E4/r16 have equal parameter/GEMM width."
+                f"Total adapter width E×r = {experts * expert_rank}; active routes/token K={active}. "
+                f"E8/r8 and E4/r16 have equal adapter width.{identity_note}"
             )
 
         def update_quant_visibility() -> None:
@@ -814,8 +849,11 @@ def train_mole_page():
                 problems.append("choose a checkpoint")
             if not corp_sel.value:
                 problems.append("choose corpora")
-            if routing_mode.value == FIXED_ROUTING_MODE and int(top_k.value or 1) > int(n_exp.value or 1):
-                problems.append("top-K must be ≤ number of experts")
+            route_count = int(n_exp.value or 1) + int(
+                routing_mode.value == SOFT_LORA_ROUTING_MODE
+            )
+            if routing_mode.value != ADAPTIVE_ROUTING_MODE and int(top_k.value or 1) > route_count:
+                problems.append("top-K must be ≤ number of adapter and identity routes")
             if not targets.value:
                 problems.append("choose target modules")
             try:
@@ -902,6 +940,7 @@ def train_mole_page():
                 "method": m_resolved,
                 "quant": q_resolved,
                 "router_type": "per_token",
+                "identity_expert": routing_mode.value == SOFT_LORA_ROUTING_MODE,
                 "num_experts": int(n_exp.value or 8),
                 "rank": int(rank.value or 8),
                 "alpha": None,
@@ -938,7 +977,7 @@ def train_mole_page():
             pid = launch_worker(rid)
             db.execute("UPDATE runs SET metrics_json=? WHERE id=?", (json.dumps({"pid": pid}), rid))
             ui.notify(
-                f"{'Adaptive surprise' if routing_mode.value == ADAPTIVE_ROUTING_MODE else 'Joint per-token'} "
+                f"{('Adaptive surprise' if routing_mode.value == ADAPTIVE_ROUTING_MODE else ('Soft LoRA identity' if routing_mode.value == SOFT_LORA_ROUTING_MODE else 'Joint per-token'))} "
                 f"MoLE training started — {name} (~{max_steps} steps, pid {pid}). See Runs.",
                 type="positive",
             )

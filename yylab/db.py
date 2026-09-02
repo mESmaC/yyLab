@@ -70,6 +70,20 @@ CREATE TABLE IF NOT EXISTS routers(
   status TEXT DEFAULT 'untrained',
   meta_json TEXT DEFAULT '{}'
 );
+CREATE TABLE IF NOT EXISTS tokenizers(
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  kind TEXT NOT NULL DEFAULT 'byte_bpe',
+  vocab_size INTEGER DEFAULT 0,
+  path TEXT DEFAULT '',
+  corpora_json TEXT DEFAULT '[]',
+  splits_json TEXT DEFAULT '[]',
+  config_json TEXT DEFAULT '{}',
+  stats_json TEXT DEFAULT '{}',
+  error TEXT DEFAULT ''
+);
 CREATE TABLE IF NOT EXISTS runs(
   id TEXT PRIMARY KEY,
   kind TEXT NOT NULL,

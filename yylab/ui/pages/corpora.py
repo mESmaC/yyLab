@@ -28,6 +28,26 @@ def _domain_tokens(stats: dict, tok: str) -> dict[str, int]:
     return out
 
 
+def curated_library_ingest_config(*, path: str, name: str) -> IngestConfig:
+    """Fast path for datasets that are already published as curated corpora.
+
+    The library browser is intentionally preservation-oriented. Expensive
+    heuristic cleaning remains available from the explicit ingest dialog.
+    """
+
+    return IngestConfig(
+        name=name,
+        source_dir=path,
+        near_dedup=False,
+        global_dedup=True,
+        language_filter=False,
+        quality_filter=False,
+        tokenizer_keys=[],
+        selection_profile="dataset",
+        max_file_mb=0,
+    )
+
+
 @ui.page("/corpora")
 def corpora_page():
     state: dict = {"job": None, "selected": None, "tok": "gpt2"}
@@ -55,7 +75,7 @@ def corpora_page():
             if state["job"]:
                 ui.notify("An ingest job is already running", type="warning")
                 return
-            cfg = IngestConfig(name=name, source_dir=path, tokenizer_keys=[])
+            cfg = curated_library_ingest_config(path=path, name=name)
             state["job"] = JOBS.submit("ingest", run_ingest, cfg)
             progress_row.visible = True
             plabel.text = f"queued · {name}"
@@ -88,6 +108,11 @@ def corpora_page():
                     return
                 known = ingested_by_source()
                 ui.label(f"{len(folders)} dataset folders").classes("text-xs text-gray-500 mt-1")
+                hint(
+                    "Fast ingest preserves dataset records, inventories provenance, and excludes obvious "
+                    "dataset sidecars (README/license/config/CSS/SVG/XML). Use Ingest folder to change "
+                    "the asset policy or enable language, quality, and MinHash cleaning."
+                )
                 for f in folders:
                     ing = known.get(f.path)
                     busy = state["job"] is not None
@@ -99,13 +124,13 @@ def corpora_page():
                         if ing:
                             status_badge(ing["status"])
                         elif busy:
-                            ui.button("Ingest", on_click=lambda p=f.path, n=f.name: start_library_ingest(p, n)).props(
+                            ui.button("Fast ingest", on_click=lambda p=f.path, n=f.name: start_library_ingest(p, n)).props(
                                 "dense no-caps outline"
-                            ).classes("w-24").set_enabled(False)
+                            ).classes("w-28").set_enabled(False)
                         else:
-                            ui.button("Ingest", on_click=lambda p=f.path, n=f.name: start_library_ingest(p, n)).props(
+                            ui.button("Fast ingest", on_click=lambda p=f.path, n=f.name: start_library_ingest(p, n)).props(
                                 "dense no-caps outline"
-                            ).classes("w-24")
+                            ).classes("w-28")
 
         def corpus_rows() -> list[dict]:
             rows = []
@@ -226,6 +251,11 @@ def corpora_page():
                     stat_card("On disk", fmt_bytes(stats.get("bytes_on_disk", 0)))
                     stat_card("Exact dupes", f'{stats.get("exact_dupes_local", 0) + stats.get("exact_dupes_global", 0):,}')
                     stat_card("Near dupes", f'{stats.get("near_dupes", 0):,}')
+                    if stats.get("near_duplicate_candidates"):
+                        stat_card(
+                            "Near-match evidence",
+                            f'{stats["near_duplicate_candidates"]:,}',
+                        )
                     stat_card("Filtered", f'{stats.get("filtered", 0):,}')
                     if stats.get("non_english_docs"):
                         stat_card("Non-English", f'{stats["non_english_docs"]:,}')
@@ -233,6 +263,34 @@ def corpora_page():
                         stat_card("Quarantined", f'{stats["quarantined_docs"]:,}')
                     if stats.get("rejected_known_bad"):
                         stat_card("Known-bad blocked", f'{stats["rejected_known_bad"]:,}')
+                    if stats.get("assets_policy_skipped"):
+                        stat_card("Assets policy-skipped", f'{stats["assets_policy_skipped"]:,}')
+                    if stats.get("docs_policy_skipped"):
+                        stat_card("Records policy-skipped", f'{stats["docs_policy_skipped"]:,}')
+                    if stats.get("split_leakage_dupes"):
+                        stat_card("Cross-split dupes", f'{stats["split_leakage_dupes"]:,}')
+                    if stats.get("duplicate_sample_ids"):
+                        stat_card("Duplicate sample IDs", f'{stats["duplicate_sample_ids"]:,}')
+                    if stats.get("records_failed"):
+                        stat_card("Malformed records", f'{stats["records_failed"]:,}')
+                cdas = stats.get("cdas") or {}
+                if cdas:
+                    compatibility_changes = int(cdas.get("compatibility_fold_would_change_docs") or 0)
+                    ui.label(
+                        f"CDAS inventory: {int(cdas.get('assets') or 0):,} assets · "
+                        f"{int(cdas.get('documents') or 0):,} document decisions · "
+                        f"{int(cdas.get('issues') or 0):,} issues · semantic text preserved"
+                    ).classes("text-xs text-teal-300 mt-1")
+                    if compatibility_changes:
+                        ui.label(
+                            f"NFKC would have changed {compatibility_changes:,} documents; yyLab kept NFC text."
+                        ).classes("text-xs text-amber-400")
+                    kept_roles = cdas.get("kept_role_counts") or {}
+                    if kept_roles:
+                        top_roles = sorted(kept_roles.items(), key=lambda item: -item[1])[:6]
+                        ui.label(
+                            "Kept roles: " + ", ".join(f"{name} ({count:,})" for name, count in top_roles)
+                        ).classes("text-xs text-gray-500")
                 langs = stats.get("langs") or {}
                 if langs:
                     top = sorted(langs.items(), key=lambda kv: -kv[1])[:4]
@@ -370,9 +428,44 @@ def corpora_page():
             with ui.row().classes("w-full gap-6"):
                 nd_chk = ui.checkbox("Near-duplicate removal (MinHash)", value=True)
                 gd_chk = ui.checkbox("Global exact dedup", value=True)
+            hint(
+                "MinHash is a full-corpus CPU and memory pass. Leave it off for published datasets "
+                "that already document near-duplicate removal."
+            )
             with ui.row().classes("w-full gap-6"):
                 lang_chk = ui.checkbox("English-only (non-English kept in side bucket)", value=True)
                 qual_chk = ui.checkbox("Quality quarantine (score < 0.35)", value=True)
+            profile_select = ui.select(
+                {
+                    "dataset": "Dataset (exclude metadata + web/config sidecars)",
+                    "repository": "Repository (keep docs/config/web source)",
+                    "strict": "Strict dataset (also reject repetition/boilerplate)",
+                    "preserve": "Preserve all supported assets",
+                },
+                value="dataset",
+                label="CDAS asset selection profile",
+            ).props("dense outlined").classes("w-full")
+            hint(
+                "The asset profile runs before extraction, so large SVG/CSS/XML trees never reach "
+                "tokenization. Every observed asset and decision is retained in inventory.sqlite3."
+            )
+            with ui.expansion("Advanced path policy", icon="filter_alt").classes("w-full"):
+                include_path_in = ui.input(
+                    "Include path regex (optional)", placeholder=r"(?:train|papers)/"
+                ).props("dense outlined").classes("w-full")
+                exclude_path_in = ui.input(
+                    "Exclude path regex (optional)", placeholder=r"(?:generated|assets)/"
+                ).props("dense outlined").classes("w-full")
+                max_file_mb_in = ui.number(
+                    "Maximum asset MiB (0 = unlimited)",
+                    value=300,
+                    min=0,
+                    step=64,
+                ).props("dense outlined").classes("w-full")
+                hint(
+                    "Oversized assets remain visible in the CDAS inventory with an explicit "
+                    "excluded-by-limit decision. Curated-library fast ingest is unlimited."
+                )
             tok_multi = ui.select(
                 SPEC_LABELS, multiple=True, value=list(SPEC_KEYS), label="Tokenizers for stats"
             ).props("dense outlined use-chips").classes("w-full")
@@ -396,6 +489,10 @@ def corpora_page():
                         language_filter=bool(lang_chk.value),
                         quality_filter=bool(qual_chk.value),
                         tokenizer_keys=list(tok_multi.value or []),
+                        selection_profile=str(profile_select.value or "dataset"),
+                        include_path_regex=(include_path_in.value or "").strip(),
+                        exclude_path_regex=(exclude_path_in.value or "").strip(),
+                        max_file_mb=float(max_file_mb_in.value or 0),
                     )
                     state["job"] = JOBS.submit("ingest", run_ingest, cfg)
                     progress_row.visible = True

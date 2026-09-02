@@ -11,6 +11,7 @@ from ...artifacts import run_dir
 from ...benchmark.models import BenchmarkSuite, load_suite
 from ...hw import best_gpu
 from ...infer.engine import ENGINE
+from ...models.families import checkpoint_family
 from ...workers.launch import launch_worker
 from ..components import empty_state, field_grid, form_section, hint, status_badge
 from ..shell import ACCENT, panel, shell, stat_card
@@ -51,6 +52,8 @@ def _json_object(value: str | bytes | None) -> dict[str, Any]:
 
 
 def _resolve_quant(checkpoint: dict, requested: str, adapter: dict | None = None) -> str:
+    if checkpoint_family(checkpoint) == "spalmer":
+        return "checkpoint"
     if adapter and adapter.get("quant"):
         return str(adapter["quant"])
     if checkpoint.get("quant_locked"):
@@ -77,6 +80,7 @@ def _quality_job_config(
     limit: int | None = None,
     baseline_run_id: str | None = None,
     max_new_tokens: int | None = None,
+    prompt_mode: str = "chat",
     enable_thinking: bool = False,
     max_thinking_tokens: int = 1024,
     context_mode: str = "native",
@@ -86,11 +90,17 @@ def _quality_job_config(
 
     if context_mode not in QUALITY_CONTEXT_MODES:
         raise ValueError(f"unknown benchmark context mode: {context_mode}")
+    prompt_mode = str(prompt_mode or "chat").strip().casefold()
+    if prompt_mode not in {"chat", "raw"}:
+        raise ValueError(f"unknown benchmark prompt mode: {prompt_mode}")
+    if prompt_mode == "raw" and enable_thinking:
+        raise ValueError("thinking requires chat prompt mode")
     rope_scaling, rope_factor, max_context_tokens = QUALITY_CONTEXT_MODES[context_mode]
 
     return {
         "checkpoint_id": checkpoint["id"],
         "checkpoint_ref": checkpoint["ref"],
+        "model_family": checkpoint_family(checkpoint),
         "quant": quant,
         # Deliberately not named adapter_id: generic training failure cleanup
         # must never mutate an already-trained benchmark subject.
@@ -106,6 +116,7 @@ def _quality_job_config(
         "limit": limit,
         "baseline_run_id": baseline_run_id,
         "max_new_tokens": max_new_tokens,
+        "prompt_mode": prompt_mode,
         "enable_thinking": enable_thinking,
         "max_thinking_tokens": max_thinking_tokens,
         "context_mode": context_mode,
@@ -259,6 +270,7 @@ def _progress_text(run: dict) -> str:
 
 
 def _quality_contract_text(config: dict[str, Any]) -> str:
+    prompt_mode = str(config.get("prompt_mode") or "chat").replace("_", " ")
     answer = config.get("max_new_tokens")
     answer_text = str(int(answer)) if isinstance(answer, (int, float)) and answer else "suite"
     if config.get("enable_thinking"):
@@ -270,7 +282,7 @@ def _quality_contract_text(config: dict[str, Any]) -> str:
     else:
         thinking_text = "no-think"
     context = str(config.get("context_mode") or "native").replace("_", " ")
-    return f"answer {answer_text} · {thinking_text} · {context}"
+    return f"{prompt_mode} · answer {answer_text} · {thinking_text} · {context}"
 
 
 def _history_rows() -> list[dict[str, Any]]:
@@ -690,15 +702,28 @@ def benchmarks_page() -> None:
                             .classes("w-full")
                         )
                     forced_expert.visible = False
-                    categories = (
-                        ui.select(
-                            suite.category_labels,
-                            label="Categories (all when empty)",
-                            multiple=True,
+                    with field_grid(2):
+                        prompt_mode = (
+                            ui.select(
+                                {
+                                    "chat": "Chat template",
+                                    "raw": "Raw text completion",
+                                },
+                                value="chat",
+                                label="Prompt format",
+                            )
+                            .props("dense outlined")
+                            .classes("w-full")
                         )
-                        .props("dense outlined use-chips")
-                        .classes("w-full")
-                    )
+                        categories = (
+                            ui.select(
+                                suite.category_labels,
+                                label="Categories (all when empty)",
+                                multiple=True,
+                            )
+                            .props("dense outlined use-chips")
+                            .classes("w-full")
+                        )
                     with field_grid(3):
                         repetitions = (
                             ui.number("Repetitions", value=1, min=1, max=20, step=1)
@@ -766,7 +791,8 @@ def benchmarks_page() -> None:
                         enable_thinking = ui.checkbox("Enable thinking", value=False)
                         continue_errors = ui.checkbox("Continue after individual case errors", value=True)
                     hint(
-                        "Thinking stays off by default for frozen-suite compatibility. "
+                        "Use raw completion for base-pretrained models with no chat protocol. "
+                        "Thinking requires chat mode and stays off by default for frozen-suite compatibility. "
                         "When enabled, its separate budget never reduces the final-answer limit; "
                         "yyLab uses Qwen's seeded thinking-mode sampling controls. Native context "
                         "is best for short cases; select YaRN only when the combined budgets need it."
@@ -927,7 +953,9 @@ def benchmarks_page() -> None:
 
         def refresh_quality_adapters(_event=None) -> None:
             options = {"": "(none)"}
-            if quality_ckpt.value:
+            selected_checkpoint = checkpoint(quality_ckpt.value)
+            spalmer = checkpoint_family(selected_checkpoint) == "spalmer"
+            if quality_ckpt.value and not spalmer:
                 for row in db.q(
                     "SELECT * FROM adapters WHERE checkpoint_id=? AND status='trained' "
                     "ORDER BY created_at DESC",
@@ -937,10 +965,44 @@ def benchmarks_page() -> None:
             quality_adapter.options = options
             quality_adapter.value = ""
             quality_adapter.update()
+            if spalmer:
+                quality_adapter.disable()
+                quality_quant.disable()
+                quality_quant.set_value("auto")
+                prompt_mode.set_value("raw")
+                context_mode.set_value("native")
+                context_mode.disable()
+                policy.options = {
+                    "base": "Fixed learned route",
+                    "dynamic": "Native adaptive residency (2–20 experts)",
+                }
+                if policy.value not in policy.options:
+                    policy.set_value("dynamic")
+            else:
+                quality_adapter.enable()
+                quality_quant.enable()
+                prompt_mode.set_value("chat")
+                context_mode.enable()
+                policy.options = {
+                    "base": "Base only",
+                    "adapter": "Adapter (LoRA / default route)",
+                    "dynamic": "Learned per-token routing",
+                    "matrix": "Base + dynamic + every expert",
+                    "expert": "One forced expert",
+                }
+            policy.update()
+            update_quality_controls()
 
         def update_quality_controls(_event=None) -> None:
             forced_expert.visible = policy.value == "expert"
-            thinking_budget.visible = bool(enable_thinking.value)
+            raw_prompt = str(prompt_mode.value or "chat") == "raw"
+            if raw_prompt:
+                if enable_thinking.value:
+                    enable_thinking.set_value(False)
+                enable_thinking.disable()
+            else:
+                enable_thinking.enable()
+            thinking_budget.visible = bool(enable_thinking.value) and not raw_prompt
             selected_adapter = adapter(quality_adapter.value)
             max_expert = max(0, int((selected_adapter or {}).get("num_experts") or 1) - 1)
             forced_expert.set_value(min(int(forced_expert.value or 0), max_expert))
@@ -964,11 +1026,16 @@ def benchmarks_page() -> None:
             ckpt = checkpoint(quality_ckpt.value)
             selected_adapter = adapter(quality_adapter.value)
             selected_policy = str(policy.value or "dynamic")
+            spalmer = checkpoint_family(ckpt) == "spalmer"
             problems = []
             if not ckpt:
                 problems.append("choose a checkpoint")
-            if selected_policy != "base" and not selected_adapter:
+            if selected_policy != "base" and not selected_adapter and not spalmer:
                 problems.append("choose an adapter for this policy")
+            if spalmer and selected_policy not in {"base", "dynamic"}:
+                problems.append("SPALMER supports base or native dynamic residency")
+            if str(prompt_mode.value or "chat") == "raw" and enable_thinking.value:
+                problems.append("thinking requires chat prompt mode")
             if (
                 selected_policy in {"dynamic", "matrix", "expert"}
                 and selected_adapter
@@ -996,6 +1063,7 @@ def benchmarks_page() -> None:
                 limit=int(case_limit.value) if int(case_limit.value or 0) > 0 else None,
                 baseline_run_id=str(baseline.value) if baseline.value else None,
                 max_new_tokens=int(max_new.value) if int(max_new.value or 0) > 0 else None,
+                prompt_mode=str(prompt_mode.value or "chat"),
                 enable_thinking=bool(enable_thinking.value),
                 max_thinking_tokens=int(thinking_budget.value or 1024),
                 context_mode=str(context_mode.value or "native"),
@@ -1015,6 +1083,11 @@ def benchmarks_page() -> None:
             problems = []
             if not ckpt:
                 problems.append("choose a checkpoint")
+            elif checkpoint_family(ckpt) == "spalmer":
+                problems.append(
+                    "the current synthetic training benchmark is HF-MoLE-specific; "
+                    "use quality benchmarking for SPALMER"
+                )
             if int(perf_top_k.value or 1) > int(perf_experts.value or 1):
                 problems.append("top-K must be ≤ experts")
             if not perf_targets.value:
@@ -1061,6 +1134,7 @@ def benchmarks_page() -> None:
             categories,
             repetitions,
             case_limit,
+            prompt_mode,
             enable_thinking,
         ):
             control.on_value_change(update_quality_controls)

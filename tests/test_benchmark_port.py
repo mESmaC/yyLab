@@ -488,6 +488,49 @@ def test_benchmark_prompt_format_fails_when_thinking_control_is_unsupported() ->
         )
 
 
+def test_benchmark_raw_prompt_uses_plain_message_content_without_role_tokens() -> None:
+    class Tokenizer:
+        def apply_chat_template(self, *_args, **_kwargs):
+            raise AssertionError("raw mode must not use a chat template")
+
+    messages = [
+        {"role": "system", "content": "Answer precisely."},
+        {"role": "user", "content": "What is 2 + 2?"},
+    ]
+
+    assert _format_messages(Tokenizer(), messages, False, "raw") == ("Answer precisely.\n\nWhat is 2 + 2?")
+    with pytest.raises(ValueError, match="thinking requires chat"):
+        _format_messages(Tokenizer(), messages, True, "raw")
+
+
+def test_benchmark_backend_honors_declared_model_family(tmp_path: Path) -> None:
+    misleading = tmp_path / "looks-like-spalmer.pt"
+    misleading.write_bytes(b"not loaded by this test")
+
+    backend = YyLabBenchmarkBackend(
+        checkpoint_ref=str(misleading),
+        quant="bf16",
+        adapter_path=None,
+        adapter_arch="",
+        model_family="hf",
+    )
+
+    assert backend.model_family == "hf"
+    assert backend.identity()["model_family"] == "hf"
+
+    class Engine:
+        def __init__(self) -> None:
+            self.specs = []
+
+        def load(self, spec):
+            self.specs.append(spec)
+            return []
+
+    backend.engine = Engine()
+    backend.configure_policy("base")
+    assert backend.engine.specs[0].model_family == "hf"
+
+
 @pytest.mark.parametrize(
     ("values", "prompt_open", "expected"),
     [
@@ -791,6 +834,15 @@ def test_quality_policy_plan_rejects_missing_or_out_of_range_experts() -> None:
         )
 
 
+def test_spalmer_quality_policies_use_native_expert_bank_without_adapter() -> None:
+    base = {"model_family": "spalmer", "checkpoint_ref": "checkpoint.pt"}
+
+    assert policies_for_config({**base, "policy": "base"}) == ["base"]
+    assert policies_for_config({**base, "policy": "dynamic"}) == ["dynamic"]
+    with pytest.raises(ValueError, match="base or native dynamic"):
+        policies_for_config({**base, "policy": "matrix"})
+
+
 def _quality_record(
     *,
     policy: str,
@@ -1092,7 +1144,9 @@ def test_disabled_thinking_budget_is_a_noop_for_workload_and_legacy_comparison()
     legacy = json.loads(json.dumps(first))
     for cell in legacy["cells"]:
         cell["request"].pop("max_thinking_tokens")
+        cell["request"].pop("prompt_mode")
     legacy.pop("runtime_context_limit")
+    legacy.pop("prompt_mode")
     legacy.pop("context_mode")
     legacy.pop("rope_scaling")
     legacy.pop("rope_factor")

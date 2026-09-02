@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import math
 import traceback
 from pathlib import Path
 
@@ -34,23 +35,31 @@ from ..mole.store import (
     save_isolated_expert,
     save_mole,
 )
+from ..tokenizer_registry import get_tokenizer, resolve_tokenizer_artifact
 from ..train.base_config import (
     BASE_RECIPE_VERSION,
     ScratchModelSpec,
     build_hf_config,
     estimate_parameter_count,
+    normalize_training_token_budget,
 )
+from ..train.compact_tokenizer import CompactTokenizerSpec, train_compact_tokenizer
 from ..train.data import (
     CORPUS_MIX_CONCATENATE,
+    CORPUS_MIX_TOKEN_BALANCED,
     DEFAULT_TEXT_CHUNK_CHARS,
+    OBJECTIVE_CHAT_SFT,
+    ChatSFTBatches,
     ExpertDataPlan,
     PackedBatches,
     allocate_expert_steps,
-    corpus_data_provenance,
+    corpus_training_preflight,
     estimate_steps,
     iter_corpus_docs,
     normalize_corpus_ids,
     normalize_corpus_mix,
+    normalize_source_splits,
+    normalize_training_objective,
     plan_expert_data,
 )
 from ..train.loop import LoopOpts, make_optimizer, train_loop
@@ -126,7 +135,7 @@ def mark_training_artifacts_failed(run_kind: str, cfg: dict) -> None:
         db.execute("UPDATE adapters SET status='failed' WHERE id=?", (cfg["adapter_id"],))
     if run_kind == "router_stage2" and cfg.get("router_id"):
         db.execute("UPDATE routers SET status='failed' WHERE id=?", (cfg["router_id"],))
-    if run_kind == "base" and cfg.get("out_checkpoint_id"):
+    if run_kind in {"base", "spalmer_base"} and cfg.get("out_checkpoint_id"):
         # The failed run remains the durable error record. Do not leave a
         # phantom checkpoint selectable as a training or inference input.
         db.execute(
@@ -135,10 +144,10 @@ def mark_training_artifacts_failed(run_kind: str, cfg: dict) -> None:
         )
 
 
-def load_base(ref: str, quant: str):
+def load_base(ref: str, quant: str, **load_options):
     from ..models.loading import load_base as _load_base
 
-    model, tokenizer, cuda, quant, notes = _load_base(ref, quant)
+    model, tokenizer, cuda, quant, notes = _load_base(ref, quant, **load_options)
     model.config.use_cache = False
     return model, tokenizer, cuda, quant, notes
 
@@ -153,6 +162,24 @@ def normalize_base_data_config(cfg: dict) -> dict:
     corpora = normalize_corpus_ids(raw_corpora)
     if not corpora:
         raise ValueError("base training requires at least one corpus")
+    for corpus_id in corpora:
+        corpus = db.q1(
+            "SELECT name,status,kind,verdict FROM corpora WHERE id=?",
+            (corpus_id,),
+        )
+        if not corpus:
+            raise ValueError(f"base training corpus does not exist: {corpus_id!r}")
+        if str(corpus.get("kind") or "").casefold() == "rejected" or str(
+            corpus.get("verdict") or ""
+        ).casefold() == "rejected":
+            raise ValueError(
+                f"base training refuses rejected corpus {corpus.get('name') or corpus_id!r}"
+            )
+        if str(corpus.get("status") or "") != "ready":
+            raise ValueError(
+                f"base training requires ready corpora; {corpus.get('name') or corpus_id!r} "
+                f"is {corpus.get('status') or 'unknown'}"
+            )
 
     raw_domains = resolved.get("domains")
     if isinstance(raw_domains, str):
@@ -167,8 +194,55 @@ def normalize_base_data_config(cfg: dict) -> dict:
 
     resolved["corpora"] = corpora
     resolved["domains"] = domains or None
+    raw_splits = resolved.get("splits")
+    if raw_splits is None:
+        raw_splits = resolved.get("source_splits")
+    resolved["splits"] = normalize_source_splits(raw_splits) or None
     resolved["corpus_mix"] = normalize_corpus_mix(resolved.get("corpus_mix"))
+    resolved["cross_corpus_dedup"] = bool(resolved.get("cross_corpus_dedup", True))
+    raw_weights = resolved.get("corpus_weights") or {}
+    if not isinstance(raw_weights, dict):
+        raise ValueError("corpus_weights must be an object keyed by corpus ID")
+    normalized_weights: dict[str, float] = {}
+    for corpus_id, weight in raw_weights.items():
+        corpus_id = str(corpus_id)
+        parsed_weight = float(weight)
+        if corpus_id not in corpora:
+            raise ValueError(f"corpus weight references an unselected corpus: {corpus_id!r}")
+        if not math.isfinite(parsed_weight) or parsed_weight <= 0:
+            raise ValueError("corpus weights must be finite and positive")
+        normalized_weights[corpus_id] = parsed_weight
+    resolved["corpus_weights"] = normalized_weights
+    raw_source_cap = resolved.get("source_max_ratio")
+    if raw_source_cap is None or raw_source_cap == "":
+        resolved["source_max_ratio"] = None
+    else:
+        parsed_source_cap = float(raw_source_cap)
+        if not math.isfinite(parsed_source_cap) or not 0 <= parsed_source_cap <= 1:
+            raise ValueError("source_max_ratio must be 0 or a finite value in (0, 1]")
+        resolved["source_max_ratio"] = parsed_source_cap or None
+    if resolved["corpus_mix"] != CORPUS_MIX_TOKEN_BALANCED and (
+        resolved["corpus_weights"] or resolved["source_max_ratio"] is not None
+    ):
+        raise ValueError("corpus weights and source_max_ratio require token-balanced mixing")
+    if len(corpora) < 2:
+        resolved["source_max_ratio"] = None
+    elif (
+        resolved["source_max_ratio"] is not None
+        and resolved["source_max_ratio"] < 1 / len(corpora)
+    ):
+        raise ValueError(
+            "source_max_ratio is smaller than the minimum feasible equal share "
+            f"({1 / len(corpora):.3f})"
+        )
+    resolved["objective"] = normalize_training_objective(resolved.get("objective"))
     return resolved
+
+
+def normalize_base_worker_config(cfg: dict) -> dict:
+    """Normalize base data and re-derive any explicit token-budget step cap."""
+
+    return normalize_training_token_budget(normalize_base_data_config(cfg))
 
 
 def build_batches(
@@ -179,7 +253,7 @@ def build_batches(
     domains: list[str] | None = None,
     shard_index: int | None = None,
     num_shards: int | None = None,
-) -> PackedBatches:
+) -> PackedBatches | ChatSFTBatches:
     selected_domains = domains if domains is not None else cfg.get("domains") or None
 
     def docs():
@@ -193,7 +267,21 @@ def build_batches(
                 shard_index=shard_index,
                 num_shards=num_shards,
                 corpus_mix=cfg.get("corpus_mix", CORPUS_MIX_CONCATENATE),
+                splits=cfg.get("splits"),
+                cross_corpus_dedup=bool(cfg.get("cross_corpus_dedup", True)),
+                corpus_weights=cfg.get("corpus_weights") or None,
+                source_max_ratio=cfg.get("source_max_ratio"),
+                annotate_source=True,
             )
+
+    if normalize_training_objective(cfg.get("objective")) == OBJECTIVE_CHAT_SFT:
+        return ChatSFTBatches(
+            docs(),
+            tokenizer,
+            seq_len=cfg["seq_len"],
+            micro_batch=cfg["micro_batch"],
+            max_batches=max_steps * cfg["grad_accum"],
+        )
 
     def tokenize(texts: list[str]) -> list[list[int]]:
         # PackedBatches slices these raw encodings to cfg["seq_len"] before
@@ -217,6 +305,75 @@ def build_batches(
         tokenize_chunk=int(cfg.get("tokenize_chunk", 8)),
         max_text_chars=int(cfg.get("max_text_chars", DEFAULT_TEXT_CHUNK_CHARS)),
     )
+
+
+def tokenized_view_manifest(
+    batches: PackedBatches | ChatSFTBatches,
+    result: dict,
+    *,
+    objective: str,
+    sequence_length: int,
+) -> dict:
+    """Reconcile source rendering, packing, and model-facing token exposure."""
+
+    stats_fn = getattr(batches, "data_stats", None)
+    batcher = stats_fn() if callable(stats_fn) else {}
+    tokens = dict(batcher.get("tokens") or {})
+    tokens.update(
+        {
+            "forwarded_model_slots": int(result.get("forwarded_model_tokens", 0)),
+            "forwarded_real_inputs": int(result.get("forwarded_real_tokens", 0)),
+            "padding_inputs": int(result.get("padding_tokens", 0)),
+            "model_target_slots": int(result.get("model_target_slots", 0)),
+            "optimizer_supervised_targets": int(result.get("supervised_tokens", 0)),
+            "ignored_target_slots": int(result.get("ignored_target_slots", 0)),
+        }
+    )
+    rendered = int(tokens.get("rendered_token_positions") or 0)
+    covered = int(tokens.get("covered_rendered_positions") or 0)
+    replay = int(tokens.get("packing_replay_inputs") or 0)
+    forwarded_real = int(tokens["forwarded_real_inputs"])
+    forwarded_model = int(tokens["forwarded_model_slots"])
+    padding = int(tokens["padding_inputs"])
+    target_slots = int(tokens["model_target_slots"])
+    supervised = int(tokens["optimizer_supervised_targets"])
+    ignored = int(tokens["ignored_target_slots"])
+    unforwarded = max(0, rendered - covered)
+    tokens["unforwarded_rendered_positions"] = unforwarded
+    reconciliation = {
+        "model_slots_equal_real_plus_padding": forwarded_model
+        == forwarded_real + padding,
+        "real_inputs_equal_covered_plus_replay": forwarded_real == covered + replay,
+        "rendered_equal_covered_plus_unforwarded": rendered == covered + unforwarded,
+        "targets_equal_supervised_plus_ignored": target_slots == supervised + ignored,
+    }
+    return {
+        "schema_version": 1,
+        "kind": "yylab_tokenized_training_view",
+        "objective": objective,
+        "sequence_length": int(sequence_length),
+        "documents": {
+            key: value
+            for key, value in batcher.items()
+            if key.endswith("docs") or key in {"docs_seen", "failure_reasons"}
+        },
+        "examples": {
+            "rendered": int(batcher.get("examples_rendered") or 0),
+            "sequences_forwarded": int(result.get("sequences_forwarded", 0)),
+            "unsupervised_sequences_skipped": int(
+                batcher.get("unsupervised_sequences_skipped") or 0
+            ),
+        },
+        "tokens": tokens,
+        "per_corpus": dict(batcher.get("per_corpus") or {}),
+        "reconciliation": reconciliation,
+        # Compact compatibility fields for older run/checkpoint consumers.
+        "docs_seen": int(batcher.get("docs_seen") or getattr(batches, "docs_seen", 0)),
+        "rendered_tokens": int(
+            batcher.get("rendered_tokens") or getattr(batches, "tokens_seen", 0)
+        ),
+        "optimizer_supervised_tokens": supervised,
+    }
 
 
 def loop_opts(
@@ -350,6 +507,7 @@ def _warmup_steps(total_steps: int) -> int:
 
 JOINT_PER_TOKEN_STRATEGY = "joint_per_token_v1"
 ADAPTIVE_SURPRISE_STRATEGY = "joint_adaptive_surprise_v1"
+SOFT_LORA_IDENTITY_STRATEGY = "joint_soft_lora_identity_v1"
 SEQUENTIAL_EXPERT_STRATEGY = "sequential_single_resident_v1"
 
 
@@ -365,6 +523,7 @@ def _mole_training_strategy(cfg: dict) -> str:
     if strategy not in {
         ADAPTIVE_SURPRISE_STRATEGY,
         JOINT_PER_TOKEN_STRATEGY,
+        SOFT_LORA_IDENTITY_STRATEGY,
         SEQUENTIAL_EXPERT_STRATEGY,
     }:
         raise ValueError(f"unknown MoLE training strategy: {strategy}")
@@ -399,6 +558,9 @@ def _run_mole_joint_per_token(
         torch.cuda.manual_seed_all(base_seed)
 
     adaptive_config = AdaptiveOccupancyConfig()
+    identity_expert = bool(cfg.get("identity_expert", False))
+    if adaptive and identity_expert:
+        raise ValueError("adaptive surprise and Soft LoRA identity routing cannot be combined")
     if adaptive:
         adaptive_payload = dict(cfg.get("adaptive") or {})
         adaptive_payload["enabled"] = True
@@ -409,7 +571,7 @@ def _run_mole_joint_per_token(
     )
     requested_rank = int(cfg.get("rank") or 8)
     requested_top_k = min(
-        requested_experts,
+        requested_experts + int(identity_expert),
         int(cfg.get("top_k") or adaptive_config.minimum_experts),
     )
     mole_cfg = MoLEConfig(
@@ -419,6 +581,7 @@ def _run_mole_joint_per_token(
         top_k=requested_top_k,
         target_modules=tuple(cfg["target_modules"]),
         router_type="per_token",
+        identity_expert=identity_expert,
         adaptive=adaptive_config,
     )
     budget_plan = None
@@ -466,7 +629,11 @@ def _run_mole_joint_per_token(
     )
 
     trainable = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
-    routing_label = "adaptive surprise MoLE" if adaptive else "joint per-token MoLE"
+    routing_label = (
+        "adaptive surprise MoLE"
+        if adaptive
+        else ("Soft LoRA identity MoLE" if identity_expert else "joint per-token MoLE")
+    )
     log(
         f"{routing_label}: E={mole_cfg.num_experts} r={mole_cfg.rank} "
         f"k={mole_cfg.top_k}; trainable={trainable:,}; global domains={cfg.get('domains') or 'all'}; "
@@ -500,14 +667,22 @@ def _run_mole_joint_per_token(
         }
     batches = build_batches(training_cfg, tokenizer, cfg["max_steps"])
     a_dir = adapter_dir(cfg["adapter_id"])
-    strategy = ADAPTIVE_SURPRISE_STRATEGY if adaptive else JOINT_PER_TOKEN_STRATEGY
+    strategy = (
+        ADAPTIVE_SURPRISE_STRATEGY
+        if adaptive
+        else (SOFT_LORA_IDENTITY_STRATEGY if identity_expert else JOINT_PER_TOKEN_STRATEGY)
+    )
     metadata = {
         "stage": "joint_experts_and_router",
         "training_strategy": strategy,
         "router_arch": (
             "global_surprise_lanes_v1"
             if adaptive
-            else "shared_per_block_per_token_v1"
+            else (
+                "shared_per_block_soft_lora_identity_v1"
+                if identity_expert
+                else "shared_per_block_per_token_v1"
+            )
         ),
         "global_domain_filter": sorted(cfg.get("domains") or []),
         "fused_linear_cross_entropy": fused_ce,
@@ -626,7 +801,14 @@ def _run_mole_joint_per_token(
 
 def run_mole(cfg: dict, rd: Path) -> dict:
     strategy = _mole_training_strategy(cfg)
-    if strategy in {ADAPTIVE_SURPRISE_STRATEGY, JOINT_PER_TOKEN_STRATEGY}:
+    soft_identity = bool(cfg.get("identity_expert", False))
+    if (strategy == SOFT_LORA_IDENTITY_STRATEGY) != soft_identity:
+        raise ValueError("Soft LoRA strategy and identity_expert must be enabled together")
+    if strategy in {
+        ADAPTIVE_SURPRISE_STRATEGY,
+        JOINT_PER_TOKEN_STRATEGY,
+        SOFT_LORA_IDENTITY_STRATEGY,
+    }:
         return _run_mole_joint_per_token(
             cfg,
             rd,
@@ -929,10 +1111,66 @@ def _create_scratch_base(cfg: dict):
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     initialization = _base_initialization(cfg)
-    tokenizer_ref = str(initialization.get("tokenizer_ref") or cfg.get("tokenizer_ref") or "")
-    if not tokenizer_ref:
-        raise ValueError("scratch training requires a tokenizer source")
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_ref)
+    compact_values = initialization.get("compact_tokenizer")
+    tokenizer_note: str
+    if isinstance(compact_values, dict):
+        compact_values = dict(compact_values)
+        compact_values.setdefault(
+            "special_token_profile",
+            "chat"
+            if normalize_training_objective(cfg.get("objective")) == OBJECTIVE_CHAT_SFT
+            else "causal",
+        )
+        compact_spec = CompactTokenizerSpec.from_dict(compact_values).validate()
+        output_checkpoint_id = str(cfg.get("out_checkpoint_id") or "")
+        if not output_checkpoint_id:
+            raise ValueError("inline compact tokenizer requires an output checkpoint ID")
+        tokenizer_path = checkpoint_dir(output_checkpoint_id) / "tokenizer-source"
+        log(
+            "training inline compact tokenizer: "
+            f"vocab={compact_spec.vocab_size:,}; profile={compact_spec.special_token_profile}; "
+            f"corpora={','.join(cfg['corpora'])}; domains={cfg.get('domains') or 'all'}; "
+            f"splits={cfg.get('splits') or 'all'}"
+        )
+
+        def tokenizer_progress(documents: int, training_bytes: int) -> None:
+            if documents == 1 or documents % 10_000 == 0:
+                log(
+                    "compact tokenizer intake: "
+                    f"{documents:,} documents; {training_bytes / 2**20:,.1f} MiB"
+                )
+
+        documents = iter_corpus_docs(
+            cfg["corpora"],
+            cfg.get("domains"),
+            shuffle_buffer=1,
+            shuffle_buffer_bytes=1,
+            seed=int(cfg.get("seed", 42)),
+            corpus_mix=cfg.get("corpus_mix", CORPUS_MIX_CONCATENATE),
+            splits=cfg.get("splits"),
+        )
+        tokenizer = train_compact_tokenizer(
+            (str(document.get("text") or "") for document in documents),
+            tokenizer_path,
+            compact_spec,
+            progress=tokenizer_progress,
+        )
+        initialization["compact_tokenizer"] = compact_spec.to_dict()
+        cfg["initialization"] = initialization
+        tokenizer_note = (
+            f"trained inline {compact_spec.special_token_profile} byte-BPE tokenizer "
+            f"with {len(tokenizer):,} entries"
+        )
+    else:
+        tokenizer_ref = str(
+            initialization.get("tokenizer_ref") or cfg.get("tokenizer_ref") or ""
+        )
+        if not tokenizer_ref:
+            raise ValueError("scratch training requires a tokenizer source")
+        if get_tokenizer(tokenizer_ref):
+            tokenizer_ref = str(resolve_tokenizer_artifact(tokenizer_ref))
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_ref)
+        tokenizer_note = f"loaded scratch tokenizer from {tokenizer_ref}"
     if tokenizer.eos_token_id is None:
         raise ValueError("scratch tokenizer must define an EOS token")
     if tokenizer.pad_token is None:
@@ -973,6 +1211,7 @@ def _create_scratch_base(cfg: dict):
         "initialization": initialization,
         "architecture": resolved_spec.to_dict(),
         "precision": precision,
+        "objective": normalize_training_objective(cfg.get("objective")),
         "sequence_length": int(cfg["seq_len"]),
         "seed": seed,
     }
@@ -980,6 +1219,7 @@ def _create_scratch_base(cfg: dict):
     notes = [
         f"randomly initialized {model.config.model_type} with "
         f"{estimate_parameter_count(resolved_spec):,} parameters on {device}",
+        tokenizer_note,
         f"native context={resolved_spec.max_position_embeddings:,}; "
         f"training sequence={int(cfg['seq_len']):,}",
     ]
@@ -1081,16 +1321,30 @@ def _make_base_scheduler(optimizer, cfg: dict):
 def run_base(cfg: dict, rd: Path) -> dict:
     import torch
 
-    cfg = normalize_base_data_config(cfg)
-    data_provenance = corpus_data_provenance(
+    cfg = normalize_base_worker_config(cfg)
+    data_preflight = corpus_training_preflight(
         cfg["corpora"],
         cfg.get("domains"),
         corpus_mix=cfg["corpus_mix"],
+        splits=cfg.get("splits"),
+        cross_corpus_dedup=cfg["cross_corpus_dedup"],
+        corpus_weights=cfg.get("corpus_weights") or None,
+        source_max_ratio=cfg.get("source_max_ratio"),
     )
+    if data_preflight["errors"]:
+        raise ValueError("; ".join(data_preflight["errors"]))
+    for warning in data_preflight["warnings"]:
+        log(f"data warning: {warning}")
+    data_provenance = data_preflight["provenance"]
+    objective = cfg["objective"]
+    data_provenance["objective"] = objective
     log(
         "base data: "
         f"corpora={','.join(cfg['corpora'])}; "
-        f"mix={cfg['corpus_mix']}; domains={cfg.get('domains') or 'all'}"
+        f"mix={cfg['corpus_mix']}; domains={cfg.get('domains') or 'all'}; "
+        f"splits={cfg.get('splits') or 'all'}; "
+        f"cross_dedup={cfg['cross_corpus_dedup']}; "
+        f"source_max_ratio={cfg.get('source_max_ratio') or 'none'}; objective={objective}"
     )
     initialization = _base_initialization(cfg)
     mode = str(initialization.get("mode") or "pretrained")
@@ -1103,6 +1357,7 @@ def run_base(cfg: dict, rd: Path) -> dict:
     quant = str(cfg.get("quant") or "nf4") if method == "qlora" else requested_dtype
     if mode == "scratch":
         model, tokenizer, cuda, quant, notes = _create_scratch_base(cfg)
+        initialization = _base_initialization(cfg)
     else:
         checkpoint_id = str(initialization.get("checkpoint_id") or cfg.get("checkpoint_id") or "")
         checkpoint_ref = str(initialization.get("checkpoint_ref") or cfg.get("checkpoint_ref") or "")
@@ -1110,7 +1365,12 @@ def run_base(cfg: dict, rd: Path) -> dict:
             raise ValueError("continued base training requires a checkpoint reference")
         if method != "full":
             enforce_quant_lock(checkpoint_id, quant)
-        model, tokenizer, cuda, quant, notes = load_base(checkpoint_ref, quant)
+        restore_saved_qat = bool(precision.get("inherit_checkpoint_low_precision", False))
+        model, tokenizer, cuda, quant, notes = load_base(
+            checkpoint_ref,
+            quant,
+            restore_saved_qat=restore_saved_qat,
+        )
 
     for note in notes:
         log(f"note: {note}")
@@ -1122,6 +1382,16 @@ def run_base(cfg: dict, rd: Path) -> dict:
     torch.manual_seed(seed)
     if cuda:
         torch.cuda.manual_seed_all(seed)
+    model.config.yylab_base_recipe_version = BASE_RECIPE_VERSION
+    model.config.yylab_training_recipe = {
+        "version": BASE_RECIPE_VERSION,
+        "initialization": initialization,
+        "architecture": getattr(model.config, "yylab_scratch_architecture", None),
+        "precision": precision,
+        "objective": objective,
+        "sequence_length": int(cfg["seq_len"]),
+        "seed": seed,
+    }
     if method in {"lora", "qlora"}:
         from peft import LoraConfig, get_peft_model
 
@@ -1195,10 +1465,30 @@ def run_base(cfg: dict, rd: Path) -> dict:
         save_fn=save,
     )
     if int(result.get("steps", 0)) < 1:
+        if objective == OBJECTIVE_CHAT_SFT:
+            stats_fn = getattr(batches, "data_stats", None)
+            stats = stats_fn() if callable(stats_fn) else {}
+            raise RuntimeError(
+                "chat SFT found no parseable transcript with supervised assistant tokens; "
+                "expected structured messages or line-start system:/user:/assistant: blocks "
+                f"compatible with the tokenizer chat template (docs scanned="
+                f"{stats.get('docs_seen', 0)}, parseable={stats.get('parseable_docs', 0)}, "
+                f"unrenderable={stats.get('unrenderable_docs', 0)}, failures="
+                f"{stats.get('failure_reasons', {})})"
+            )
         raise RuntimeError(
             "selected base-training corpora produced no complete training sequences; "
-            "check corpus shards, domain filters, and sequence length"
+            "check corpus shards, domain/split filters, and sequence length"
         )
+    training_data_stats = tokenized_view_manifest(
+        batches,
+        result,
+        objective=objective,
+        sequence_length=int(cfg["seq_len"]),
+    )
+    data_provenance["training"] = training_data_stats
+    cfg["data_provenance"] = data_provenance
+    write_json(rd / "tokenized_view_manifest.json", training_data_stats)
     master_summary_fn = getattr(optimizer, "master_state_summary", None)
     master_summary = master_summary_fn() if callable(master_summary_fn) else None
     if master_summary is not None:
@@ -1208,6 +1498,7 @@ def run_base(cfg: dict, rd: Path) -> dict:
 
     if method == "full":
         out = checkpoint_dir(cfg["out_checkpoint_id"])
+        write_json(out / "tokenized_view_manifest.json", training_data_stats)
         params_raw = sum(parameter.numel() for parameter in model.parameters())
         architecture = getattr(model.config, "yylab_scratch_architecture", None)
         checkpoint_meta = {
@@ -1219,9 +1510,11 @@ def run_base(cfg: dict, rd: Path) -> dict:
                 else None
             ),
             "tokenizer_ref": initialization.get("tokenizer_ref"),
+            "compact_tokenizer": initialization.get("compact_tokenizer"),
             "architecture": architecture,
             "precision": precision,
             "optimizer": optimizer_cfg,
+            "objective": objective,
             "training_sequence_length": int(cfg["seq_len"]),
             "parameters": params_raw,
             "data_provenance": data_provenance,
@@ -1241,6 +1534,7 @@ def run_base(cfg: dict, rd: Path) -> dict:
             ),
         )
     else:
+        write_json(adapter_dir(cfg["adapter_id"]) / "tokenized_view_manifest.json", training_data_stats)
         checkpoint_id = str(initialization.get("checkpoint_id") or cfg.get("checkpoint_id") or "")
         commit_quant_lock(checkpoint_id, quant)
         adapter_row = db.q1("SELECT meta_json FROM adapters WHERE id=?", (cfg["adapter_id"],))
@@ -1249,6 +1543,7 @@ def run_base(cfg: dict, rd: Path) -> dict:
         except (TypeError, ValueError):
             adapter_meta = {}
         adapter_meta["data_provenance"] = data_provenance
+        adapter_meta["objective"] = objective
         db.execute(
             "UPDATE adapters SET status='trained', path=?, corpora_json=?, meta_json=? WHERE id=?",
             (
@@ -1263,6 +1558,7 @@ def run_base(cfg: dict, rd: Path) -> dict:
         "docs_seen": batches.docs_seen,
         "tokens": batches.tokens_seen,
         "initialization": mode,
+        "objective": objective,
         "parameter_dtype": requested_dtype,
         "qat": precision.get("qat", "none"),
         "sparsity": precision.get("sparsity", "none"),
@@ -1271,7 +1567,9 @@ def run_base(cfg: dict, rd: Path) -> dict:
         "corpora": list(cfg["corpora"]),
         "corpus_mix": cfg["corpus_mix"],
         "domains": list(cfg.get("domains") or []),
+        "splits": list(cfg.get("splits") or []),
         "data_provenance": data_provenance,
+        "training_data": training_data_stats,
     }
 
 
@@ -1408,12 +1706,17 @@ def main() -> None:
     log(f"yylab worker: run={run_id} kind={run['kind']}")
 
     try:
-        if run["kind"] == "base":
-            cfg = normalize_base_data_config(cfg)
+        if run["kind"] in {"base", "spalmer_base"}:
+            cfg = normalize_base_worker_config(cfg)
             # The run-directory recipe is the canonical replay payload even for
             # legacy rows that stored one scalar corpus ID.
             write_json(rd / "config.json", cfg)
-        if not cfg.get("max_steps") and run["kind"] in {"mole_stage1", "router_stage2", "base"}:
+        if not cfg.get("max_steps") and run["kind"] in {
+            "mole_stage1",
+            "router_stage2",
+            "base",
+            "spalmer_base",
+        }:
             cfg["max_steps"] = estimate_steps(
                 cfg["corpora"],
                 cfg.get("domains"),
@@ -1422,6 +1725,7 @@ def main() -> None:
                 cfg["micro_batch"],
                 cfg["grad_accum"],
                 cfg.get("token_stats_key"),
+                splits=cfg.get("splits"),
             )
             log(f"estimated {cfg['max_steps']} optimizer steps")
 
@@ -1431,6 +1735,10 @@ def main() -> None:
             summary = run_router(cfg, rd)
         elif run["kind"] == "base":
             summary = run_base(cfg, rd)
+        elif run["kind"] == "spalmer_base":
+            from ..train.spalmer import run_spalmer_base
+
+            summary = run_spalmer_base(cfg, rd)
         elif run["kind"] == "export":
             summary = run_export(cfg, rd)
         elif run["kind"] == "benchmark_quality":

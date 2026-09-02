@@ -154,3 +154,23 @@ def test_mole_worker_strategy_validation_preserves_legacy_default():
         raise AssertionError("unknown strategies must fail before loading a model")
     except ValueError as exc:
         assert "unknown MoLE training strategy" in str(exc)
+
+
+def test_soft_lora_worker_strategy_requires_identity_contract(tmp_path):
+    from yylab.workers.train import (
+        SOFT_LORA_IDENTITY_STRATEGY,
+        _mole_training_strategy,
+        run_mole,
+    )
+
+    assert (
+        _mole_training_strategy(
+            {"training_strategy": SOFT_LORA_IDENTITY_STRATEGY, "identity_expert": True}
+        )
+        == SOFT_LORA_IDENTITY_STRATEGY
+    )
+    try:
+        run_mole({"training_strategy": SOFT_LORA_IDENTITY_STRATEGY}, tmp_path)
+        raise AssertionError("Soft LoRA must not silently omit its identity route")
+    except ValueError as exc:
+        assert "identity_expert" in str(exc)

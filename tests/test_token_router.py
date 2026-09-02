@@ -39,6 +39,7 @@ def _initialized_layer(
     num_experts: int = 4,
     rank: int = 3,
     top_k: int = 2,
+    identity_expert: bool = False,
 ) -> MoLELinear:
     layer = MoLELinear(
         nn.Linear(in_features, out_features, bias=False),
@@ -46,6 +47,7 @@ def _initialized_layer(
         rank=rank,
         alpha=rank * 2.0,
         top_k=top_k,
+        identity_expert=identity_expert,
     )
     with torch.no_grad():
         layer.router.gate.weight.normal_(0.0, 0.35)
@@ -130,6 +132,37 @@ def test_top1_router_receives_task_gradient_without_auxiliary_loss():
     assert gradient is not None
     assert torch.isfinite(gradient).all()
     assert gradient.abs().sum().item() > 0
+
+
+def test_soft_lora_identity_route_can_preserve_exact_base_output():
+    torch.manual_seed(49)
+    layer = _initialized_layer(num_experts=2, rank=2, top_k=1, identity_expert=True)
+    x = torch.ones(2, 3, 6)
+    with torch.no_grad():
+        layer.router.gate.weight[:2].fill_(-1.0)
+        layer.router.gate.weight[2].fill_(1.0)
+
+    expected = layer.base(x)
+    output = layer(x)
+    indices, weights, logits = layer.router(x.reshape(-1, 6))
+
+    assert logits.shape[-1] == 3
+    assert torch.equal(indices, torch.full_like(indices, 2))
+    assert torch.equal(weights.detach(), torch.ones_like(weights))
+    assert torch.equal(output, expected)
+
+
+def test_soft_lora_identity_route_keeps_router_and_adapter_gradients():
+    torch.manual_seed(51)
+    layer = _initialized_layer(num_experts=2, rank=2, top_k=3, identity_expert=True)
+    x = torch.randn(3, 4, 6, requires_grad=True)
+
+    layer(x).square().mean().backward()
+
+    assert layer.router.num_routes == 3
+    assert layer.router.gate.weight.grad is not None
+    assert layer.router.gate.weight.grad.abs().sum().item() > 0
+    assert any(expert.lora_B.grad is not None for expert in layer.experts)
 
 
 def test_block_token_router_route_is_reused_across_different_projection_widths():

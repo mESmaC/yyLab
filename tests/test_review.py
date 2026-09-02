@@ -121,9 +121,15 @@ def test_hidden_rejected_corpus(tmp_path):
     assert cid in {row["id"] for row in visible}
     assert r["approved_corpus_id"] in {row["id"] for row in visible}
 
-    from yylab.ingest.dedup import sha256_hex
+    from yylab.ingest.dedup import sha256_hex, training_hash_key
 
-    assert db.q1("SELECT hash FROM rejected_hashes WHERE hash=?", (sha256_hex(BAD_DOC),)) is not None
+    assert (
+        db.q1(
+            "SELECT hash FROM rejected_hashes WHERE hash=?",
+            (training_hash_key(sha256_hex(BAD_DOC)),),
+        )
+        is not None
+    )
 
 
 def _read_zst_jsonl(path: Path) -> list[dict]:

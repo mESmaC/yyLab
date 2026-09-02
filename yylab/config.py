@@ -24,6 +24,7 @@ class Paths:
         self.rejected = root / "rejected"
         self.annotations = root / "annotations"
         self.rankers = root / "rankers"
+        self.tokenizers = root / "tokenizers"
         self.db_file = root / "yylab.sqlite3"
         self.settings_file = root / "settings.json"
 
@@ -39,6 +40,7 @@ class Paths:
             self.rejected,
             self.annotations,
             self.rankers,
+            self.tokenizers,
         ):
             p.mkdir(parents=True, exist_ok=True)
 

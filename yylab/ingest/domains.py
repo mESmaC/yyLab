@@ -53,7 +53,7 @@ def domain_for_ext(path_suffix: str) -> str | None:
     return None
 
 
-TRUSTED_HINTS = {"code", "web", "math", "science"}
+TRUSTED_HINTS = {"code", "web", "math", "science", "conversation"}
 
 
 def _indent_ratio(lines: list[str]) -> float:

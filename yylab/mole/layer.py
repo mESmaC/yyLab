@@ -38,14 +38,18 @@ class TopKRouter(nn.Module):
         num_experts: int,
         top_k: int,
         device: torch.device | None = None,
+        identity_expert: bool = False,
     ) -> None:
         super().__init__()
-        if not 1 <= top_k <= num_experts:
-            raise ValueError("top_k must be within [1, num_experts]")
+        num_routes = num_experts + int(identity_expert)
+        if not 1 <= top_k <= num_routes:
+            raise ValueError("top_k must be within [1, num_routes]")
         self.in_features = in_features
         self.num_experts = num_experts
+        self.identity_expert = bool(identity_expert)
+        self.num_routes = num_routes
         self.top_k = top_k
-        self.gate = nn.Linear(in_features, num_experts, bias=False, device=device)
+        self.gate = nn.Linear(in_features, num_routes, bias=False, device=device)
         nn.init.zeros_(self.gate.weight)
 
     def forward(
@@ -57,15 +61,15 @@ class TopKRouter(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         logits = self.gate(x.float())
         selected_k = self.top_k if top_k is None else int(top_k)
-        if not 1 <= selected_k <= self.num_experts:
-            raise ValueError("runtime top-k must be within [1, num_experts]")
+        if not 1 <= selected_k <= self.num_routes:
+            raise ValueError("runtime top-k must be within [1, num_routes]")
         selection_logits = logits
         if allowed_experts is not None:
             if len(set(allowed_experts)) != len(allowed_experts):
                 raise ValueError("allowed expert indices must be unique")
             if len(allowed_experts) < selected_k:
                 raise ValueError("runtime top-k exceeds the resident expert set")
-            if any(not 0 <= index < self.num_experts for index in allowed_experts):
+            if any(not 0 <= index < self.num_routes for index in allowed_experts):
                 raise IndexError("allowed expert index is out of range")
             mask = torch.full_like(logits, float("-inf"))
             allowed = torch.tensor(allowed_experts, dtype=torch.long, device=logits.device)
@@ -106,8 +110,17 @@ class SharedTokenRouter(TopKRouter):
         top_k: int,
         device: torch.device | None = None,
         adaptive: bool = False,
+        identity_expert: bool = False,
     ) -> None:
-        super().__init__(hidden_size, num_experts, top_k, device=device)
+        if adaptive and identity_expert:
+            raise ValueError("adaptive routing does not support an identity route")
+        super().__init__(
+            hidden_size,
+            num_experts,
+            top_k,
+            device=device,
+            identity_expert=identity_expert,
+        )
         # Legacy per-projection gates remain zero-initialized for artifact
         # compatibility.  A new block router needs a tiny asymmetric start so
         # equal logits do not deterministically collapse every token onto the
@@ -248,32 +261,36 @@ class SharedPromptRouter(nn.Module):
         hidden_width: int | None = 256,
         max_prompt_tokens: int = 256,
         device: torch.device | None = None,
+        identity_expert: bool = False,
     ) -> None:
         super().__init__()
         if hidden_size < 1 or num_experts < 1:
             raise ValueError("router dimensions must be positive")
-        if not 1 <= top_k <= num_experts:
-            raise ValueError("top_k must be within [1, num_experts]")
+        num_routes = num_experts + int(identity_expert)
+        if not 1 <= top_k <= num_routes:
+            raise ValueError("top_k must be within [1, num_routes]")
         if hidden_width is not None and hidden_width < 1:
             raise ValueError("router hidden width must be positive or None")
         if max_prompt_tokens < 1:
             raise ValueError("max_prompt_tokens must be positive")
         self.hidden_size = hidden_size
         self.num_experts = num_experts
+        self.identity_expert = bool(identity_expert)
+        self.num_routes = num_routes
         self.top_k = top_k
         self.hidden_width = hidden_width
         self.max_prompt_tokens = max_prompt_tokens
         if hidden_width is None:
             self.network = nn.Sequential(
                 nn.LayerNorm(hidden_size, device=device),
-                nn.Linear(hidden_size, num_experts, device=device),
+                nn.Linear(hidden_size, num_routes, device=device),
             )
         else:
             self.network = nn.Sequential(
                 nn.LayerNorm(hidden_size, device=device),
                 nn.Linear(hidden_size, hidden_width, device=device),
                 nn.SiLU(),
-                nn.Linear(hidden_width, num_experts, device=device),
+                nn.Linear(hidden_width, num_routes, device=device),
             )
         self.last_router_logits: torch.Tensor | None = None
         self.last_router_weights: torch.Tensor | None = None
@@ -370,6 +387,7 @@ class MoLELinear(nn.Module):
         shared_router: SharedPromptRouter | None = None,
         shared_token_router: SharedTokenRouter | None = None,
         adaptive: bool = False,
+        identity_expert: bool = False,
     ) -> None:
         super().__init__()
         self.base = base
@@ -380,7 +398,9 @@ class MoLELinear(nn.Module):
         self.out_features = out_f
         self.num_experts = num_experts
         self.rank = rank
-        self.top_k = min(top_k, num_experts)
+        self.identity_expert = bool(identity_expert)
+        self.num_routes = num_experts + int(self.identity_expert)
+        self.top_k = min(top_k, self.num_routes)
         self.adaptive = bool(adaptive)
         dtype = expert_dtype or base.weight.dtype
         if dtype in (torch.uint8, torch.int8):
@@ -407,7 +427,12 @@ class MoLELinear(nn.Module):
         self.router = (
             None
             if self.adaptive and shared_token_router is not None
-            else TopKRouter(in_f, num_experts, self.top_k).to(device=base.weight.device)
+            else TopKRouter(
+                in_f,
+                num_experts,
+                self.top_k,
+                identity_expert=self.identity_expert,
+            ).to(device=base.weight.device)
         )
         object.__setattr__(
             self,
@@ -433,6 +458,8 @@ class MoLELinear(nn.Module):
     def set_shared_router(self, router: SharedPromptRouter | None) -> None:
         if router is not None and router.num_experts != self.num_experts:
             raise ValueError("shared router expert count does not match the MoLE layer")
+        if router is not None and router.identity_expert != self.identity_expert:
+            raise ValueError("shared router identity policy does not match the MoLE layer")
         object.__setattr__(
             self,
             "_shared_router_ref",
@@ -446,6 +473,8 @@ class MoLELinear(nn.Module):
     def set_shared_token_router(self, router: SharedTokenRouter | None) -> None:
         if router is not None and router.num_experts != self.num_experts:
             raise ValueError("shared token router expert count does not match the MoLE layer")
+        if router is not None and router.identity_expert != self.identity_expert:
+            raise ValueError("shared token router identity policy does not match the MoLE layer")
         if router is not None and router.top_k != self.top_k:
             raise ValueError("shared token router top-k does not match the MoLE layer")
         object.__setattr__(
@@ -517,11 +546,16 @@ class MoLELinear(nn.Module):
         # force a device synchronization.
         for route_slot in range(self.top_k):
             selected = indices[:, route_slot]
-            selected_a = packed_a.index_select(0, selected)
-            selected_b = packed_b.index_select(0, selected)
+            adapter_selected = selected.clamp_max(self.num_experts - 1)
+            selected_a = packed_a.index_select(0, adapter_selected)
+            selected_b = packed_b.index_select(0, adapter_selected)
             low_rank = torch.bmm(flat_x, selected_a.transpose(1, 2))
             contribution = torch.bmm(low_rank, selected_b.transpose(1, 2))
             scale = selected_weights[:, route_slot].to(contribution.dtype).view(batch_size, 1, 1)
+            if self.identity_expert:
+                scale = scale * selected.ne(self.num_experts).to(contribution.dtype).view(
+                    batch_size, 1, 1
+                )
             contribution = contribution * (scale * self.experts[0].scaling)
             contribution = contribution.to(output_dtype)
             add = contribution if add is None else add + contribution
@@ -568,8 +602,12 @@ class MoLELinear(nn.Module):
         total_rank = self.num_experts * self.rank
         low_rank = (x @ packed_a.transpose(0, 1)).reshape(x.shape[0], self.num_experts, self.rank)
 
+        adapter_indices = indices.clamp_max(self.num_experts - 1)
+        adapter_weights = route_weights.to(dtype=low_rank.dtype)
+        if self.identity_expert:
+            adapter_weights = adapter_weights * indices.ne(self.num_experts).to(low_rank.dtype)
         sparse_gate = low_rank.new_zeros((x.shape[0], self.num_experts))
-        sparse_gate.scatter_(1, indices, route_weights.to(dtype=low_rank.dtype))
+        sparse_gate.scatter_add_(1, adapter_indices, adapter_weights)
         routed_low_rank = (low_rank * sparse_gate.unsqueeze(-1)).reshape(x.shape[0], total_rank)
         delta = routed_low_rank @ packed_b
         delta = delta * self.experts[0].scaling

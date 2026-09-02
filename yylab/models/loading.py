@@ -32,6 +32,12 @@ def scan_checkpoint(path) -> dict:
     from safetensors import safe_open
 
     path = Path(path)
+    from .spalmer import scan_spalmer_checkpoint
+
+    if (path.is_file() and path.suffix.casefold() == ".pt") or (
+        path.is_dir() and (path / "spalmer.pt").is_file()
+    ):
+        return scan_spalmer_checkpoint(path)
     cfg_file = path / "config.json"
     if not cfg_file.exists():
         raise FileNotFoundError("config.json not found — not a HuggingFace checkpoint folder")
@@ -58,6 +64,7 @@ def load_base(
     attn_implementation: str = "sdpa",
     rope_scaling: dict | None = None,
     max_position_embeddings: int | None = None,
+    restore_saved_qat: bool = True,
 ):
     import torch
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
@@ -126,7 +133,21 @@ def load_base(
         kwargs["device_map"] = {"": 0}
 
     model = AutoModelForCausalLM.from_pretrained(ref, **kwargs)
-    qat_count, qat_meta = apply_saved_qat(model)
+    if restore_saved_qat:
+        qat_count, qat_meta = apply_saved_qat(model)
+    else:
+        qat_count, qat_meta = 0, None
+        if saved_qat is not None:
+            # A saved QAT checkpoint contains ordinary high-precision shadow
+            # weights. Continued training that explicitly requests dense
+            # numerics must not silently re-enable the inherited forward mask.
+            # Remove the metadata as well, otherwise save_pretrained() would
+            # publish a dense-trained checkpoint that reactivates QAT at load.
+            if hasattr(model.config, "yylab_low_precision"):
+                delattr(model.config, "yylab_low_precision")
+            notes.append(
+                "Loaded high-precision shadow weights without restoring inherited QAT numerics."
+            )
     if qat_meta is not None:
         execution = (
             "native low-bit forward"

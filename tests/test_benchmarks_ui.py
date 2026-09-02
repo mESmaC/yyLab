@@ -48,6 +48,7 @@ def test_quality_job_config_uses_non_training_adapter_identifier():
     assert config == {
         "checkpoint_id": "ckpt-1",
         "checkpoint_ref": "local-model",
+        "model_family": "hf",
         "quant": "bf16",
         "adapter_benchmark_id": "adapter-1",
         "adapter_path": "adapter-path",
@@ -61,6 +62,7 @@ def test_quality_job_config_uses_non_training_adapter_identifier():
         "limit": 4,
         "baseline_run_id": "run-base",
         "max_new_tokens": 32,
+        "prompt_mode": "chat",
         "enable_thinking": True,
         "max_thinking_tokens": 2048,
         "context_mode": "yarn_4x",
@@ -83,16 +85,65 @@ def test_quality_job_config_disables_thinking_by_default():
     )
 
     assert config["enable_thinking"] is False
+    assert config["prompt_mode"] == "chat"
     assert config["max_thinking_tokens"] == 1024
     assert config["context_mode"] == "native"
     assert config["rope_scaling"] == "none"
     assert config["max_context_tokens"] is None
 
 
+def test_quality_job_config_tags_spalmer_family_and_native_precision():
+    checkpoint = {
+        **_checkpoint(),
+        "ref": "spalmer.pt",
+        "meta_json": '{"model_family":"spalmer"}',
+    }
+
+    config = benchmarks._quality_job_config(
+        checkpoint,
+        None,
+        quant=benchmarks._resolve_quant(checkpoint, "auto"),
+        policy="dynamic",
+        profile="smoke",
+        repetitions=1,
+        label="spalmer",
+    )
+
+    assert config["model_family"] == "spalmer"
+    assert config["quant"] == "checkpoint"
+
+
+def test_quality_job_config_supports_raw_completion_without_thinking():
+    config = benchmarks._quality_job_config(
+        _checkpoint(),
+        None,
+        quant="bf16",
+        policy="base",
+        profile="smoke",
+        repetitions=1,
+        label="raw-base",
+        prompt_mode="raw",
+    )
+
+    assert config["prompt_mode"] == "raw"
+    with pytest.raises(ValueError, match="thinking requires chat"):
+        benchmarks._quality_job_config(
+            _checkpoint(),
+            None,
+            quant="bf16",
+            policy="base",
+            profile="smoke",
+            repetitions=1,
+            label="invalid",
+            prompt_mode="raw",
+            enable_thinking=True,
+        )
+
+
 def test_quality_contract_labels_distinguish_legacy_shared_thinking_cap():
     assert (
         benchmarks._quality_contract_text({"max_new_tokens": 256, "enable_thinking": True})
-        == "answer 256 · legacy shared-cap · native"
+        == "chat · answer 256 · legacy shared-cap · native"
     )
     assert (
         benchmarks._quality_contract_text(
@@ -103,7 +154,7 @@ def test_quality_contract_labels_distinguish_legacy_shared_thinking_cap():
                 "context_mode": "yarn_4x",
             }
         )
-        == "answer 256 · think 2048 · yarn 4x"
+        == "chat · answer 256 · think 2048 · yarn 4x"
     )
 
 

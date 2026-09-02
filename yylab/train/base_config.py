@@ -229,6 +229,25 @@ def estimate_parameter_count(spec: ScratchModelSpec, tokenizer_vocab_size: int |
     return fixed + int(spec.num_hidden_layers) * per_layer
 
 
+def tokenizer_embedding_parameter_floor(
+    spec: ScratchModelSpec,
+    tokenizer_vocab_size: int,
+    *,
+    qat_mode: str = "none",
+) -> int:
+    """Return the irreducible embedding count for a valid yyLab decoder.
+
+    A target-size solver may shrink transformer width and depth, but it may not
+    shrink the tokenizer's vocabulary.  Eight is the smallest generally valid
+    hidden/head width; native NVFP4 raises the aligned hidden floor to 32.
+    """
+
+    vocab_size = spec.resolved_vocab_size(tokenizer_vocab_size)
+    minimum_hidden = 32 if qat_mode == "nvfp4" else 8
+    embedding_tables = 1 if spec.tie_word_embeddings else 2
+    return vocab_size * minimum_hidden * embedding_tables
+
+
 def fit_layers_to_parameter_target(
     spec: ScratchModelSpec,
     target_parameters: int,
@@ -250,6 +269,196 @@ def fit_layers_to_parameter_target(
     layers = round((int(target_parameters) - fixed) / max(per_layer, 1))
     layers = min(max(int(layers), int(min_layers)), int(max_layers))
     return replace(spec, num_hidden_layers=layers)
+
+
+def fit_scratch_to_parameter_target(
+    spec: ScratchModelSpec,
+    target_parameters: int,
+    *,
+    tokenizer_vocab_size: int,
+    qat_mode: str = "none",
+    min_layers: int = 1,
+    max_layers: int = 128,
+) -> ScratchModelSpec:
+    """Fit width, MLP width, attention layout, and depth to a target.
+
+    The search is deterministic and keeps vocabulary, context, embedding
+    tying, initialization, and normalization choices exact.  Candidate widths
+    remain kernel aligned and the resulting spec is fully validated before it
+    is returned.
+    """
+
+    target = int(target_parameters)
+    if target < 1:
+        raise ValueError("target parameter count must be positive")
+    if int(min_layers) < 1 or int(max_layers) < int(min_layers):
+        raise ValueError("layer bounds must satisfy 1 <= min_layers <= max_layers")
+    if qat_mode not in QAT_LABELS:
+        raise ValueError(f"unsupported QAT target: {qat_mode}")
+
+    vocab_size = spec.resolved_vocab_size(tokenizer_vocab_size)
+    embedding_floor = tokenizer_embedding_parameter_floor(
+        spec,
+        tokenizer_vocab_size,
+        qat_mode=qat_mode,
+    )
+    if target < embedding_floor:
+        table_word = "table" if spec.tie_word_embeddings else "tables"
+        minimum_hidden = 32 if qat_mode == "nvfp4" else 8
+        raise ValueError(
+            f"target {target:,} is below the tokenizer embedding floor "
+            f"{embedding_floor:,} ({vocab_size:,} vocabulary x {minimum_hidden} minimum "
+            f"hidden x {1 if spec.tie_word_embeddings else 2} {table_word}); choose a "
+            "smaller tokenizer vocabulary or a larger target"
+        )
+
+    embedding_tables = 1 if spec.tie_word_embeddings else 2
+    maximum_hidden = max(
+        8,
+        min(65_536, target // max(vocab_size * embedding_tables, 1)),
+    )
+    minimum_head_dim = 16 if qat_mode == "nvfp4" else 8
+    head_dims = tuple(
+        value
+        for value in (8, 16, 32, 64, 128, 256, int(spec.head_dim))
+        if value >= minimum_head_dim
+        and value <= 512
+        and value % (16 if qat_mode == "nvfp4" else 8) == 0
+    )
+    head_dims = tuple(dict.fromkeys(head_dims))
+    kv_ratio = int(spec.num_key_value_heads) / max(int(spec.num_attention_heads), 1)
+    best: tuple[tuple[float, ...], ScratchModelSpec] | None = None
+
+    for head_dim in head_dims:
+        max_heads = min(512, maximum_hidden // head_dim)
+        for attention_heads in range(1, max_heads + 1):
+            hidden = attention_heads * head_dim
+            if hidden % (32 if qat_mode == "nvfp4" else 8):
+                continue
+            divisors = [value for value in range(1, attention_heads + 1) if attention_heads % value == 0]
+            desired_kv = max(1, round(attention_heads * kv_ratio))
+            kv_heads = min(divisors, key=lambda value: (abs(value - desired_kv), value))
+            shell = replace(
+                spec,
+                vocab_size=vocab_size,
+                hidden_size=hidden,
+                intermediate_size=8,
+                num_attention_heads=attention_heads,
+                num_key_value_heads=kv_heads,
+                head_dim=head_dim,
+            )
+            fixed, per_layer_at_eight = _parameter_parts(shell, vocab_size)
+            intermediate_coefficient = 3 * hidden + (1 if spec.family == "bitnet" else 0)
+            layer_constant = per_layer_at_eight - intermediate_coefficient * 8
+            intermediate_alignment = 32 if qat_mode == "nvfp4" else 8
+
+            for layers in range(int(min_layers), int(max_layers) + 1):
+                remaining = target - fixed - layers * layer_constant
+                ideal_intermediate = remaining / max(layers * intermediate_coefficient, 1)
+                rounded = (
+                    round(ideal_intermediate / intermediate_alignment)
+                    * intermediate_alignment
+                )
+                intermediate_candidates = {
+                    max(
+                        intermediate_alignment,
+                        min(262_144, rounded + offset),
+                    )
+                    for offset in (
+                        -intermediate_alignment,
+                        0,
+                        intermediate_alignment,
+                    )
+                }
+                for intermediate in intermediate_candidates:
+                    candidate = replace(
+                        shell,
+                        intermediate_size=intermediate,
+                        num_hidden_layers=layers,
+                    )
+                    count = estimate_parameter_count(candidate)
+                    relative_error = abs(count - target) / target
+                    # Within one basis point, prefer a conventional MLP ratio
+                    # and a shape near the user's current depth/head layout.
+                    shape_penalty = (
+                        abs(intermediate / hidden - 3.0)
+                        + abs(layers - int(spec.num_hidden_layers)) / max(int(spec.num_hidden_layers), 1)
+                        + abs(head_dim - int(spec.head_dim)) / max(int(spec.head_dim), 1)
+                    )
+                    score = (
+                        round(relative_error, 4),
+                        shape_penalty,
+                        relative_error,
+                        float(count),
+                    )
+                    if best is None or score < best[0]:
+                        best = (score, candidate)
+
+    if best is None:
+        raise ValueError("no valid scratch architecture fits the requested target and constraints")
+    fitted = best[1]
+    fitted.validate(tokenizer_vocab_size=tokenizer_vocab_size, qat_mode=qat_mode)
+    return fitted
+
+
+def resolve_training_token_budget(
+    *,
+    requested_tokens: int = 0,
+    seq_len: int,
+    micro_batch: int,
+    grad_accum: int,
+    max_steps: int = 0,
+    estimated_steps: int = 0,
+) -> dict[str, int | str]:
+    """Resolve token, explicit-step, and epoch-derived caps deterministically."""
+
+    sequence = int(seq_len)
+    micro = int(micro_batch)
+    accumulation = int(grad_accum)
+    if min(sequence, micro, accumulation) < 1:
+        raise ValueError("sequence length, microbatch, and accumulation must be positive")
+    tokens_per_step = sequence * micro * accumulation
+    requested = max(0, int(requested_tokens or 0))
+    explicit_steps = max(0, int(max_steps or 0))
+    data_steps = max(0, int(estimated_steps or 0))
+    if requested:
+        resolved_steps = max(1, math.ceil(requested / tokens_per_step))
+        source = "token_budget"
+    elif explicit_steps:
+        resolved_steps = explicit_steps
+        source = "max_steps"
+    elif data_steps:
+        resolved_steps = data_steps
+        source = "epochs"
+    else:
+        raise ValueError("a token budget, explicit step cap, or epoch-derived step count is required")
+    scheduled = resolved_steps * tokens_per_step
+    return {
+        "requested_training_tokens": requested,
+        "tokens_per_optimizer_step": tokens_per_step,
+        "max_steps": resolved_steps,
+        "scheduled_training_tokens": scheduled,
+        "token_budget_rounding": scheduled - requested if requested else 0,
+        "step_cap_source": source,
+    }
+
+
+def normalize_training_token_budget(config: dict) -> dict:
+    """Apply an explicit token budget to a replayed config, if present."""
+
+    resolved = dict(config)
+    requested = int(resolved.get("requested_training_tokens") or 0)
+    if requested < 1:
+        return resolved
+    budget = resolve_training_token_budget(
+        requested_tokens=requested,
+        seq_len=int(resolved["seq_len"]),
+        micro_batch=int(resolved["micro_batch"]),
+        grad_accum=int(resolved["grad_accum"]),
+        max_steps=int(resolved.get("max_steps") or 0),
+    )
+    resolved.update(budget)
+    return resolved
 
 
 def build_hf_config(spec: ScratchModelSpec, tokenizer) -> object:

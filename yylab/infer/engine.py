@@ -11,6 +11,7 @@ from dataclasses import dataclass, field, replace
 class LoadSpec:
     ref: str
     quant: str
+    model_family: str = ""
     adapter_path: str | None = None
     adapter_arch: str = ""
     router_path: str | None = None
@@ -21,6 +22,7 @@ class LoadSpec:
             [
                 self.ref,
                 self.quant,
+                self.model_family,
                 self.adapter_path or "",
                 self.router_path or "",
                 json.dumps(self.settings, sort_keys=True),
@@ -37,6 +39,7 @@ class ChatContextPlan:
     prompt_budget: int
     context_limit: int
     answer_budget: int
+    prompt_mode: str = "chat"
     dropped_messages: int = 0
     dropped_turns: int = 0
     strategy: str = "recency"
@@ -60,6 +63,7 @@ class ChatContextPlan:
             "prompt_budget": self.prompt_budget,
             "context_limit": self.context_limit,
             "answer_budget": self.answer_budget,
+            "prompt_mode": self.prompt_mode,
             "dropped_messages": self.dropped_messages,
             "dropped_turns": self.dropped_turns,
             "compacted": self.compacted,
@@ -77,7 +81,23 @@ class ChatContextPlan:
         }
 
 
-def format_messages(tokenizer, messages: list[dict]) -> str:
+def format_messages(tokenizer, messages: list[dict], *, prompt_mode: str = "chat") -> str:
+    """Render one generation prompt in chat-template or raw-completion mode.
+
+    Raw completion deliberately accepts exactly one payload. Treating a list
+    of prior user/assistant messages as plain text would invent separators and
+    multi-turn semantics that a base pretrained checkpoint has not learned.
+    """
+
+    if prompt_mode == "raw":
+        if len(messages) != 1:
+            raise ValueError("Raw completion requires exactly one independent prompt.")
+        content = messages[0].get("content", "")
+        if not isinstance(content, str):
+            raise TypeError("Raw completion prompt content must be text.")
+        return content
+    if prompt_mode != "chat":
+        raise ValueError(f"unknown prompt mode: {prompt_mode}")
     try:
         return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     except Exception:  # noqa: BLE001
@@ -367,9 +387,84 @@ class Engine:
             return tokenizer_context
         return 8192
 
-    def _prompt_tokens(self, messages: list[dict]) -> int:
-        prompt = format_messages(self.tokenizer, messages)
+    def _context_extension_action(self) -> str:
+        """Return valid overflow guidance for the active architecture."""
+
+        from ..models.families import SPALMER_MODEL_FAMILY
+
+        if self.spec and self.spec.model_family == SPALMER_MODEL_FAMILY:
+            return "increase the configured native SPALMER context limit"
+        return "use YaRN"
+
+    def _prompt_tokens(self, messages: list[dict], *, prompt_mode: str = "chat") -> int:
+        prompt = format_messages(self.tokenizer, messages, prompt_mode=prompt_mode)
         return _encoded_length(self.tokenizer(prompt))
+
+    def plan_context(
+        self,
+        messages: list[dict],
+        *,
+        max_new_tokens: int,
+        prompt_mode: str = "chat",
+        compact: bool = True,
+        strategy: str | None = None,
+        recent_turns: int | None = None,
+        max_nll_probes: int | None = None,
+        nll_probe_tokens: int | None = None,
+        min_nll_gain_nats: float | None = None,
+        nll_token_cost_nats: float | None = None,
+        trigger_ratio: float | None = None,
+    ) -> ChatContextPlan:
+        """Plan either conversational context or one literal completion prompt."""
+
+        if prompt_mode == "chat":
+            return self.plan_chat_context(
+                messages,
+                max_new_tokens=max_new_tokens,
+                compact=compact,
+                strategy=strategy,
+                recent_turns=recent_turns,
+                max_nll_probes=max_nll_probes,
+                nll_probe_tokens=nll_probe_tokens,
+                min_nll_gain_nats=min_nll_gain_nats,
+                nll_token_cost_nats=nll_token_cost_nats,
+                trigger_ratio=trigger_ratio,
+            )
+        if prompt_mode != "raw":
+            raise ValueError(f"unknown prompt mode: {prompt_mode}")
+        if not self.is_loaded():
+            raise RuntimeError("no model loaded")
+
+        answer_budget = int(max_new_tokens)
+        if answer_budget < 1:
+            raise ValueError("max_new_tokens must be positive")
+        context_limit = self.context_limit()
+        prompt_budget = context_limit - answer_budget
+        if prompt_budget < 1:
+            raise ValueError(
+                f"Answer budget ({answer_budget}) leaves no prompt space in the "
+                f"{context_limit}-token context."
+            )
+
+        copied = [dict(message) for message in messages]
+        prompt_tokens = self._prompt_tokens(copied, prompt_mode="raw")
+        if prompt_tokens > prompt_budget:
+            raise ValueError(
+                f"Raw prompt needs {prompt_tokens} tokens but only {prompt_budget} remain after "
+                f"reserving {answer_budget} completion tokens. Raw prompts are never compacted or "
+                "truncated; shorten the prompt, lower the completion budget, or "
+                f"{self._context_extension_action()}."
+            )
+        return ChatContextPlan(
+            messages=tuple(copied),
+            prompt_tokens=prompt_tokens,
+            prompt_budget=prompt_budget,
+            context_limit=context_limit,
+            answer_budget=answer_budget,
+            prompt_mode="raw",
+            strategy="none",
+            selection_budget=prompt_budget,
+        )
 
     def _token_ids(self, text: str) -> list[int]:
         encoded = self.tokenizer(text, add_special_tokens=False)["input_ids"]
@@ -451,7 +546,8 @@ class Engine:
         if candidate_tokens > prompt_budget:
             raise ValueError(
                 f"The current turn plus protected instructions needs {candidate_tokens} tokens, but only "
-                f"{prompt_budget} remain after reserving the answer. Reduce the message or use YaRN."
+                f"{prompt_budget} remain after reserving the answer. Reduce the message or "
+                f"{self._context_extension_action()}."
             )
 
         for group in reversed(groups[:-1]):
@@ -512,7 +608,8 @@ class Engine:
         if mandatory_tokens > prompt_budget:
             raise ValueError(
                 f"The current turn plus protected instructions needs {mandatory_tokens} tokens, but only "
-                f"{prompt_budget} remain after reserving the answer. Reduce the message or use YaRN."
+                f"{prompt_budget} remain after reserving the answer. Reduce the message or "
+                f"{self._context_extension_action()}."
             )
         selection_budget = max(selection_budget, mandatory_tokens)
 
@@ -689,14 +786,16 @@ class Engine:
                 )
             raise ValueError(
                 f"Chat prompt needs {prompt_tokens} tokens but only {prompt_budget} remain after "
-                f"reserving {answer_budget} answer tokens. Enable context compaction or use YaRN."
+                f"reserving {answer_budget} answer tokens. Enable context compaction or "
+                f"{self._context_extension_action()}."
             )
 
         protected, groups = _conversation_groups(copied)
         if not groups:
             raise ValueError(
                 f"Protected chat instructions need {prompt_tokens} tokens but the prompt budget is "
-                f"{prompt_budget}. Reduce them, lower the answer budget, or use YaRN."
+                f"{prompt_budget}. Reduce them, lower the answer budget, or "
+                f"{self._context_extension_action()}."
             )
 
         if strategy == "recency":
@@ -762,6 +861,7 @@ class Engine:
                 pass
 
     def load(self, spec: LoadSpec) -> list[str]:
+        from ..models.families import SPALMER_MODEL_FAMILY, family_from_reference
         from ..models.loading import load_base
         from ..mole.inject import MoLEConfig, inject_mole, set_stage
         from ..mole.runtime import AdaptiveExpertRuntime
@@ -771,6 +871,9 @@ class Engine:
             load_mole_config,
             load_mole_weights,
         )
+        model_family = spec.model_family or family_from_reference(spec.ref)
+        if model_family == SPALMER_MODEL_FAMILY:
+            return self._load_spalmer(replace(spec, model_family=model_family))
 
         resolved_settings, preset_context = _context_mode_settings(spec.ref, dict(spec.settings))
         spec = replace(spec, settings=resolved_settings)
@@ -863,6 +966,53 @@ class Engine:
                 pass
             return list(notes)
 
+    def _load_spalmer(self, spec: LoadSpec) -> list[str]:
+        """Load a native SPALMER bundle behind yyLab's inference contract."""
+
+        from ..models.spalmer import load_spalmer_runtime
+
+        if spec.adapter_path or spec.router_path:
+            raise ValueError(
+                "SPALMER checkpoints contain their native micro-expert bank; "
+                "yyLab LoRA/MoLE adapters and router snapshots are not compatible"
+            )
+        mode = str(spec.settings.get("context_mode") or "native")
+        if mode not in {"", "native"} or str(spec.settings.get("rope_scaling") or "none") != "none":
+            raise ValueError(
+                "SPALMER uses recurrent KDA/NoPE MLA state and does not use RoPE or YaRN; "
+                "select native context"
+            )
+        if spec.quant not in {"", "auto", "bf16", "checkpoint", "native"}:
+            raise ValueError(
+                "SPALMER precision is checkpoint-native (FP4 expert forward, MXFP8 "
+                "activations, BF16 parameters); select Auto or BF16"
+            )
+
+        settings = dict(spec.settings)
+        settings.update(context_mode="native", rope_scaling="none", rope_factor=1.0)
+        spec = replace(spec, quant="checkpoint", settings=settings)
+        with self._lock:
+            if self.model is not None:
+                del self.model
+                self.model = None
+            self.adaptive_runtime = None
+            facade = load_spalmer_runtime(
+                spec.ref,
+                dynamic_residency=bool(settings.get("spalmer_dynamic_residency", True)),
+                max_context_tokens=(
+                    int(settings["max_context_tokens"])
+                    if int(settings.get("max_context_tokens") or 0) > 0
+                    else None
+                ),
+            )
+            self.model = facade
+            self.tokenizer = facade.tokenizer
+            self.spec = spec
+            self.notes = list(facade.notes)
+            self.cuda = bool(facade.cuda_available)
+            self.device = "cuda" if self.cuda else "cpu"
+            return list(self.notes)
+
     def _generate_kwargs(
         self, input_ids, attention_mask, temperature: float, top_p: float, max_new_tokens: int
     ) -> dict:
@@ -870,8 +1020,10 @@ class Engine:
         max_ctx = self.context_limit()
         prompt_len = input_ids.shape[1]
         budget = max_ctx - prompt_len
-        if budget < 2:
-            raise ValueError(f"Prompt ({prompt_len} tokens) exceeds max context ({max_ctx}).")
+        if budget < 1:
+            raise ValueError(
+                f"Prompt ({prompt_len} tokens) leaves no generation room in max context ({max_ctx})."
+            )
         kwargs: dict = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
@@ -882,10 +1034,22 @@ class Engine:
         if temperature > 0:
             kwargs["temperature"] = max(float(temperature), 1e-5)
             kwargs["top_p"] = float(top_p)
-        cache_kwargs, cache_notes = _cache_kwargs(settings, self.cuda)
+        from ..models.families import SPALMER_MODEL_FAMILY
+
+        spalmer = bool(self.spec and self.spec.model_family == SPALMER_MODEL_FAMILY)
+        if spalmer:
+            cache_kwargs, cache_notes = {}, [
+                "SPALMER generation uses native recurrent KDA/MLA state; Transformers KV cache settings do not apply."
+            ]
+        else:
+            cache_kwargs, cache_notes = _cache_kwargs(settings, self.cuda)
         self.notes.extend(cache_notes)
         kwargs.update(cache_kwargs)
-        if str(settings.get("cache_implementation") or "dynamic") == "quantized_offloaded":
+        if (
+            not spalmer
+            and str(settings.get("cache_implementation") or "dynamic")
+            == "quantized_offloaded"
+        ):
             import torch
 
             from .quantized_offload_cache import QuantizedOffloadedCache
@@ -925,6 +1089,7 @@ class Engine:
         top_p: float = 0.9,
         max_new_tokens: int = 512,
         telemetry_callback: Callable[[dict[str, object]], None] | None = None,
+        prompt_mode: str = "chat",
     ) -> Iterator[str]:
         # Adaptive occupancy is model-attached mutable state. Serializing all
         # generation also prevents fixed-route adapters and the global cancel
@@ -934,7 +1099,7 @@ class Engine:
                 raise RuntimeError("no model loaded")
             self._cancel.clear()
 
-            prompt = format_messages(self.tokenizer, messages)
+            prompt = format_messages(self.tokenizer, messages, prompt_mode=prompt_mode)
             enc = self.tokenizer(prompt, return_tensors="pt")
             input_ids = enc["input_ids"].to(self.model.device)
             attention_mask = enc["attention_mask"].to(self.model.device)
@@ -993,7 +1158,13 @@ class Engine:
 
     def routing_telemetry(self) -> dict[str, object] | None:
         runtime = self.adaptive_runtime
-        return None if runtime is None else runtime.telemetry()
+        if runtime is not None:
+            return runtime.telemetry()
+        getter = getattr(self.model, "routing_telemetry", None)
+        if callable(getter):
+            value = getter()
+            return value if isinstance(value, dict) else None
+        return None
 
     def adaptive_telemetry(self) -> dict[str, object] | None:
         """Backward-compatible alias for adaptive routing telemetry."""

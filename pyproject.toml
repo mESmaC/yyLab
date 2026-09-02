@@ -33,12 +33,14 @@ dependencies = [
     "rich>=14",
     "sentence-transformers>=6.0.0",
     "liger-kernel>=0.8.2",
+    "fla-core>=0.4",
     "torchao>=0.18",
     "nvidia-cusparselt-cu13>=0.9.1; sys_platform == 'win32'",
     "pypdf>=6.16.2",
     "python-docx>=1.2.0",
     "beautifulsoup4>=4.15.0",
     "langdetect>=1.0.9",
+    "spalmer[hf]>=0.1.0",
 ]
 
 [dependency-groups]
@@ -70,6 +72,7 @@ explicit = true
 
 [tool.uv.sources]
 torch = { index = "pytorch-cu128" }
+spalmer = { git = "https://github.com/mESmaC/spalmer.git", rev = "fc7c45f39133c5886525abaf63143c56781a47bb" }
 
 [tool.ruff]
 line-length = 110

@@ -8,7 +8,10 @@ from . import (  # noqa: F401
     review,
     runs,
     settings,
+    tokenizers,
     train_base,
     train_mole,
+    train_preference,
     train_router,
+    train_spalmer,
 )

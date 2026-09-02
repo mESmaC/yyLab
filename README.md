@@ -18,9 +18,17 @@ Artifacts live in `./artifacts` (override with `YYLAB_HOME`).
 ## Features
 
 - **Corpora intake** — point at a folder; adapter plugins per filetype,
-  normalization, exact + MinHash dedup, domain tagging, zstd JSONL shards,
+  streaming JSONL/Parquet normalization, exact + bounded-memory MinHash dedup,
+  domain tagging, zstd JSONL shards,
   token counts across GPT-2/tiktoken, Llama 3.x, Qwen 2.5, Phi-3, Gemma,
-  Mistral tokenizers; mixture charts + live stats table.
+  Mistral tokenizers; mixture charts + live stats table. JSON-encoded message
+  columns are retained structurally, accepted-document token counts are
+  accumulated inline, and compressed output is not reread after ingest. The
+  dataset-library button uses a preservation-oriented fast path for published
+  corpora: canonical global dedup only, with MinHash/language/quality cleaning
+  reserved for the explicit ingest dialog. When enabled, MinHash retains the
+  same 9×13 band decision in a compact fingerprint index rather than keeping
+  document keys and candidate sets for every row.
 - **Human-trained corpus ranker** — every review swipe is committed immediately
   with its text, provenance, queue component, and model score. A standardized
   logistic Stage-1 model trains from the unique human labels and reports strict
@@ -36,12 +44,45 @@ Artifacts live in `./artifacts` (override with `YYLAB_HOME`).
   attention and KV heads, head dimension, native context, RoPE theta,
   embeddings, initialization, normalization, and attention controls. Native
   context and the shorter sequence length used by a particular run are
-  independent. An exact parameter calculator and nearest-layer solver show the
-  achieved model size before launch; scratch runs are full-parameter runs,
+  independent. An exact parameter calculator and deterministic shape solver
+  can vary width, MLP width, attention layout, and depth for genuinely tiny
+  models. Targets are continuous from 0.100M upward rather than limited to
+  presets, with an exact integer override for non-round counts. It never
+  shrinks below the tokenizer vocabulary and reports the
+  irreducible embedding floor. Scratch runs may reuse an existing tokenizer or
+  train a configurable compact byte-level BPE tokenizer from the selected
+  corpora; 2048 entries is a default, not a fixed size, and a ~1M preset is only
+  a shortcut.
+  Scratch runs are full-parameter runs,
   while continued runs retain full, LoRA, and QLoRA choices. A base run can
   select multiple ordered corpora; new recipes mix their eligible documents by
   deterministic round robin while still consuming every document in each
-  epoch, and persist the selected sources and mix provenance with the run.
+  epoch, and persist the selected sources and mix provenance with the run. The
+  UI defaults source splits to `train + unspecified`, retaining legacy corpora
+  while excluding explicit validation/test shards unless selected.
+  Runs may instead request an explicit training-token budget; yyLab rounds it
+  up to a whole optimizer step, persists requested and scheduled token totals,
+  and keeps legacy explicit-step and epoch-derived caps replayable.
+- **Tokenizer laboratory** — train reusable byte-level BPE artifacts directly
+  from any corpus/split/domain selection without materializing the corpus in
+  RAM, or import an HF tokenizer directory/raw `tokenizer.json` into an
+  independent self-contained copy. Vocabulary size is arbitrary above the
+  chosen byte-coverage floor: 257 for minimal causal, 264 for built-in chat
+  roles, or 256 plus a custom special-token list. No normalization (exact byte
+  round trip) is the default; NFKC and NFKC+lowercase are explicit options.
+  Detached runs report held-out or deterministic-fallback bytes/token,
+  vocabulary utilization, round-trip failures, checksums, and corpus
+  provenance. Ready artifacts have stable registry IDs for later model recipes.
+- **Native SPALMER experiments** — plan and queue scratch 10M, 50M, 100M, or
+  exact custom-size SPALMER checkpoints from one or more yyLab corpora while
+  reusing any registered or compatible Hugging Face tokenizer. The worker
+  preserves the architecture's per-layer PLE, 3:1 KDA/MLA cycle, directional
+  branch, optional ATXY component, 200 coherent micro-experts, adaptive 2–20
+  expert residency, W4/MXFP8 expert QAT, BF16 parameters, and FP32 Adam moments.
+  FLA supplies the optimized CUDA KDA path. Completed native `.pt` bundles are
+  registered automatically and can be loaded directly in Chat or benchmarked
+  with fixed versus adaptive residency; HF LoRA/MoLE adapters and RoPE/YaRN are
+  intentionally not applied to this NoPE recurrent architecture.
 - **Explicit base-training precision** — parameter dtype, QAT numerics,
   activation quantization, optimizer implementation/state placement, AdamW
   constants, scheduler/warmup, batching, checkpointing, compile, and fused
@@ -69,6 +110,13 @@ Artifacts live in `./artifacts` (override with `YYLAB_HOME`).
   one sparse decision per token and transformer block, then reuses that route
   across the block's adapted attention and MLP projections. An optional domain
   filter applies globally; data is never assigned to experts by hand.
+- **Soft LoRA identity routing** — an optional learned, parameter-free identity
+  lane competes with the LoRA experts at every token. Selecting it contributes
+  exactly zero adapter delta, so the gate can retain the frozen base behavior
+  where adaptation is unnecessary; dense top-K can include every expert plus
+  identity. This implements [SLIM's](https://arxiv.org/abs/2410.07739)
+  LoRA-versus-identity routing core, not its
+  separate sliding-clustering or dynamic-merge stages.
 - **Adaptive surprise MoLE** — an architecture mode solves expert count and
   rank so each global lane is approximately 0.5% of resolved model parameters,
   then trains nested 1–10% active sets with a calibrated predicted-NLL head.
@@ -81,6 +129,21 @@ Artifacts live in `./artifacts` (override with `YYLAB_HOME`).
 - **Legacy router training** — older sequential expert banks remain loadable
   and can still train a separate shared prompt-level router. New per-token
   adapters carry their routers in the adapter and need no second stage.
+- **Offline preference optimization** — a file or recursive shard directory of
+  JSONL, JSON, and/or Parquet is normalized to one canonical
+  `prompt`/`chosen`/`rejected` contract. Besides direct pair rows, yyLab can
+  group candidate traces by an explicit ID or identical structured prompt and
+  resolve an explicit chosen/rejected label, finite score, or rank. Exact
+  duplicate projections are removed across formats, source splits never pair
+  with each other, and a canonical checksum is revalidated by the worker.
+  Reasoning and tool context are preserved when the trajectories share the
+  exact prompt; divergent tool trajectories and positive-only traces are
+  rejected rather than converted into fake preferences. Valid pairs train an
+  ordinary LoRA or QLoRA adapter with DPO. Prompt tokens are masked, complete
+  assistant turns are scored, and the selected base checkpoint (with the
+  adapter disabled) is the frozen reference policy. This remains deliberately
+  offline: yyLab does not yet provide reward-model, rollout, PPO, or GRPO
+  infrastructure.
 - **Auto training method** — architecture-aware planner estimates VRAM and
   selects LoRA/QLoRA plus batch, accumulation, and gradient checkpointing;
   compatible Qwen3/RTX systems choose the largest power-of-two microbatch that
@@ -124,8 +187,11 @@ Artifacts live in `./artifacts` (override with `YYLAB_HOME`).
   full-precision residual trades a little VRAM for fidelity.
 - **Chat** — load checkpoint (+ native adapter and, for legacy banks, an
   optional prompt-router snapshot), choose native or YaRN 2×/4× context,
-  stream generation, and preserve instructions, recent turns, and the full
-  requested answer budget. Under pressure, the adaptive context policy uses
+  select chat-template or independent raw-completion prompts, stream generation,
+  and preserve instructions, recent turns, and the full requested answer budget
+  in chat mode. Raw mode bypasses chat control tokens and rejects oversized
+  prompts instead of inventing history or silently compacting them. Under
+  pressure, the adaptive chat-context policy uses
   optional factorized addresses `A=(T,X,Y)`, lexical overlap, and recency to
   propose old complete turns, then admits them only when bounded query-NLL gain
   exceeds a configurable token cost. Accepted turns return to chronological
@@ -134,7 +200,7 @@ Artifacts live in `./artifacts` (override with `YYLAB_HOME`).
   Adaptive artifacts additionally show live active/resident lanes, parameter
   occupancy, NLL or entropy signal, hysteresis decisions, recomputations, and
   transfer counters.
-- **RL export** — LoRA and legacy/static MoLE adapters can be folded into a
+- **Adapter export** — LoRA (including DPO-trained LoRA) and legacy/static MoLE adapters can be folded into a
   standalone HF checkpoint. Learned per-token routing is dynamic and cannot be
   represented exactly by one dense weight matrix, so its lossless artifact is
   the native version-3 safetensors + JSON adapter. Adaptive v4 adds its expert
