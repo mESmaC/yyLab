@@ -40,6 +40,11 @@ BAD_DOC = (
     "casino bonus free spins casino bonus free spins casino bonus free spins casino bonus "
     "free spins casino bonus free spins casino bonus free spins casino bonus free spins now"
 )
+QUARANTINED_DOC = (
+    "buy now buy now buy now buy now buy now buy now buy now buy now buy now buy now "
+    "buy now buy now buy now buy now buy now buy now buy now buy now buy now buy now "
+    "buy now buy now buy now buy now buy now buy now buy now buy now buy now buy now"
+)
 
 
 def _make_corpus(tmp_path: Path, name: str, extra: dict[str, str] | None = None) -> str:
@@ -229,6 +234,35 @@ def test_default_queue_skips_reviewed_documents(tmp_path):
 
     assert sample_review_docs(cid, n=50) == []
     assert len(sample_review_docs(cid, n=50, skip_reviewed=False)) == 3
+
+
+def test_queue_reads_quarantine_shards_from_ingest_directory(tmp_path):
+    src = tmp_path / "review-quarantine"
+    src.mkdir()
+    (src / "good.txt").write_text(GOOD_A, "utf-8")
+    (src / "junk.txt").write_text(QUARANTINED_DOC, "utf-8")
+    cid = run_ingest(
+        lambda *a: None,
+        IngestConfig(
+            name="review-quarantine",
+            source_dir=str(src),
+            tokenizer_keys=[],
+            near_dedup=False,
+            global_dedup=False,
+            language_filter=False,
+            quality_filter=True,
+        ),
+    )
+
+    stats = read_json(corpus_dir(cid) / "stats.json")
+    assert stats["quarantine_shards"]
+    assert (corpus_dir(cid) / "data_quarantine" / stats["quarantine_shards"][0]).exists()
+    assert not (corpus_dir(cid) / "quarantine").exists()
+
+    docs = sample_review_docs(cid, n=50, include_quarantine=True, strategy="uniform")
+
+    assert {doc["text"] for doc in docs} == {GOOD_A, QUARANTINED_DOC}
+    assert {doc["bucket"] for doc in docs} == {"data", "quarantine"}
 
 
 class _FakeRanker:

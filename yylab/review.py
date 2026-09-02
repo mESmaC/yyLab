@@ -26,21 +26,21 @@ DEFAULT_AUDIT_FRACTION = 0.10
 _SCORE_BATCH_SIZE = 256
 
 
-def _buckets(cid: str, include_quarantine: bool) -> list[tuple[str, list[str]]]:
+def _buckets(cid: str, include_quarantine: bool) -> list[tuple[str, str, list[str]]]:
     cdir = corpus_dir(cid)
     stats_path = cdir / "stats.json"
     stats = {}
     if stats_path.exists():
         stats = orjson.loads(stats_path.read_bytes())
-    out: list[tuple[str, list[str]]] = [("data", stats.get("shards") or [])]
+    out: list[tuple[str, str, list[str]]] = [("data", "data", stats.get("shards") or [])]
     if include_quarantine:
-        out.append(("quarantine", stats.get("quarantine_shards") or []))
-    return [(b, s) for b, s in out if s]
+        out.append(("quarantine", "data_quarantine", stats.get("quarantine_shards") or []))
+    return [(bucket, data_dir, shards) for bucket, data_dir, shards in out if shards]
 
 
 def _iter_review_docs(cid: str, include_quarantine: bool, reviewed: set[str]):
-    for bucket, shards in _buckets(cid, include_quarantine):
-        for line in _iter_shards(corpus_dir(cid) / bucket, shards):
+    for bucket, data_dir, shards in _buckets(cid, include_quarantine):
+        for line in _iter_shards(corpus_dir(cid) / data_dir, shards):
             text = line.get("text", "")
             if not text:
                 continue
