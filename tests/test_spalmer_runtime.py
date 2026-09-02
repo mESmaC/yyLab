@@ -231,6 +231,8 @@ def _facade(
     *,
     tokenizer: object | None = None,
     dynamic: bool = False,
+    full_pool: bool = False,
+    paging: bool = False,
 ) -> SpalmerCausalLMFacade:
     tokenizer = tokenizer or SimpleNamespace(eos_token_id=2)
     return SpalmerCausalLMFacade(
@@ -239,6 +241,8 @@ def _facade(
         checkpoint_path=Path("fixture.pt"),
         metadata={},
         dynamic_residency=dynamic,
+        expert_paging=paging,
+        full_pool_routing=full_pool or paging,
         max_context_tokens=64,
         cuda_available=False,
     )
@@ -272,7 +276,9 @@ def test_load_spalmer_runtime_is_lazy_and_wraps_a_generic_tokenizer(tmp_path, mo
     assert runtime.device.type == "cpu"
     assert next(runtime.model.parameters()).dtype == torch.float32
     assert runtime.config.max_position_embeddings == 3072
-    assert runtime.dynamic_residency is True
+    assert runtime.dynamic_residency is False
+    assert runtime.expert_paging is False
+    assert runtime.full_pool_routing is True
     assert any("NoPE" in note for note in runtime.notes)
     assert model.calls == 0
 
@@ -319,20 +325,32 @@ def test_load_spalmer_runtime_unwraps_an_hf_tokenizer_adapter(tmp_path, monkeypa
     assert model.calls == 0
 
 
-def _offload_snapshot(*, coherent: bool = True) -> SimpleNamespace:
-    resident = (0, 1)
+def _offload_snapshot(
+    *,
+    paging: bool = True,
+    coherent: bool = True,
+    capacity: int = 20,
+    warm: bool = False,
+) -> SimpleNamespace:
+    resident = () if paging else (0, 1)
+    if paging:
+        cached_by_layer = ((0, 1), (2, 3), (4, 5), (6, 7)) if warm else ((),) * 4
+    else:
+        cached_by_layer = (resident,) * 4 if coherent else (resident, (), resident, resident)
     return SimpleNamespace(
         enabled=True,
+        paging=paging,
+        mode="paged" if paging else "request_global",
         target_device="cuda:0",
-        capacity=20,
+        capacity=capacity,
         resident_expert_ids=resident,
         layer_count=4,
         master_devices=("cpu",) * 4,
         master_pinned_by_layer=(True,) * 4,
         cache_devices=("cuda:0",) * 4,
-        cached_expert_ids_by_layer=(resident,) * 4 if coherent else (resident, (), resident, resident),
+        cached_expert_ids_by_layer=cached_by_layer,
         master_bytes=8 * 2**20,
-        cache_bytes=128 * 2**10,
+        cache_bytes=128 * 2**10 if warm or not paging else 0,
         cache_index_bytes=6_400,
         stage_operations=1,
         transferred_expert_rows=8,
@@ -350,6 +368,7 @@ class _FakeOffloadedSpalmerModel(_FakeSpalmerModel):
         super().__init__()
         self.enable_calls: list[dict[str, object]] = []
         self.to_devices: list[str] = []
+        self.coherent = coherent
         self.snapshot = _offload_snapshot(coherent=coherent)
         self._execution_device = torch.device("cpu")
 
@@ -367,11 +386,83 @@ class _FakeOffloadedSpalmerModel(_FakeSpalmerModel):
 
     def enable_expert_offload(self, device, **kwargs):
         self.enable_calls.append({"device": str(device), **kwargs})
+        paging = bool(kwargs.get("paging", True))
+        self.snapshot = _offload_snapshot(
+            paging=paging,
+            coherent=self.coherent,
+            capacity=int(kwargs.get("cache_size") or 20),
+        )
         self._execution_device = torch.device("cuda:0")
         return self.snapshot
 
     def expert_offload_telemetry(self):
         return self.snapshot if self.enable_calls else None
+
+
+class _PrePagingOffloadedSpalmerModel(_FakeOffloadedSpalmerModel):
+    def enable_expert_offload(
+        self,
+        device,
+        *,
+        cache_size=None,
+        non_blocking=True,
+        pin_memory=True,
+    ):
+        self.enable_calls.append(
+            {
+                "device": str(device),
+                "cache_size": cache_size,
+                "non_blocking": non_blocking,
+                "pin_memory": pin_memory,
+            }
+        )
+        self.snapshot = _offload_snapshot(
+            paging=False,
+            capacity=int(cache_size or 20),
+        )
+        self._execution_device = torch.device("cuda:0")
+        return self.snapshot
+
+
+def test_default_paging_fails_closed_against_a_pre_paging_core(tmp_path, monkeypatch) -> None:
+    checkpoint = tmp_path / "spalmer.pt"
+    checkpoint.write_bytes(b"loader is mocked")
+    model = _PrePagingOffloadedSpalmerModel()
+    tokenizer = _GenericTokenizer()
+    tokenizer.identity = SimpleNamespace(backend="spalmer-rpd-v2")
+    _fake_spalmer_module(monkeypatch, model, tokenizer, {})
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+    with pytest.raises(RuntimeError, match="predates quality-preserving expert paging"):
+        load_spalmer_runtime(checkpoint)
+
+    assert model.enable_calls == []
+
+
+def test_explicit_legacy_mode_remains_compatible_with_a_pre_paging_core(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    checkpoint = tmp_path / "spalmer.pt"
+    checkpoint.write_bytes(b"loader is mocked")
+    model = _PrePagingOffloadedSpalmerModel()
+    tokenizer = _GenericTokenizer()
+    tokenizer.identity = SimpleNamespace(backend="spalmer-rpd-v2")
+    _fake_spalmer_module(monkeypatch, model, tokenizer, {})
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+    runtime = load_spalmer_runtime(checkpoint, expert_paging=False)
+
+    assert runtime.expert_paging is False
+    assert model.enable_calls == [
+        {
+            "device": "cuda",
+            "cache_size": None,
+            "non_blocking": True,
+            "pin_memory": True,
+        }
+    ]
+    assert any("Legacy request-global" in note for note in runtime.notes)
 
 
 def test_cuda_load_uses_physical_expert_offload_and_proves_placement(tmp_path, monkeypatch) -> None:
@@ -391,18 +482,26 @@ def test_cuda_load_uses_physical_expert_offload_and_proves_placement(tmp_path, m
             "cache_size": None,
             "non_blocking": True,
             "pin_memory": True,
+            "paging": True,
         }
     ]
     assert "cuda" not in model.to_devices
     assert runtime.device == torch.device("cuda:0")
+    # A cold paged cache can be allocation-free at load time. Later layers are
+    # independent and need not contain one coherent global identity set.
+    model.snapshot = _offload_snapshot(paging=True, warm=True)
     placement = runtime.expert_offload_telemetry()
     assert placement is not None
     assert placement["physical_expert_offload"] is True
     assert placement["expert_masters_on_cpu"] is True
     assert placement["expert_cache_on_target"] is True
     assert placement["expert_cache_capacity"] == 20
-    assert placement["resident_experts"] == [0, 1]
-    assert any("Physical SPALMER expert offload enabled" in note for note in runtime.notes)
+    assert placement["resident_experts"] == []
+    assert placement["expert_paging"] is True
+    assert placement["expert_cache_ids_by_layer"][0] != placement[
+        "expert_cache_ids_by_layer"
+    ][1]
+    assert any("Paged SPALMER expert offload enabled" in note for note in runtime.notes)
 
 
 def test_cuda_load_fails_closed_when_native_placement_proof_is_incoherent(
@@ -418,13 +517,29 @@ def test_cuda_load_fails_closed_when_native_placement_proof_is_incoherent(
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
 
     with pytest.raises(RuntimeError, match="placement proof failed"):
-        load_spalmer_runtime(checkpoint)
+        load_spalmer_runtime(checkpoint, expert_paging=False)
 
     assert len(model.enable_calls) == 1
     assert "cuda" not in model.to_devices
 
 
-def test_cuda_load_rejects_cache_capacity_above_checkpoint_policy(tmp_path, monkeypatch) -> None:
+def test_paged_cache_capacity_can_exceed_legacy_resident_cap(tmp_path, monkeypatch) -> None:
+    checkpoint = tmp_path / "spalmer.pt"
+    checkpoint.write_bytes(b"loader is mocked")
+    model = _FakeOffloadedSpalmerModel()
+    tokenizer = _GenericTokenizer()
+    tokenizer.identity = SimpleNamespace(backend="spalmer-rpd-v2")
+    _fake_spalmer_module(monkeypatch, model, tokenizer, {})
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+    runtime = load_spalmer_runtime(checkpoint, expert_cache_size=21)
+
+    assert runtime.expert_offload_telemetry()["expert_cache_capacity"] == 21
+    assert model.enable_calls[-1]["paging"] is True
+    assert "cuda" not in model.to_devices
+
+
+def test_legacy_cache_capacity_still_obeys_request_resident_cap(tmp_path, monkeypatch) -> None:
     checkpoint = tmp_path / "spalmer.pt"
     checkpoint.write_bytes(b"loader is mocked")
     model = _FakeOffloadedSpalmerModel()
@@ -434,10 +549,9 @@ def test_cuda_load_rejects_cache_capacity_above_checkpoint_policy(tmp_path, monk
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
 
     with pytest.raises(ValueError, match="cannot exceed.*resident cap"):
-        load_spalmer_runtime(checkpoint, expert_cache_size=21)
+        load_spalmer_runtime(checkpoint, expert_cache_size=21, expert_paging=False)
 
     assert model.enable_calls == []
-    assert "cuda" not in model.to_devices
 
 
 class _Streamer:
@@ -541,6 +655,28 @@ def test_facade_generation_honors_an_iterable_of_stopping_criteria() -> None:
 
     assert generated.tolist() == [[1, 4]]
     assert model.calls == 1
+
+
+def test_full_pool_generation_bypasses_request_global_residency(monkeypatch) -> None:
+    model = _FakeSpalmerModel([4, 2])
+    runtime = _facade(model, full_pool=True)
+    experts = types.ModuleType("spalmer.experts")
+
+    def fail_residency(*_args, **_kwargs):
+        raise AssertionError("paged inference must not choose a request-global expert set")
+
+    experts.choose_inference_residency = fail_residency
+    package = types.ModuleType("spalmer")
+    package.__path__ = []
+    monkeypatch.setitem(sys.modules, "spalmer", package)
+    monkeypatch.setitem(sys.modules, "spalmer.experts", experts)
+
+    generated = runtime.generate(torch.tensor([[1]]), max_new_tokens=2, eos_token_id=2)
+
+    assert generated.tolist() == [[1, 4, 2]]
+    assert model.end_requests == 0
+    assert runtime.routing_telemetry()["routing_mode"] == "unrestricted_top_k"
+    assert runtime.routing_telemetry()["logical_eligible_experts"] == 200
 
 
 def test_facade_forward_can_expose_the_final_hidden_states() -> None:

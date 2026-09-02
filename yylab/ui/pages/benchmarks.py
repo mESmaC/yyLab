@@ -132,6 +132,10 @@ def _quality_job_config(
             raise ValueError("spalmer_expert_cache_size must be positive")
         config.update(
             spalmer_expert_offload=True,
+            # The stable "base" policy now means the checkpoint's trained
+            # full-pool top-k with physical paging.  "dynamic" is retained as
+            # an explicit comparison against the legacy prompt-global mask.
+            spalmer_expert_paging=policy != "dynamic",
             spalmer_expert_cache_size=spalmer_expert_cache_size,
         )
     return config
@@ -296,7 +300,12 @@ def _quality_contract_text(config: dict[str, Any]) -> str:
     if str(config.get("model_family") or "").casefold() == "spalmer":
         cache_size = config.get("spalmer_expert_cache_size")
         cap = str(int(cache_size)) if isinstance(cache_size, int | float) and cache_size else "native"
-        text += f" · physical expert offload ({cap} cap)"
+        mode = (
+            "paged full-pool"
+            if config.get("spalmer_expert_paging", True)
+            else "legacy request-global (experimental)"
+        )
+        text += f" · {mode} expert offload ({cap} cap)"
     return text
 
 
@@ -1000,11 +1009,10 @@ def benchmarks_page() -> None:
                 context_mode.set_value("native")
                 context_mode.disable()
                 policy.options = {
-                    "base": "Fixed learned route",
-                    "dynamic": "Native adaptive residency (2–20 experts)",
+                    "base": "Paged full-pool trained top-k (recommended)",
+                    "dynamic": "Legacy request-global adaptive (experimental)",
                 }
-                if policy.value not in policy.options:
-                    policy.set_value("dynamic")
+                policy.set_value("base")
             else:
                 quality_adapter.enable()
                 quality_quant.enable()
@@ -1061,7 +1069,7 @@ def benchmarks_page() -> None:
             if selected_policy != "base" and not selected_adapter and not spalmer:
                 problems.append("choose an adapter for this policy")
             if spalmer and selected_policy not in {"base", "dynamic"}:
-                problems.append("SPALMER supports base or native dynamic residency")
+                problems.append("SPALMER supports paged or legacy request-global routing")
             if str(prompt_mode.value or "chat") == "raw" and enable_thinking.value:
                 problems.append("thinking requires chat prompt mode")
             if (

@@ -216,16 +216,40 @@ Teacher-forced prompt NLL sometimes preferred the more repetitive constrained
 continuation, so prompt NLL alone is not an adequate free-generation quality
 criterion for this policy.
 
-The two viable follow-ups are:
+The two viable follow-ups identified at that point were:
 
 1. expose the same request-global candidate constraint during training so the
    router and experts learn to work inside it; or
 2. keep full logical top-2 routing and add bounded token/layer-aware expert
    paging or predictive prefetch so the physical cache can remain small.
 
-Until one is implemented, unrestricted top-2 should be used when evaluating
-checkpoint quality. Bounded request-global residency remains useful for
-placement/mechanics experiments but should not be treated as quality-equivalent.
+The second path is now implemented. Full-pool top-2 is the logical default, and
+selected rows are paged independently in each layer through a bounded physical
+cache. Request-global residency remains useful for placement/mechanics
+experiments but is labeled experimental and is not treated as quality-equivalent.
+
+## Paging resolution and Model-1 equivalence
+
+The completed Model-1 checkpoint was compared on the RTX 5070 in BF16 using an
+all-resident CUDA reference and CPU-backed paged inference with a cache capacity
+of only two expert rows per layer. The 48-token validation prompt selected 57–72
+distinct identities per layer during prefill, forcing the pager to tile far
+beyond its cache capacity.
+
+- prefill logits were bit-identical (maximum absolute difference `0.0`);
+- every layer's routed expert identities and routing weights were bit-identical;
+- the 64-token greedy continuation was bit-identical;
+- complete expert masters remained on CPU and every published layer cache stayed
+  at or below two rows on CUDA;
+- the eight layer-local caches diverged as expected instead of sharing one
+  request-global identity set;
+- quantization-error telemetry agreed within `1.87e-9`, a harmless FP32 reduction
+  ordering difference that did not affect routing, logits, or generation.
+
+At this deliberately restrictive two-row capacity, unrestricted/paged timings
+were 2.374/2.866 seconds for prefill and 6.820/9.971 seconds for the 64-token
+decode. These are correctness stress measurements, not a recommended throughput
+configuration; the normal 20-row cache trades more VRAM for fewer transfers.
 
 ## Defects found during the smoke cycle
 
@@ -252,6 +276,7 @@ SPALMER:
 - `5650ad3` — bounded grouped expert routing;
 - `87efaf8` — safe recurrent KDA dispatch;
 - `a9cacd8` — independent resident candidates and token top-k.
+- `54d6b8d` — full-pool logical routing with bounded layer-local expert paging.
 
 yyLab:
 
@@ -259,13 +284,14 @@ yyLab:
 - `b49d221` — first-step optimizer-offload validation;
 - `547d19f` — bounded-execution telemetry;
 - `0d8fc4a` — generation guard correctness;
-- this validation revision pins SPALMER `a9cacd8`, separates active/resident
-  telemetry, and records this report.
+- this validation revision pins SPALMER `54d6b8d`, makes paged full-pool routing
+  the Chat/benchmark default, and retains prompt-global routing as an explicit
+  experimental policy.
 
 Final local verification before commit:
 
-- SPALMER: 336 passed, 1 skipped; Ruff passed.
-- yyLab: 547 passed; Ruff passed.
+- SPALMER: 347 passed, 3 skipped; Ruff passed.
+- yyLab: 555 passed; Ruff passed.
 
 ## Remaining boundaries
 

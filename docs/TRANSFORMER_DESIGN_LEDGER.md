@@ -98,7 +98,7 @@ Initial conventional defaults:
 | C10 | Plasticity and potentiation | Expert-by-expert forward-precision promotion using each 0.5% expert group as the control unit | Candidate |
 | C11 | Output projection | Standard untied linear vocabulary head, softmax, and next-token cross-entropy | Candidate |
 | C12 | Backward and optimizer state | FP8/MXFP8 backward, adaptive FP8 persistent state, CPU offload | Partially implemented; CPU FP32-moment offload is operational |
-| C13 | Inference residency controller | Dynamically select 2–20 resident candidates while preserving an independently sparse per-token top-k; provisional 10% expert-pool cap | Implemented prototype; request-global cap quality is under investigation |
+| C13 | Inference residency controller | Full-pool trained top-k with bounded layer-local paging; retain 2–20 prompt-global adaptive residency as an experiment | Paging implemented and checkpoint-validated; prompt-global policy remains experimental |
 | C14 | Adaptation interfaces | SFT, continued pretraining, RL, LoRA/MoLE, and Soft LoRA experiments | Captured |
 | C15 | Evaluation and observability | Perplexity/NLL, coherence, routing, memory, and benchmark evidence | Captured |
 | C16 | Directional neural subnetworks | Feature-gated feed-forward, feedback, lateral, and lateral active-silencing paths may coexist in each block | Candidate |
@@ -121,7 +121,7 @@ repeated Transformer blocks ----+
   |-- global-attention KV <-> quantized VRAM / CPU offload
   |-- forward / backward / lateral / active-silencing neural paths
   |-- surprise / entropy prediction and per-token expert routing
-  |-- dynamically resident 2-20 of ~200 small experts; route a sparse trained top-k
+  |-- route trained top-k over ~200 experts; page selected rows through bounded layer caches
   |-- pre-norm RMSNorm + additive residual paths
         |
         v
@@ -656,7 +656,8 @@ Interfaces still to specify:
 
 ### C13. Dynamic expert rounding and inference residency
 
-**State:** Implemented prototype.
+**State:** Experimental; quality-preserving paging is implemented and validated,
+while adaptive prompt-global residency remains an explicit comparison policy.
 
 The term **dynamic expert rounding** currently refers to dynamically selecting
 how much of the total expert/weight pool becomes resident at inference, with
@@ -703,33 +704,41 @@ available shared base, vocabulary path, and router disappear from model
 capacity. Nor does it require every resident candidate to execute for every
 token.
 
-The current physical implementation keeps the complete checkpoint-visible BF16
-expert masters in CPU memory and places the shared base, vocabulary path, router,
-and a bounded expert-row cache on the accelerator. One global residency commit
-stages the same expert identities across every layer before publishing the new
-routing mask. Accepted expansion remains fixed throughout autoregressive decode;
-rejected expansion restores both the prior identities and per-token capacity,
-while ordinary residency growth leaves the trained top-k unchanged.
-Fixed inference also starts from the bounded minimum rather than materializing
-the complete expert pool. Cache tensors are derived runtime state and are not
-stored in checkpoints.
+The selected default for checkpoints trained with all experts eligible separates
+logical routing from physical placement. Complete checkpoint-visible BF16 expert
+masters remain in CPU memory. Every token and layer still scores the full expert
+pool and executes the trained top-k, while each layer independently pages only
+its selected expert rows into a bounded accelerator cache. If a prefill selects
+more distinct identities than the cache can hold, execution tiles those
+identities and accumulates every routed contribution in the same order as the
+all-resident implementation. Decode normally needs at most the trained top-k
+rows per layer and retains recent rows for reuse.
+
+The cache contains at most `c` published rows per layer and never becomes a
+routing mask. Replacement allocates and fills the next page before publishing
+it so a failed transfer leaves the prior page executable; this transactional
+window can briefly hold roughly `2c` rows. Cache tensors are derived runtime
+state and are not stored in checkpoints. The original prompt-global controller
+remains available as an explicit legacy experiment: it commits one shared
+candidate set, may expand it during prefill, then freezes it for decode.
 
 Current boundaries:
 
-- Residency changes are request-level during prefill/recomputation, not
-  independently token-level during decode.
+- Default paging follows token- and layer-local router choices during prefill
+  and decode. It is demand-driven rather than predictive and currently uses no
+  overlapped prefetch stream.
 - The first 10M checkpoint learned diffuse top-2 routing with all 200 identities
   eligible during training. Request-global pools of 20, 40, and 60 did not
   preserve its unrestricted generation trajectory; even 100 residents only
-  partially recovered it. A future bounded-residency checkpoint must expose the
-  same candidate constraint during training, or inference must page/prefetch
-  token- or layer-specific candidates while respecting the physical cache cap.
+  partially recovered it. The implemented pager preserves its unrestricted
+  trajectory with a small physical cache. A future checkpoint may still train
+  the prompt-global constraint directly if that policy remains desirable.
 - Teacher-forced prompt NLL alone did not predict continuation coherence for
-  that checkpoint, so bounded selection remains experimental until it includes
-  a stronger continuation-quality or paging signal.
-- Transfers are synchronous with the residency commit boundary. Asynchronous
-  predictive prefetch, multi-request cache sharing, and LRU scheduling remain
-  later runtime work.
+  that checkpoint, so prompt-global selection remains experimental until it
+  includes a stronger continuation-quality signal.
+- CPU-to-accelerator copies are ordered with execution and the cache retains
+  recent rows, but asynchronous predictive prefetch and multi-request cache
+  sharing remain later runtime work.
 - Resident caches mirror BF16 masters; MXFP4/NVFP4 execution values and MXFP8 or
   BF16 potentiated values are derived after staging. Packed low-bit cache storage
   remains coupled to the future native mixed-W4A8 kernel backend.
@@ -864,6 +873,7 @@ composable as more ideas are added.
 | 2026-09-02 | Implemented the routed-expert reference QAT lane in SPALMER with format-faithful MXFP4/NVFP4 weights, MXFP8 activations, one BF16 parameter/master payload, FP32 Adam moments, stochastic BF16 writeback, strict native-backend failure, and checkpointed precision/tokenizer provenance. Native mixed W4A8 and MXFP8 backward remain explicit later backends. |
 | 2026-09-02 | Implemented physical request-level expert residency: full BF16 expert masters remain CPU-backed while coherent bounded expert rows are staged per layer on the accelerator, with transactional expansion/rollback, fixed-route bounds, checkpoint-independent caches, and placement/transfer telemetry. Added the single-device C12 CPU-offloaded FP32 Adam-moment lane with bounded accelerator update chunks. |
 | 2026-09-02 | Model-1 validation separated resident candidates `m` from per-token active experts `k`, restoring `2 <= k <= m` and the trained top-2 route. Cap sweeps through 20%, 30%, and 50% showed that prompt-global residency cannot preserve this checkpoint's diffuse routing; bounded training-time eligibility or token/layer-aware paging is now the required C13 follow-up. |
+| 2026-09-02 | Implemented C13 layer-local expert paging as the default inference policy: the router keeps all trained identities eligible, selected rows are tiled through a bounded CPU-backed accelerator cache, and Model 1 reproduced unrestricted logits, routes, and greedy output exactly with a two-row cache. Prompt-global NLL residency remains an experimental legacy comparison. |
 
 ## Template for the next idea
 

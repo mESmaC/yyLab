@@ -103,7 +103,7 @@ def test_quality_job_config_tags_spalmer_family_and_native_precision():
         checkpoint,
         None,
         quant=benchmarks._resolve_quant(checkpoint, "auto"),
-        policy="dynamic",
+        policy="base",
         profile="smoke",
         repetitions=1,
         label="spalmer",
@@ -112,21 +112,38 @@ def test_quality_job_config_tags_spalmer_family_and_native_precision():
     assert config["model_family"] == "spalmer"
     assert config["quant"] == "checkpoint"
     assert config["spalmer_expert_offload"] is True
+    assert config["spalmer_expert_paging"] is True
     assert config["spalmer_expert_cache_size"] is None
-    assert "physical expert offload (native cap)" in benchmarks._quality_contract_text(config)
+    assert "paged full-pool expert offload (native cap)" in benchmarks._quality_contract_text(
+        config
+    )
 
     bounded = benchmarks._quality_job_config(
         checkpoint,
         None,
         quant="checkpoint",
-        policy="dynamic",
+        policy="base",
         profile="smoke",
         repetitions=1,
         label="spalmer-bounded",
         spalmer_expert_cache_size=8,
     )
     assert bounded["spalmer_expert_cache_size"] == 8
-    assert "physical expert offload (8 cap)" in benchmarks._quality_contract_text(bounded)
+    assert "paged full-pool expert offload (8 cap)" in benchmarks._quality_contract_text(
+        bounded
+    )
+
+    legacy = benchmarks._quality_job_config(
+        checkpoint,
+        None,
+        quant="checkpoint",
+        policy="dynamic",
+        profile="smoke",
+        repetitions=1,
+        label="spalmer-legacy",
+    )
+    assert legacy["spalmer_expert_paging"] is False
+    assert "legacy request-global (experimental)" in benchmarks._quality_contract_text(legacy)
 
 
 def test_quality_job_config_supports_raw_completion_without_thinking():

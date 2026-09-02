@@ -156,13 +156,24 @@ def _routing_telemetry_text(telemetry: dict | None) -> str:
     if not telemetry:
         return ""
     routing_mode = str(telemetry.get("routing_mode") or "")
-    if routing_mode not in {"adaptive_surprise", "fixed_resident"}:
+    if routing_mode not in {
+        "adaptive_surprise",
+        "fixed_resident",
+        "paged_top_k",
+        "unrestricted_top_k",
+    }:
         return ""
     active = int(telemetry.get("active_experts") or 0)
     minimum = int(telemetry.get("minimum_experts") or 0)
     maximum = int(telemetry.get("maximum_experts") or 0)
     active_fraction = float(telemetry.get("active_fraction") or 0.0) * 100.0
-    text = f"{'Adaptive' if routing_mode == 'adaptive_surprise' else 'Fixed'} top-k {active}"
+    mode_label = {
+        "adaptive_surprise": "Adaptive",
+        "fixed_resident": "Fixed",
+        "paged_top_k": "Paged full-pool",
+        "unrestricted_top_k": "Unrestricted full-pool",
+    }[routing_mode]
+    text = f"{mode_label} top-k {active}"
     if minimum and maximum and (minimum != active or maximum != active):
         text += f" ({minimum}–{maximum})"
     text += f" · active {active_fraction:.2f}%"
@@ -185,24 +196,38 @@ def _routing_telemetry_text(telemetry: dict | None) -> str:
         if surprise_ema is not None:
             text += f" (EMA {float(surprise_ema):.3f})"
 
-    resident = telemetry.get("resident_expert_count")
-    if resident is None:
-        resident_ids = telemetry.get("resident_experts")
-        resident = len(resident_ids) if isinstance(resident_ids, (list, tuple)) else resident_ids
-    resident_maximum = telemetry.get("resident_capacity") or telemetry.get("maximum_resident_experts")
-    if resident is not None:
-        text += f" · resident {int(resident)}"
-        if resident_maximum is not None:
-            text += f"/{int(resident_maximum)}"
-        resident_bytes = telemetry.get("resident_bytes")
-        if resident_bytes is not None:
-            text += f" ({float(resident_bytes) / 2**20:.1f} MiB)"
+    paged = routing_mode in {"paged_top_k", "unrestricted_top_k"}
+    if paged:
+        eligible = telemetry.get("logical_eligible_experts") or telemetry.get("total_experts")
+        capacity = telemetry.get("expert_cache_capacity")
+        cached_rows = telemetry.get("expert_cache_cached_rows")
+        if eligible is not None:
+            text += f" · eligible {int(eligible)}"
+        if capacity is not None:
+            text += f" · layer cache cap {int(capacity)}"
+            if cached_rows is not None:
+                text += f" ({int(cached_rows)} total layer rows cached)"
+    else:
+        resident = telemetry.get("resident_expert_count")
+        if resident is None:
+            resident_ids = telemetry.get("resident_experts")
+            resident = len(resident_ids) if isinstance(resident_ids, (list, tuple)) else resident_ids
+        resident_maximum = telemetry.get("resident_capacity") or telemetry.get(
+            "maximum_resident_experts"
+        )
+        if resident is not None:
+            text += f" · resident {int(resident)}"
+            if resident_maximum is not None:
+                text += f"/{int(resident_maximum)}"
+            resident_bytes = telemetry.get("resident_bytes")
+            if resident_bytes is not None:
+                text += f" ({float(resident_bytes) / 2**20:.1f} MiB)"
 
-    text += (
-        f" · expand {int(telemetry.get('expansions') or 0)}"
-        f" / contract {int(telemetry.get('contractions') or 0)}"
-        f" / redo {int(telemetry.get('recomputations') or 0)}"
-    )
+        text += (
+            f" · expand {int(telemetry.get('expansions') or 0)}"
+            f" / contract {int(telemetry.get('contractions') or 0)}"
+            f" / redo {int(telemetry.get('recomputations') or 0)}"
+        )
     cache_hit_rate = telemetry.get("cache_hit_rate")
     if cache_hit_rate is not None:
         text += f" · expert cache {float(cache_hit_rate) * 100:.1f}% hit"
@@ -292,10 +317,10 @@ def chat_page():
                     + " · native context"
                 ).props("outline color=grey")
                 spalmer_dynamic = ui.checkbox(
-                    "Adaptive SPALMER residency (2–20 candidates)", value=True
+                    "Legacy request-global adaptive residency (experimental)", value=False
                 ).tooltip(
-                    "Expands the resident candidate pool when surprise warrants it; "
-                    "per-token top-k stays at the checkpoint's trained value."
+                    "Disables quality-preserving paging and masks routing to one "
+                    "prompt-selected resident set. Leave off for full-pool trained top-k."
                 )
                 spalmer_dynamic.visible = False
                 spalmer_cache_size = (
@@ -309,7 +334,8 @@ def chat_page():
                     .props("dense outlined")
                     .classes("w-56")
                     .tooltip(
-                        "Hard accelerator-resident expert limit. Zero uses the checkpoint's native cap."
+                        "Hard per-layer accelerator expert-cache limit. Zero uses the "
+                        "checkpoint's native cap. It does not limit logical routing in paged mode."
                     )
                 )
                 spalmer_cache_size.visible = False
@@ -571,7 +597,9 @@ def chat_page():
                 engine_settings,
                 str(context_mode.value or "native"),
             )
-            load_settings["spalmer_dynamic_residency"] = bool(spalmer_dynamic.value)
+            legacy_residency = bool(spalmer_dynamic.value)
+            load_settings["spalmer_expert_paging"] = not legacy_residency
+            load_settings["spalmer_dynamic_residency"] = legacy_residency
             load_settings["spalmer_expert_offload"] = True
             load_settings["spalmer_expert_cache_size"] = int(
                 spalmer_cache_size.value or 0
@@ -611,9 +639,12 @@ def chat_page():
                 resolved = ENGINE.spec.settings if ENGINE.spec else {}
                 loaded_mode = str(resolved.get("context_mode") or "native").replace("_", " ")
                 if ENGINE.spec and ENGINE.spec.model_family == "spalmer":
-                    routing_mode = "adaptive residents / trained top-k" if resolved.get(
-                        "spalmer_dynamic_residency", True
-                    ) else "fixed learned route"
+                    if resolved.get("spalmer_expert_paging", True):
+                        routing_mode = "paged full-pool trained top-k"
+                    elif resolved.get("spalmer_dynamic_residency", True):
+                        routing_mode = "legacy request-global adaptive (experimental)"
+                    else:
+                        routing_mode = "legacy fixed resident route (experimental)"
                     cache_cap = resolved.get("spalmer_expert_cache_size") or "checkpoint cap"
                     engine_badge.text = (
                         f"SPALMER · recurrent KDA/NoPE MLA · {routing_mode} · "

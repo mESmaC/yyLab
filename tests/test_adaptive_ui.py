@@ -146,6 +146,33 @@ def test_fixed_spalmer_residency_telemetry_is_visible() -> None:
     assert "physical offload: CPU masters 100.0 MiB → cuda:0 cache 2.0 MiB" in text
 
 
+def test_paged_spalmer_telemetry_reports_full_pool_and_layer_cache() -> None:
+    text = _routing_telemetry_text(
+        {
+            "routing_mode": "paged_top_k",
+            "active_experts": 2,
+            "minimum_experts": 2,
+            "maximum_experts": 2,
+            "active_fraction": 0.01,
+            "logical_eligible_experts": 200,
+            "expert_cache_capacity": 20,
+            "expert_cache_cached_rows": 11,
+            "physical_expert_offload": True,
+            "expert_paging": True,
+            "expert_master_bytes": 100 * 2**20,
+            "expert_cache_bytes": 10 * 2**20,
+            "expert_cache_device": "cuda:0",
+            "stop_reason": "full-pool trained top-k with layer-local on-demand paging",
+        }
+    )
+
+    assert "Paged full-pool top-k 2" in text
+    assert "eligible 200" in text
+    assert "layer cache cap 20 (11 total layer rows cached)" in text
+    assert "resident 0" not in text
+    assert "expand" not in text
+
+
 def test_chat_telemetry_reader_safely_handles_optional_engine_api() -> None:
     class NoTelemetry:
         pass

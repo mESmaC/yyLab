@@ -77,12 +77,15 @@ Artifacts live in `./artifacts` (override with `YYLAB_HOME`).
   exact custom-size SPALMER checkpoints from one or more yyLab corpora while
   reusing any registered or compatible Hugging Face tokenizer. The worker
   preserves the architecture's per-layer PLE, 3:1 KDA/MLA cycle, directional
-  branch, optional ATXY component, 200 coherent micro-experts, adaptive 2–20
-  expert residency, W4/MXFP8 expert QAT, BF16 parameters, and FP32 Adam moments.
-  FLA supplies the optimized CUDA KDA path. Completed native `.pt` bundles are
-  registered automatically and can be loaded directly in Chat or benchmarked
-  with fixed versus adaptive residency; HF LoRA/MoLE adapters and RoPE/YaRN are
-  intentionally not applied to this NoPE recurrent architecture.
+  branch, optional ATXY component, 200 coherent micro-experts, W4/MXFP8 expert
+  QAT, BF16 parameters, and FP32 Adam moments. FLA supplies the optimized CUDA
+  KDA path. Completed native `.pt` bundles are registered automatically and can
+  be loaded directly in Chat or benchmarked. CUDA inference defaults to the
+  checkpoint's trained full-pool top-k while independently paging selected
+  expert rows through bounded per-layer caches; the older prompt-global
+  adaptive-residency controller remains an explicit experimental comparison.
+  HF LoRA/MoLE adapters and RoPE/YaRN are intentionally not applied to this
+  NoPE recurrent architecture.
 - **Explicit base-training precision** — parameter dtype, QAT numerics,
   activation quantization, optimizer implementation/state placement, AdamW
   constants, scheduler/warmup, batching, checkpointing, compile, and fused

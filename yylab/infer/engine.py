@@ -990,6 +990,16 @@ class Engine:
 
         settings = dict(spec.settings)
         expert_offload = bool(settings.get("spalmer_expert_offload", True))
+        expert_paging = bool(settings.get("spalmer_expert_paging", True))
+        # Request-global selection is the legacy experimental policy.  Paged
+        # inference keeps all experts logically eligible, so it must never run
+        # the prompt-NLL residency controller even when loading an older saved
+        # yyLab settings payload whose implicit dynamic default was true.
+        dynamic_residency = (
+            bool(settings.get("spalmer_dynamic_residency", True))
+            if not expert_paging
+            else False
+        )
         raw_cache_size = int(settings.get("spalmer_expert_cache_size") or 0)
         if raw_cache_size < 0:
             raise ValueError("spalmer_expert_cache_size cannot be negative")
@@ -999,6 +1009,8 @@ class Engine:
             rope_scaling="none",
             rope_factor=1.0,
             spalmer_expert_offload=expert_offload,
+            spalmer_expert_paging=expert_paging,
+            spalmer_dynamic_residency=dynamic_residency,
             spalmer_expert_cache_size=expert_cache_size,
         )
         spec = replace(spec, quant="checkpoint", settings=settings)
@@ -1009,7 +1021,7 @@ class Engine:
             self.adaptive_runtime = None
             facade = load_spalmer_runtime(
                 spec.ref,
-                dynamic_residency=bool(settings.get("spalmer_dynamic_residency", True)),
+                dynamic_residency=dynamic_residency,
                 max_context_tokens=(
                     int(settings["max_context_tokens"])
                     if int(settings.get("max_context_tokens") or 0) > 0
@@ -1017,6 +1029,7 @@ class Engine:
                 ),
                 expert_offload=expert_offload,
                 expert_cache_size=expert_cache_size,
+                expert_paging=expert_paging,
             )
             self.model = facade
             self.tokenizer = facade.tokenizer

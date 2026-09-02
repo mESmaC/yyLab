@@ -31,6 +31,7 @@ def test_engine_dispatches_spalmer_before_hf_context_loading(monkeypatch):
         max_context_tokens,
         expert_offload,
         expert_cache_size,
+        expert_paging,
     ):
         calls.append(
             (
@@ -39,6 +40,7 @@ def test_engine_dispatches_spalmer_before_hf_context_loading(monkeypatch):
                 max_context_tokens,
                 expert_offload,
                 expert_cache_size,
+                expert_paging,
             )
         )
         return facade
@@ -54,20 +56,53 @@ def test_engine_dispatches_spalmer_before_hf_context_loading(monkeypatch):
             settings={
                 "context_mode": "native",
                 "max_context_tokens": 3072,
-                "spalmer_dynamic_residency": False,
+                # Old saved settings may still say dynamic=True. The new
+                # default paging mode must force that logical mask off.
+                "spalmer_dynamic_residency": True,
             },
         )
     )
 
-    assert calls == [("fixture.pt", False, 3072, True, None)]
+    assert calls == [("fixture.pt", False, 3072, True, None, True)]
     assert engine.model is facade
     assert engine.tokenizer is facade.tokenizer
     assert engine.spec.model_family == "spalmer"
     assert engine.spec.quant == "checkpoint"
     assert engine.spec.settings["spalmer_expert_offload"] is True
+    assert engine.spec.settings["spalmer_expert_paging"] is True
+    assert engine.spec.settings["spalmer_dynamic_residency"] is False
     assert engine.spec.settings["spalmer_expert_cache_size"] is None
     assert notes == ["native SPALMER"]
     assert engine.routing_telemetry()["active_experts"] == 4
+
+
+def test_engine_keeps_legacy_request_global_residency_explicit(monkeypatch):
+    facade = _Facade()
+    calls = []
+
+    def load(_ref, **kwargs):
+        calls.append(kwargs)
+        return facade
+
+    monkeypatch.setattr("yylab.models.spalmer.load_spalmer_runtime", load)
+    engine = Engine()
+
+    engine.load(
+        LoadSpec(
+            ref="fixture.pt",
+            quant="checkpoint",
+            model_family="spalmer",
+            settings={
+                "spalmer_expert_paging": False,
+                "spalmer_dynamic_residency": True,
+            },
+        )
+    )
+
+    assert calls[0]["expert_paging"] is False
+    assert calls[0]["dynamic_residency"] is True
+    assert engine.spec.settings["spalmer_expert_paging"] is False
+    assert engine.spec.settings["spalmer_dynamic_residency"] is True
 
 
 def test_engine_rejects_hf_only_options_for_spalmer(monkeypatch):

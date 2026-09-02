@@ -531,6 +531,35 @@ def test_benchmark_backend_honors_declared_model_family(tmp_path: Path) -> None:
     assert backend.engine.specs[0].model_family == "hf"
 
 
+def test_spalmer_benchmark_base_is_paged_and_dynamic_is_explicit_legacy() -> None:
+    backend = YyLabBenchmarkBackend(
+        checkpoint_ref="checkpoint.pt",
+        quant="checkpoint",
+        adapter_path=None,
+        adapter_arch="",
+        model_family="spalmer",
+    )
+
+    class Engine:
+        def __init__(self) -> None:
+            self.specs = []
+
+        def load(self, spec):
+            self.specs.append(spec)
+            return []
+
+    backend.engine = Engine()
+
+    backend.configure_policy("base")
+    backend.configure_policy("dynamic")
+
+    assert backend.engine.specs[0].settings["spalmer_expert_paging"] is True
+    assert backend.engine.specs[0].settings["spalmer_dynamic_residency"] is False
+    assert backend.engine.specs[1].settings["spalmer_expert_paging"] is False
+    assert backend.engine.specs[1].settings["spalmer_dynamic_residency"] is True
+    assert backend.identity()["expert_placement"]["requested_expert_paging"] is False
+
+
 @pytest.mark.parametrize(
     ("values", "prompt_open", "expected"),
     [
@@ -839,7 +868,7 @@ def test_spalmer_quality_policies_use_native_expert_bank_without_adapter() -> No
 
     assert policies_for_config({**base, "policy": "base"}) == ["base"]
     assert policies_for_config({**base, "policy": "dynamic"}) == ["dynamic"]
-    with pytest.raises(ValueError, match="base or native dynamic"):
+    with pytest.raises(ValueError, match="paged full-pool.*legacy request-global"):
         policies_for_config({**base, "policy": "matrix"})
 
 

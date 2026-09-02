@@ -298,6 +298,11 @@ class YyLabBenchmarkBackend:
                 "requested_physical_offload": bool(
                     self.settings.get("spalmer_expert_offload", True)
                 ),
+                "requested_expert_paging": bool(
+                    self._policy != "dynamic"
+                    if self._policy in {"base", "dynamic"}
+                    else self.settings.get("spalmer_expert_paging", True)
+                ),
                 "requested_cache_size": self.settings.get("spalmer_expert_cache_size"),
                 "actual_placement": "reported per generation in routing telemetry",
             }
@@ -310,12 +315,14 @@ class YyLabBenchmarkBackend:
         if self.model_family == "spalmer":
             if policy not in {"base", "dynamic"}:
                 raise ValueError(
-                    "SPALMER benchmarks support its fixed base route or native dynamic "
-                    "2–20 expert residency; yyLab adapter/forced-expert policies do not apply"
+                    "SPALMER benchmarks support quality-correct paged routing or the "
+                    "experimental legacy request-global policy; yyLab adapter/forced-expert "
+                    "policies do not apply"
                 )
             stack = f"spalmer:{policy}"
             if self._stack != stack:
                 settings = dict(self.settings)
+                settings["spalmer_expert_paging"] = policy == "base"
                 settings["spalmer_dynamic_residency"] = policy == "dynamic"
                 notes = self.engine.load(
                     LoadSpec(

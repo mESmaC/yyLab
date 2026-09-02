@@ -141,6 +141,12 @@ def _stack_lock(cfg: Mapping[str, object]) -> dict[str, object]:
     if model_family == "spalmer":
         value["spalmer_runtime"] = {
             "physical_expert_offload": bool(cfg.get("spalmer_expert_offload", True)),
+            "expert_paging": bool(
+                cfg.get(
+                    "spalmer_expert_paging",
+                    str(cfg.get("policy") or "base") != "dynamic",
+                )
+            ),
             "expert_cache_size": cfg.get("spalmer_expert_cache_size"),
         }
     value["stack_fingerprint"] = hashlib.sha256(canonical_json(value).encode()).hexdigest()
@@ -202,7 +208,10 @@ def policies_for_config(cfg: Mapping[str, object]) -> list[str]:
     )
     if model_family == "spalmer":
         if policy not in {"base", "dynamic"}:
-            raise ValueError("SPALMER quality benchmarks support base or native dynamic-residency policy")
+            raise ValueError(
+                "SPALMER quality benchmarks support paged full-pool routing or the "
+                "experimental legacy request-global policy"
+            )
         if cfg.get("adapter_path"):
             raise ValueError("SPALMER quality benchmarks do not accept yyLab adapters")
         return [policy]
@@ -344,6 +353,16 @@ def _workload_contract(
             if str(cfg.get("model_family") or "").casefold() in {"spalmer", "spalmer_v1"}
             else None
         ),
+        "spalmer_expert_paging": (
+            bool(
+                cfg.get(
+                    "spalmer_expert_paging",
+                    str(cfg.get("policy") or "base") != "dynamic",
+                )
+            )
+            if str(cfg.get("model_family") or "").casefold() in {"spalmer", "spalmer_v1"}
+            else None
+        ),
         "spalmer_expert_cache_size": cfg.get("spalmer_expert_cache_size"),
         "cells": cells,
     }
@@ -395,6 +414,7 @@ def _generation_comparison_fingerprint(workload_contract: Mapping[str, object]) 
     if workload_contract.get("spalmer_expert_offload") is not None:
         fingerprint_value["spalmer_expert_placement"] = {
             "physical_expert_offload": workload_contract.get("spalmer_expert_offload"),
+            "expert_paging": workload_contract.get("spalmer_expert_paging"),
             "expert_cache_size": workload_contract.get("spalmer_expert_cache_size"),
         }
     return _fingerprint(fingerprint_value)
@@ -1262,6 +1282,12 @@ def run_quality_benchmark(
         if str(cfg.get("model_family") or "").casefold() in {"spalmer", "spalmer_v1"}:
             backend_settings.update(
                 spalmer_expert_offload=bool(cfg.get("spalmer_expert_offload", True)),
+                spalmer_expert_paging=bool(
+                    cfg.get(
+                        "spalmer_expert_paging",
+                        str(cfg.get("policy") or "base") != "dynamic",
+                    )
+                ),
                 spalmer_expert_cache_size=cfg.get("spalmer_expert_cache_size"),
             )
         if str(cfg.get("rope_scaling") or "none") != "none":

@@ -8,6 +8,7 @@ surface used by yyLab's existing chat and benchmark paths.
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from types import SimpleNamespace
@@ -297,6 +298,8 @@ class SpalmerCausalLMFacade(nn.Module):
         checkpoint_path: Path,
         metadata: Mapping[str, Any],
         dynamic_residency: bool,
+        expert_paging: bool,
+        full_pool_routing: bool,
         max_context_tokens: int,
         cuda_available: bool,
         notes: Sequence[str] = (),
@@ -308,6 +311,17 @@ class SpalmerCausalLMFacade(nn.Module):
         self.checkpoint_path = checkpoint_path
         self.metadata = dict(metadata)
         self.dynamic_residency = bool(dynamic_residency)
+        # ``expert_paging`` describes an actually enabled physical backend;
+        # ``full_pool_routing`` is the quality policy and also applies when all
+        # expert masters already reside on CPU or GPU.
+        self.expert_paging = bool(expert_paging)
+        self.full_pool_routing = bool(full_pool_routing)
+        if self.expert_paging and not self.full_pool_routing:
+            raise ValueError("physical expert paging requires full-pool logical routing")
+        if self.full_pool_routing and self.dynamic_residency:
+            raise ValueError(
+                "full-pool expert inference cannot use legacy request-global dynamic residency"
+            )
         self.cuda_available = bool(cuda_available)
         self.cuda = self.cuda_available
         self.notes = list(notes)
@@ -335,9 +349,21 @@ class SpalmerCausalLMFacade(nn.Module):
         return buffer.device if buffer is not None else torch.device("cpu")
 
     def set_dynamic_residency(self, enabled: bool) -> None:
+        if self.full_pool_routing and enabled:
+            raise ValueError(
+                "full-pool expert inference cannot enable legacy request-global residency"
+            )
         self.dynamic_residency = bool(enabled)
 
     def routing_telemetry(self) -> dict[str, object] | None:
+        if self.full_pool_routing:
+            # Paging counters and layer-local identities change during decode,
+            # so always read a fresh native snapshot instead of returning the
+            # prefill receipt captured below.
+            return _full_pool_routing_telemetry(
+                self.model,
+                expert_paging=self.expert_paging,
+            )
         if self.last_routing_telemetry is not None:
             return dict(self.last_routing_telemetry)
         return _fixed_residency_telemetry(self.model)
@@ -439,7 +465,16 @@ class SpalmerCausalLMFacade(nn.Module):
             generator = torch.Generator(device=self.device)
             generator.manual_seed(int(torch.initial_seed() if seed is None else seed))
 
-        use_dynamic = self.dynamic_residency if dynamic_residency is None else dynamic_residency
+        if self.full_pool_routing and dynamic_residency:
+            raise ValueError(
+                "dynamic_residency is the legacy request-global policy and cannot be "
+                "combined with paged expert inference"
+            )
+        use_dynamic = (
+            False
+            if self.full_pool_routing
+            else self.dynamic_residency if dynamic_residency is None else dynamic_residency
+        )
         request_open = False
         was_training = self.model.training
         decision = None
@@ -451,7 +486,16 @@ class SpalmerCausalLMFacade(nn.Module):
             if max_new_tokens == 0:
                 return generated
 
-            if use_dynamic:
+            if self.full_pool_routing:
+                # Native paging is a physical placement policy only.  The
+                # router must see the full trained pool, and the selected rows
+                # are materialized by the layer-local cache on demand.
+                output = self.model(generated, attention_mask=mask)
+                self.last_routing_telemetry = _full_pool_routing_telemetry(
+                    self.model,
+                    expert_paging=self.expert_paging,
+                )
+            elif use_dynamic:
                 from spalmer.experts import choose_inference_residency
 
                 decision = choose_inference_residency(self.model, generated)
@@ -515,10 +559,11 @@ class SpalmerCausalLMFacade(nn.Module):
 def load_spalmer_runtime(
     ref: str | Path,
     *,
-    dynamic_residency: bool = True,
+    dynamic_residency: bool = False,
     max_context_tokens: int | None = None,
     expert_offload: bool = True,
     expert_cache_size: int | None = None,
+    expert_paging: bool = True,
 ) -> SpalmerCausalLMFacade:
     """Load a native bundle and return an HF-shaped inference facade."""
 
@@ -527,6 +572,10 @@ def load_spalmer_runtime(
         raise ValueError("max_context_tokens must be positive")
     if expert_cache_size is not None and expert_cache_size <= 0:
         raise ValueError("expert_cache_size must be positive")
+    if expert_paging and dynamic_residency:
+        raise ValueError(
+            "paged expert inference cannot use legacy request-global dynamic residency"
+        )
 
     # Keep SPALMER optional for yyLab installations that only use HF models.
     from spalmer import load_checkpoint
@@ -547,24 +596,36 @@ def load_spalmer_runtime(
                 raise RuntimeError(
                     "this SPALMER runtime does not implement physical expert offload"
                 )
-            native_cap = _native_resident_cap(model)
+            native_cap = (
+                _native_num_experts(model) if expert_paging else _native_resident_cap(model)
+            )
             if expert_cache_size is not None and expert_cache_size > native_cap:
                 raise ValueError(
-                    "expert_cache_size cannot exceed the checkpoint's bounded "
-                    f"resident cap ({native_cap})"
+                    "expert_cache_size cannot exceed the checkpoint's "
+                    f"{'expert count' if expert_paging else 'bounded resident cap'} "
+                    f"({native_cap})"
                 )
-            snapshot = enable_offload(
-                device,
-                cache_size=expert_cache_size,
-                non_blocking=True,
-                pin_memory=True,
-            )
+            supports_paging = _accepts_keyword(enable_offload, "paging")
+            if expert_paging and not supports_paging:
+                raise RuntimeError(
+                    "this SPALMER runtime predates quality-preserving expert paging; "
+                    "upgrade SPALMER or explicitly select legacy request-global mode"
+                )
+            offload_kwargs: dict[str, object] = {
+                "cache_size": expert_cache_size,
+                "non_blocking": True,
+                "pin_memory": True,
+            }
+            if supports_paging:
+                offload_kwargs["paging"] = expert_paging
+            snapshot = enable_offload(device, **offload_kwargs)
             try:
                 offload = _validated_expert_offload_telemetry(
                     model,
                     snapshot,
                     expected_device=device,
                     expected_capacity=expert_cache_size,
+                    expected_paging=expert_paging,
                 )
             except BaseException:
                 disable_offload = getattr(model, "disable_expert_offload", None)
@@ -606,16 +667,27 @@ def load_spalmer_runtime(
     ]
     if offload is not None:
         pinned = "pinned " if offload["expert_masters_pinned"] else ""
-        notes.extend(
-            (
-                "Physical SPALMER expert offload enabled: complete expert master banks "
-                f"remain in {pinned}CPU RAM and only request-resident rows execute on "
-                f"{offload['expert_cache_device']}.",
-                "SPALMER expert cache is hard-bounded at "
-                f"{offload['expert_cache_capacity']}/{offload['total_experts']} identities "
-                "for fixed and adaptive routing.",
+        if expert_paging:
+            notes.extend(
+                (
+                    "Paged SPALMER expert offload enabled: the trained router can select "
+                    "from the full expert pool while selected rows are loaded from "
+                    f"{pinned}CPU RAM into layer-local {offload['expert_cache_device']} caches.",
+                    "SPALMER's per-layer expert cache is hard-bounded at "
+                    f"{offload['expert_cache_capacity']}/{offload['total_experts']} identities; "
+                    "physical residency does not mask logical routing.",
+                )
             )
-        )
+        else:
+            notes.extend(
+                (
+                    "Legacy request-global SPALMER expert offload is enabled (experimental): "
+                    f"complete expert masters remain in {pinned}CPU RAM and only one shared "
+                    f"resident set executes on {offload['expert_cache_device']}.",
+                    "This legacy policy can change the trained router's output by masking "
+                    "experts outside the request-global resident set.",
+                )
+            )
     elif cuda:
         notes.append("SPALMER parameters run as BF16 on CUDA; physical expert offload is disabled.")
     else:
@@ -629,6 +701,8 @@ def load_spalmer_runtime(
         checkpoint_path=checkpoint_path,
         metadata=metadata,
         dynamic_residency=dynamic_residency,
+        expert_paging=bool(offload is not None and offload["expert_paging"]),
+        full_pool_routing=expert_paging,
         max_context_tokens=context_limit,
         cuda_available=cuda,
         notes=notes,
@@ -922,6 +996,31 @@ def _native_resident_cap(model: nn.Module) -> int:
     return cap
 
 
+def _native_num_experts(model: nn.Module) -> int:
+    residency = getattr(model, "residency", None)
+    config = getattr(residency, "config", None)
+    count = int(getattr(config, "num_experts", 0) or 0)
+    if count < 1:
+        raise RuntimeError("SPALMER checkpoint does not declare its expert count")
+    return count
+
+
+def _accepts_keyword(function: object, keyword: str) -> bool:
+    """Return whether a native API explicitly supports a compatibility keyword."""
+
+    try:
+        signature = inspect.signature(function)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return False
+    parameter = signature.parameters.get(keyword)
+    if parameter is not None and parameter.kind is not inspect.Parameter.POSITIONAL_ONLY:
+        return True
+    return any(
+        item.kind is inspect.Parameter.VAR_KEYWORD
+        for item in signature.parameters.values()
+    )
+
+
 def _expert_offload_telemetry(
     model: nn.Module,
     snapshot: object | None = None,
@@ -947,9 +1046,15 @@ def _expert_offload_telemetry(
     total_experts = int(getattr(config, "num_experts", capacity) or capacity)
     cache_devices = tuple(str(value) for value in getattr(snapshot, "cache_devices", ()))
     target_device = str(getattr(snapshot, "target_device", "") or "")
+    paging = bool(getattr(snapshot, "paging", False))
+    raw_mode = str(getattr(snapshot, "mode", "") or "").strip().casefold()
+    mode = raw_mode or ("paged" if paging else "request_global")
+    cached_rows = sum(len(layer) for layer in cached_by_layer)
+    cached_identities = sorted({identity for layer in cached_by_layer for identity in layer})
     return {
         "physical_expert_offload": bool(getattr(snapshot, "enabled", False)),
-        "expert_offload_mode": "cpu_master_gpu_cache",
+        "expert_offload_mode": mode,
+        "expert_paging": paging,
         "expert_masters_on_cpu": bool(getattr(snapshot, "masters_on_cpu", False)),
         "expert_masters_pinned": bool(getattr(snapshot, "masters_pinned", False)),
         "expert_master_devices": [
@@ -975,6 +1080,8 @@ def _expert_offload_telemetry(
         "expert_cache_transfer_bytes": int(getattr(snapshot, "transfer_bytes", 0) or 0),
         "expert_cache_layer_count": int(getattr(snapshot, "layer_count", 0) or 0),
         "expert_cache_ids_by_layer": [list(layer) for layer in cached_by_layer],
+        "expert_cache_cached_rows": cached_rows,
+        "expert_cache_cached_identities": cached_identities,
         "resident_expert_count": len(resident_ids),
         "resident_experts": list(resident_ids),
         "resident_capacity": capacity,
@@ -989,6 +1096,7 @@ def _validated_expert_offload_telemetry(
     *,
     expected_device: torch.device,
     expected_capacity: int | None,
+    expected_paging: bool,
 ) -> dict[str, object]:
     """Fail closed unless native telemetry proves bounded selective placement."""
 
@@ -1001,6 +1109,11 @@ def _validated_expert_offload_telemetry(
         problems.append("complete expert masters are not all on CPU")
     if not value["expert_cache_on_target"]:
         problems.append("layer caches are not all on the execution device")
+    if bool(value["expert_paging"]) != expected_paging:
+        problems.append(
+            "native offload mode does not match the requested "
+            f"{'paged' if expected_paging else 'legacy request-global'} policy"
+        )
 
     target_text = str(value["expert_cache_device"])
     try:
@@ -1014,22 +1127,30 @@ def _validated_expert_offload_telemetry(
             problems.append(f"cache target {target} does not match {expected_device}")
 
     capacity = int(value["expert_cache_capacity"])
-    native_cap = _native_resident_cap(model)
+    native_cap = _native_num_experts(model) if expected_paging else _native_resident_cap(model)
     resident_ids = tuple(int(item) for item in value["resident_experts"])
-    if not 1 <= len(resident_ids) <= capacity <= native_cap:
-        problems.append(
-            "resident identity count/capacity is outside the checkpoint's bounded policy"
-        )
+    if not 1 <= capacity <= native_cap:
+        problems.append("cache capacity is outside the checkpoint's bounded policy")
     if expected_capacity is not None and capacity != expected_capacity:
         problems.append(f"cache capacity {capacity} does not match requested {expected_capacity}")
     layer_count = int(value["expert_cache_layer_count"])
     ids_by_layer = tuple(tuple(layer) for layer in value["expert_cache_ids_by_layer"])
     if layer_count < 1 or len(ids_by_layer) != layer_count:
         problems.append("cache telemetry does not cover every expert layer")
-    elif any(layer != resident_ids for layer in ids_by_layer):
-        problems.append("layer caches do not share one coherent resident identity set")
-    if int(value["expert_master_bytes"]) <= 0 or int(value["expert_cache_bytes"]) <= 0:
-        problems.append("physical expert storage reports no allocated bytes")
+    elif expected_paging:
+        if resident_ids:
+            problems.append("paged offload reports an unexpected request-global resident set")
+        if not _valid_layer_cache_ids(ids_by_layer, capacity, int(value["total_experts"])):
+            problems.append("paged layer cache identities exceed their bounded capacity")
+    else:
+        if not 1 <= len(resident_ids) <= capacity:
+            problems.append("legacy offload has no bounded request-global resident set")
+        if any(layer != resident_ids for layer in ids_by_layer):
+            problems.append("layer caches do not share one coherent resident identity set")
+    if int(value["expert_master_bytes"]) <= 0:
+        problems.append("physical expert master storage reports no allocated bytes")
+    if not expected_paging and int(value["expert_cache_bytes"]) <= 0:
+        problems.append("legacy physical expert cache reports no allocated bytes")
     if problems:
         raise RuntimeError("SPALMER physical expert placement proof failed: " + "; ".join(problems))
     return value
@@ -1044,19 +1165,99 @@ def _assert_live_expert_placement(
 
     resident_ids = tuple(int(item) for item in value["resident_experts"])
     capacity = int(value["expert_cache_capacity"])
-    coherent = all(
-        tuple(int(item) for item in layer) == resident_ids
+    ids_by_layer = tuple(
+        tuple(int(item) for item in layer)
         for layer in value["expert_cache_ids_by_layer"]
+    )
+    paging = bool(value.get("expert_paging"))
+    total_experts = int(value.get("total_experts") or 0)
+    layer_count = int(value.get("expert_cache_layer_count") or 0)
+    valid_cache = (
+        layer_count >= 1
+        and len(ids_by_layer) == layer_count
+        and _valid_layer_cache_ids(ids_by_layer, capacity, total_experts)
+    )
+    coherent = all(layer == resident_ids for layer in ids_by_layer)
+    identity_policy_valid = (
+        not resident_ids and expected_ids is None and valid_cache
+        if paging
+        else (
+            1 <= len(resident_ids) <= capacity
+            and coherent
+            and valid_cache
+            and (expected_ids is None or resident_ids == expected_ids)
+        )
     )
     if (
         not value["physical_expert_offload"]
         or not value["expert_masters_on_cpu"]
         or not value["expert_cache_on_target"]
-        or not 1 <= len(resident_ids) <= capacity
-        or not coherent
-        or (expected_ids is not None and resident_ids != expected_ids)
+        or capacity < 1
+        or not identity_policy_valid
     ):
         raise RuntimeError("SPALMER physical expert cache lost placement or identity coherence")
+
+
+def _valid_layer_cache_ids(
+    ids_by_layer: Sequence[Sequence[int]],
+    capacity: int,
+    total_experts: int,
+) -> bool:
+    if capacity < 1 or total_experts < 1:
+        return False
+    for layer in ids_by_layer:
+        identities = tuple(int(item) for item in layer)
+        if len(identities) > capacity or len(set(identities)) != len(identities):
+            return False
+        if any(identity < 0 or identity >= total_experts for identity in identities):
+            return False
+    return True
+
+
+def _full_pool_routing_telemetry(
+    model: nn.Module,
+    *,
+    expert_paging: bool,
+) -> dict[str, object]:
+    """Describe full-pool trained routing with optional physical expert paging."""
+
+    residency = getattr(model, "residency", None)
+    config = getattr(residency, "config", None)
+    active = int(
+        getattr(config, "active_experts", 0)
+        or getattr(config, "min_active_experts", 0)
+        or 0
+    )
+    num_experts = int(getattr(config, "num_experts", active) or active or 1)
+    physical = _expert_offload_telemetry(model)
+    if expert_paging and physical is None:
+        raise RuntimeError("SPALMER physical paging backend is no longer enabled")
+    if physical is not None:
+        _assert_live_expert_placement(physical, expected_ids=None)
+        if bool(physical["expert_paging"]) != expert_paging:
+            raise RuntimeError("SPALMER physical paging state changed after load")
+    value: dict[str, object] = {
+        "routing_mode": "paged_top_k" if expert_paging else "unrestricted_top_k",
+        "active_experts": active,
+        "minimum_experts": active,
+        "maximum_experts": active,
+        "active_fraction": active / max(1, num_experts),
+        "mean_active_experts": float(active),
+        "peak_active_experts": active,
+        "expansions": 0,
+        "contractions": 0,
+        "recomputations": 0,
+        "total_experts": num_experts,
+        "logical_eligible_experts": num_experts,
+        "stop_reason": (
+            "full-pool trained top-k with layer-local on-demand paging"
+            if expert_paging
+            else "full-pool trained top-k"
+        ),
+    }
+    if physical is not None:
+        value.update(physical)
+    return value
 
 
 def _fixed_residency_telemetry(model: nn.Module) -> dict[str, object] | None:
