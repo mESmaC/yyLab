@@ -376,6 +376,9 @@ class _FakeTrainer:
             elapsed_seconds=0.1,
             promoted_experts=(3,),
             average_surprise=2.3,
+            max_expert_group_load=17,
+            max_expert_group_padding_amplification=1.375,
+            max_expert_group_global_max_counterfactual_padding_amplification=13.625,
         )
         self.progress.completed_steps = 1
         self.progress.tokens_seen = 8
@@ -454,6 +457,10 @@ def test_run_writes_native_artifact_metadata_without_real_training(tmp_path, mon
     manifest = json.loads((output / "spalmer_manifest.json").read_text("utf-8"))
     recipe = json.loads((output / "yylab_recipe.json").read_text("utf-8"))
     token_view = json.loads((output / "tokenized_view_manifest.json").read_text("utf-8"))
+    progress = json.loads((tmp_path / "run" / "progress.json").read_text("utf-8"))
+    telemetry = json.loads(
+        (tmp_path / "run" / "metrics.jsonl").read_text("utf-8").splitlines()[-1]
+    )
     placement_receipt = json.loads(
         (tmp_path / "run" / "optimizer_state_placement.json").read_text("utf-8")
     )
@@ -463,6 +470,14 @@ def test_run_writes_native_artifact_metadata_without_real_training(tmp_path, mon
     assert recipe["model_family"] == "spalmer"
     assert token_view["input_width"] == 9
     assert summary["model_family"] == "spalmer"
+    assert progress["max_expert_group_load"] == 17
+    assert progress["max_expert_group_padding_amplification"] == pytest.approx(1.375)
+    assert progress[
+        "max_expert_group_global_max_counterfactual_padding_amplification"
+    ] == pytest.approx(13.625)
+    assert "expert group max=17" in telemetry["msg"]
+    assert "bucket padding=1.375x" in telemetry["msg"]
+    assert "legacy global-max=13.625x" in telemetry["msg"]
     _, update_args = database_calls[-1]
     metadata = json.loads(update_args[-2])
     assert update_args[0].endswith("spalmer.pt")

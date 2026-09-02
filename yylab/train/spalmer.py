@@ -1029,6 +1029,26 @@ def _metric_payload(metrics: Any, *, max_steps: int) -> dict[str, Any]:
     tokens_seen = int(_metric_value(metrics, "tokens_seen", 0))
     elapsed = float(_metric_value(metrics, "elapsed_seconds", 0.0) or 0.0)
     throughput = tokens_seen / max(elapsed, 1e-6)
+    max_group_load = _metric_value(metrics, "max_expert_group_load")
+    max_padding_amplification = _metric_value(
+        metrics,
+        "max_expert_group_padding_amplification",
+    )
+    max_global_max_counterfactual_amplification = _metric_value(
+        metrics,
+        "max_expert_group_global_max_counterfactual_padding_amplification",
+    )
+    message = f"{throughput:,.1f} tok/s"
+    if max_group_load is not None and max_padding_amplification is not None:
+        message += (
+            f" · expert group max={int(max_group_load):,}"
+            f" · bucket padding={float(max_padding_amplification):.3f}x"
+        )
+    if max_global_max_counterfactual_amplification is not None:
+        message += (
+            " · legacy global-max="
+            f"{float(max_global_max_counterfactual_amplification):.3f}x"
+        )
     return {
         "schema_version": 1,
         "stage": "SPALMER base pretraining",
@@ -1044,7 +1064,7 @@ def _metric_payload(metrics: Any, *, max_steps: int) -> dict[str, Any]:
         "tokens_seen": tokens_seen,
         "tok_per_s": throughput,
         "elapsed_s": elapsed,
-        "msg": f"{throughput:,.1f} tok/s",
+        "msg": message,
         "objective": objective,
         "model_loss": float(_metric_value(metrics, "model_loss", objective)),
         "auxiliary_loss": _metric_value(metrics, "auxiliary_loss"),
@@ -1057,6 +1077,19 @@ def _metric_payload(metrics: Any, *, max_steps: int) -> dict[str, Any]:
         "elapsed_seconds": elapsed,
         "promoted_experts": list(_metric_value(metrics, "promoted_experts", ()) or ()),
         "average_surprise": _metric_value(metrics, "average_surprise"),
+        "max_expert_group_load": (
+            None if max_group_load is None else int(max_group_load)
+        ),
+        "max_expert_group_padding_amplification": (
+            None
+            if max_padding_amplification is None
+            else float(max_padding_amplification)
+        ),
+        "max_expert_group_global_max_counterfactual_padding_amplification": (
+            None
+            if max_global_max_counterfactual_amplification is None
+            else float(max_global_max_counterfactual_amplification)
+        ),
     }
 
 
@@ -1078,7 +1111,12 @@ class _TelemetryWriter:
             "SPALMER "
             f"step={step}/{self.max_steps} loss={float(payload['loss']):.4f} "
             f"tokens={int(payload['tokens_seen']):,} "
-            f"surprise={float(payload.get('average_surprise') or 0.0):.4f}",
+            f"surprise={float(payload.get('average_surprise') or 0.0):.4f} "
+            f"group_max={payload.get('max_expert_group_load')} "
+            "bucket_padding_amp="
+            f"{float(payload.get('max_expert_group_padding_amplification') or 0.0):.3f}x "
+            "legacy_global_max_amp="
+            f"{float(payload.get('max_expert_group_global_max_counterfactual_padding_amplification') or 0.0):.3f}x",
             flush=True,
         )
 
