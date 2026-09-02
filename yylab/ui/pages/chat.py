@@ -143,11 +143,11 @@ def _routing_telemetry_text(telemetry: dict | None) -> str:
     active = int(telemetry.get("active_experts") or 0)
     minimum = int(telemetry.get("minimum_experts") or 0)
     maximum = int(telemetry.get("maximum_experts") or 0)
-    occupancy = float(telemetry.get("active_fraction") or 0.0) * 100.0
-    text = f"{'Adaptive' if routing_mode == 'adaptive_surprise' else 'Fixed'} experts {active}"
-    if minimum and maximum:
+    active_fraction = float(telemetry.get("active_fraction") or 0.0) * 100.0
+    text = f"{'Adaptive' if routing_mode == 'adaptive_surprise' else 'Fixed'} top-k {active}"
+    if minimum and maximum and (minimum != active or maximum != active):
         text += f" ({minimum}–{maximum})"
-    text += f" · occupancy {occupancy:.2f}%"
+    text += f" · active {active_fraction:.2f}%"
 
     mean_active = telemetry.get("mean_active_experts")
     peak_active = telemetry.get("peak_active_experts")
@@ -274,9 +274,10 @@ def chat_page():
                     + " · native context"
                 ).props("outline color=grey")
                 spalmer_dynamic = ui.checkbox(
-                    "Adaptive SPALMER residency (2–20 experts)", value=True
+                    "Adaptive SPALMER residency (2–20 candidates)", value=True
                 ).tooltip(
-                    "Starts at two resident experts and expands only when effective surprise warrants it."
+                    "Expands the resident candidate pool when surprise warrants it; "
+                    "per-token top-k stays at the checkpoint's trained value."
                 )
                 spalmer_dynamic.visible = False
                 spalmer_cache_size = (
@@ -589,7 +590,7 @@ def chat_page():
                 resolved = ENGINE.spec.settings if ENGINE.spec else {}
                 loaded_mode = str(resolved.get("context_mode") or "native").replace("_", " ")
                 if ENGINE.spec and ENGINE.spec.model_family == "spalmer":
-                    routing_mode = "adaptive 2–20" if resolved.get(
+                    routing_mode = "adaptive residents / trained top-k" if resolved.get(
                         "spalmer_dynamic_residency", True
                     ) else "fixed learned route"
                     cache_cap = resolved.get("spalmer_expert_cache_size") or "checkpoint cap"

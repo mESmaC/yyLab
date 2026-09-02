@@ -1095,14 +1095,13 @@ def _residency_telemetry(model: nn.Module, decision: object) -> dict[str, object
     residency = getattr(model, "residency", None)
     config = getattr(residency, "config", None)
     num_experts = int(getattr(config, "num_experts", len(resident_ids)) or len(resident_ids))
-    minimum = int(getattr(config, "min_active_experts", active) or active)
-    maximum = int(getattr(config, "max_active_experts", active) or active)
-    resident_cap = int(getattr(config, "resident_cap", maximum) or maximum)
+    configured_minimum = int(getattr(config, "min_active_experts", active) or active)
+    configured_maximum = int(getattr(config, "max_active_experts", active) or active)
+    resident_cap = int(getattr(config, "resident_cap", configured_maximum) or configured_maximum)
     physical = _expert_offload_telemetry(model)
     if physical is not None:
         _assert_live_expert_placement(physical, expected_ids=resident_ids)
         physical_cap = int(physical["expert_cache_capacity"])
-        maximum = min(maximum, physical_cap)
         resident_cap = min(resident_cap, physical_cap)
     trace = tuple((int(count), float(signal)) for count, signal in decision.trace)
     expansions = tuple(tuple(int(value) for value in group) for group in decision.expansions)
@@ -1111,8 +1110,10 @@ def _residency_telemetry(model: nn.Module, decision: object) -> dict[str, object
     value = {
         "routing_mode": "adaptive_surprise",
         "active_experts": active,
-        "minimum_experts": minimum,
-        "maximum_experts": maximum,
+        "minimum_experts": active,
+        "maximum_experts": active,
+        "configured_minimum_active_experts": configured_minimum,
+        "configured_maximum_active_experts": configured_maximum,
         "active_fraction": active / max(1, num_experts),
         "mean_active_experts": float(active),
         "peak_active_experts": active,
@@ -1122,10 +1123,18 @@ def _residency_telemetry(model: nn.Module, decision: object) -> dict[str, object
         "resident_expert_count": len(resident_ids),
         "resident_experts": list(resident_ids),
         "resident_capacity": resident_cap,
+        "resident_fraction": len(resident_ids) / max(1, num_experts),
         "expansions": len(expansions),
         "contractions": 0,
         "recomputations": max(0, len(trace) - 1),
-        "trace": [{"active_experts": count, "signal": signal} for count, signal in trace],
+        "trace": [
+            {
+                "resident_experts": count,
+                "active_experts": active,
+                "signal": signal,
+            }
+            for count, signal in trace
+        ],
         "expansion_groups": [list(group) for group in expansions],
         "stop_reason": "request capacity selected at prefill",
     }

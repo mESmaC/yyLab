@@ -82,10 +82,10 @@ def test_adaptive_telemetry_formatter_reports_native_controller_values() -> None
     text = _routing_telemetry_text(
         {
             "routing_mode": "adaptive_surprise",
-            "active_experts": 4,
+            "active_experts": 2,
             "minimum_experts": 2,
-            "maximum_experts": 20,
-            "active_fraction": 0.02,
+            "maximum_experts": 2,
+            "active_fraction": 0.01,
             "mean_active_experts": 3.25,
             "peak_active_experts": 6,
             "signal_kind": "entropy",
@@ -95,6 +95,7 @@ def test_adaptive_telemetry_formatter_reports_native_controller_values() -> None
             "contractions": 1,
             "recomputations": 2,
             "resident_experts": [1, 3, 5, 7],
+            "resident_capacity": 20,
             "resident_bytes": 8 * 2**20,
             "lane_loads": 4,
             "h2d_bytes": 8 * 2**20,
@@ -110,11 +111,11 @@ def test_adaptive_telemetry_formatter_reports_native_controller_values() -> None
         }
     )
 
-    assert "Adaptive experts 4 (2–20)" in text
-    assert "occupancy 2.00%" in text
+    assert "Adaptive top-k 2" in text
+    assert "active 1.00%" in text
     assert "entropy 1.250 nats (EMA 1.100)" in text
     assert "expand 3 / contract 1 / redo 2" in text
-    assert "resident 4 (8.0 MiB)" in text
+    assert "resident 4/20 (8.0 MiB)" in text
     assert "lane loads 4 / H2D 8.0 MiB" in text
     assert "physical offload: pinned CPU masters 40.0 MiB → cuda:0 cache 8.0 MiB" in text
     assert "stages 3 / transferred 12.0 MiB" in text
@@ -139,7 +140,8 @@ def test_fixed_spalmer_residency_telemetry_is_visible() -> None:
         }
     )
 
-    assert "Fixed experts 2 (2–2)" in text
+    assert "Fixed top-k 2" in text
+    assert "active 1.00%" in text
     assert "resident 2/20" in text
     assert "physical offload: CPU masters 100.0 MiB → cuda:0 cache 2.0 MiB" in text
 

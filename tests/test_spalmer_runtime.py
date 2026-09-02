@@ -571,7 +571,7 @@ def test_dynamic_generation_records_receipt_and_always_restores_request(monkeypa
     decision = SimpleNamespace(
         output=initial,
         resident_ids=(3, 8, 13, 21),
-        active_experts=4,
+        active_experts=2,
         effective_nll=1.25,
         predictive_entropy=1.5,
         average_surprise=1.1,
@@ -594,7 +594,16 @@ def test_dynamic_generation_records_receipt_and_always_restores_request(monkeypa
     assert telemetry is not None
     assert telemetry["routing_mode"] == "adaptive_surprise"
     assert telemetry["resident_experts"] == [3, 8, 13, 21]
-    assert telemetry["active_experts"] == 4
+    assert telemetry["active_experts"] == 2
+    assert telemetry["minimum_experts"] == 2
+    assert telemetry["maximum_experts"] == 2
+    assert telemetry["configured_maximum_active_experts"] == 20
+    assert telemetry["resident_expert_count"] == 4
+    assert telemetry["resident_fraction"] == 0.02
+    assert telemetry["trace"] == [
+        {"resident_experts": 2, "active_experts": 2, "signal": 1.5},
+        {"resident_experts": 4, "active_experts": 2, "signal": 1.25},
+    ]
     assert telemetry["expansions"] == 1
 
 
