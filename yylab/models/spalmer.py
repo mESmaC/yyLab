@@ -401,6 +401,8 @@ class SpalmerCausalLMFacade(nn.Module):
         temperature: float = 1.0,
         top_p: float = 1.0,
         top_k: int | None = None,
+        repetition_penalty: float = 1.0,
+        no_repeat_ngram_size: int = 0,
         eos_token_id: int | Sequence[int] | Tensor | None = None,
         pad_token_id: int | None = None,
         streamer: object | None = None,
@@ -415,22 +417,7 @@ class SpalmerCausalLMFacade(nn.Module):
         """Generate one sequence with SPALMER's explicit recurrent state."""
 
         del pad_token_id, use_cache
-        unsupported = sorted(
-            key
-            for key in kwargs
-            if key
-            in {
-                "cache_config",
-                "cache_implementation",
-                "past_key_values",
-                "prefill_chunk_size",
-            }
-        )
-        if unsupported:
-            raise ValueError(
-                "SPALMER owns recurrent KDA/MLA state; unsupported HF cache options: "
-                + ", ".join(unsupported)
-            )
+        _validate_ignored_generation_kwargs(kwargs)
         _validate_generation_inputs(input_ids, attention_mask, max_new_tokens)
         if do_sample and temperature <= 0:
             raise ValueError("sampling temperature must be positive")
@@ -438,6 +425,10 @@ class SpalmerCausalLMFacade(nn.Module):
             raise ValueError("top_p must be in (0, 1]")
         if top_k is not None and top_k < 0:
             raise ValueError("top_k cannot be negative")
+        if not repetition_penalty > 0:
+            raise ValueError("repetition_penalty must be positive")
+        if not isinstance(no_repeat_ngram_size, int) or no_repeat_ngram_size < 0:
+            raise ValueError("no_repeat_ngram_size must be a non-negative integer")
 
         generated = input_ids.to(device=self.device, dtype=torch.long)
         mask = None if attention_mask is None else attention_mask.to(device=self.device)
@@ -478,6 +469,12 @@ class SpalmerCausalLMFacade(nn.Module):
 
             for index in range(max_new_tokens):
                 scores = output.logits[:, -1]
+                scores = _apply_repetition_guards(
+                    generated,
+                    scores,
+                    repetition_penalty=float(repetition_penalty),
+                    no_repeat_ngram_size=int(no_repeat_ngram_size),
+                )
                 scores = _apply_logits_processors(logits_processor, generated, scores)
                 next_token = _select_token(
                     scores,
@@ -759,6 +756,100 @@ def _eos_ids(value: int | Sequence[int] | Tensor | None) -> frozenset[int]:
     return frozenset(int(item) for item in values)
 
 
+def _validate_ignored_generation_kwargs(kwargs: Mapping[str, Any]) -> None:
+    """Accept inert HF defaults but never silently discard active features."""
+
+    inert_defaults = {
+        "assistant_model": None,
+        "cache_config": None,
+        "cache_implementation": None,
+        "compile_config": None,
+        "decoder_start_token_id": None,
+        "generation_config": None,
+        "max_length": None,
+        "min_length": 0,
+        "min_new_tokens": None,
+        "negative_prompt_attention_mask": None,
+        "negative_prompt_ids": None,
+        "num_beam_groups": 1,
+        "num_beams": 1,
+        "num_return_sequences": 1,
+        "output_attentions": False,
+        "output_hidden_states": False,
+        "output_logits": False,
+        "output_scores": False,
+        "past_key_values": None,
+        "prefill_chunk_size": None,
+        "prefix_allowed_tokens_fn": None,
+        "return_dict_in_generate": False,
+        "synced_gpus": False,
+    }
+    unsupported = [
+        key
+        for key, value in kwargs.items()
+        if key not in inert_defaults or value != inert_defaults[key]
+    ]
+    if not unsupported:
+        return
+
+    cache_options = sorted(
+        key
+        for key in unsupported
+        if key
+        in {
+            "cache_config",
+            "cache_implementation",
+            "past_key_values",
+            "prefill_chunk_size",
+        }
+    )
+    if cache_options:
+        raise ValueError(
+            "SPALMER owns recurrent KDA/MLA state; unsupported HF cache options: "
+            + ", ".join(cache_options)
+        )
+    raise ValueError(
+        "unsupported non-default SPALMER generation options: "
+        + ", ".join(sorted(unsupported))
+    )
+
+
+def _apply_repetition_guards(
+    input_ids: Tensor,
+    scores: Tensor,
+    *,
+    repetition_penalty: float,
+    no_repeat_ngram_size: int,
+) -> Tensor:
+    """Apply HF-compatible repetition guards before caller processors."""
+
+    if repetition_penalty != 1.0:
+        selected = scores.gather(1, input_ids)
+        selected = torch.where(
+            selected < 0,
+            selected * repetition_penalty,
+            selected / repetition_penalty,
+        )
+        scores = scores.scatter(1, input_ids, selected)
+
+    if no_repeat_ngram_size < 1:
+        return scores
+    current_length = input_ids.shape[-1]
+    if current_length < no_repeat_ngram_size:
+        return scores
+    prefix = input_ids[:, current_length + 1 - no_repeat_ngram_size :]
+    windows = input_ids.unfold(dimension=1, size=no_repeat_ngram_size, step=1)
+    matches = (windows[..., :-1] == prefix.unsqueeze(1)).all(dim=-1)
+    vocab_size = scores.shape[-1]
+    banned_mask = scores.new_zeros((scores.shape[0], vocab_size + 1), dtype=torch.bool)
+    banned_mask.scatter_(
+        1,
+        torch.where(matches, windows[..., -1], vocab_size),
+        True,
+    )
+    return scores.masked_fill(banned_mask[:, :vocab_size], -float("inf"))
+
+
 def _apply_logits_processors(processors: object, input_ids: Tensor, scores: Tensor) -> Tensor:
     if processors is None:
         return scores
@@ -804,9 +895,21 @@ def _select_token(
 def _stopping_requested(criteria: object, input_ids: Tensor, scores: Tensor) -> bool:
     if criteria is None:
         return False
-    result = criteria(input_ids, scores) if callable(criteria) else False
+    if not callable(criteria):
+        if isinstance(criteria, (str, bytes)):
+            raise TypeError("stopping_criteria must be callable or an iterable of callables")
+        try:
+            iterator = iter(criteria)  # type: ignore[arg-type]
+        except TypeError as exc:
+            raise TypeError("stopping_criteria must be callable or an iterable of callables") from exc
+        return any(
+            _stopping_requested(criterion, input_ids, scores) for criterion in iterator
+        )
+    result = criteria(input_ids, scores)
     if isinstance(result, Tensor):
         return bool(result.bool().all().item())
+    if isinstance(result, Sequence) and not isinstance(result, (str, bytes)):
+        return bool(result) and all(bool(value) for value in result)
     return bool(result)
 
 

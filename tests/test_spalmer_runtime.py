@@ -205,6 +205,27 @@ class _FakeSpalmerModel(nn.Module):
         self.end_requests += 1
 
 
+class _RankedFakeSpalmerModel(_FakeSpalmerModel):
+    def __init__(self, scores: dict[int, float]) -> None:
+        super().__init__()
+        self.scores = dict(scores)
+
+    def forward(self, input_ids, **_kwargs):
+        self.calls += 1
+        logits = torch.full(
+            (1, input_ids.shape[1], self.config.vocab_size),
+            -20.0,
+            device=input_ids.device,
+        )
+        for token_id, score in self.scores.items():
+            logits[:, -1, token_id] = score
+        return SimpleNamespace(
+            logits=logits,
+            token_mixer_states=(f"token-{self.calls}",),
+            channel_mixer_states=(f"channel-{self.calls}",),
+        )
+
+
 def _facade(
     model: nn.Module,
     *,
@@ -466,6 +487,62 @@ def test_facade_generation_honors_external_stop_without_another_decode() -> None
     assert model.calls == 1
 
 
+def test_facade_generation_composes_repetition_penalty_before_custom_processors() -> None:
+    model = _RankedFakeSpalmerModel({4: 4.0, 5: -2.0, 6: 3.0})
+    runtime = _facade(model)
+    observed: list[torch.Tensor] = []
+
+    def redirect(_ids, scores):
+        observed.append(scores.detach().clone())
+        redirected = scores.clone()
+        redirected[:, 7] = 10.0
+        return redirected
+
+    generated = runtime.generate(
+        torch.tensor([[4, 5]]),
+        max_new_tokens=1,
+        repetition_penalty=2.0,
+        logits_processor=[redirect],
+        eos_token_id=7,
+    )
+
+    assert generated.tolist() == [[4, 5, 7]]
+    assert observed[0][0, 4].item() == pytest.approx(2.0)
+    assert observed[0][0, 5].item() == pytest.approx(-4.0)
+    assert observed[0][0, 6].item() == pytest.approx(3.0)
+
+
+def test_facade_generation_blocks_an_existing_ngram() -> None:
+    model = _RankedFakeSpalmerModel({2: 9.0, 3: 8.0})
+    runtime = _facade(model)
+
+    generated = runtime.generate(
+        torch.tensor([[1, 2, 1]]),
+        max_new_tokens=1,
+        no_repeat_ngram_size=2,
+        eos_token_id=7,
+    )
+
+    assert generated.tolist() == [[1, 2, 1, 3]]
+
+
+def test_facade_generation_honors_an_iterable_of_stopping_criteria() -> None:
+    model = _FakeSpalmerModel([4, 5, 6])
+    runtime = _facade(model)
+
+    generated = runtime.generate(
+        torch.tensor([[1]]),
+        max_new_tokens=5,
+        stopping_criteria=[
+            lambda _ids, _scores: False,
+            lambda ids, _scores: [ids.shape[1] >= 2],
+        ],
+    )
+
+    assert generated.tolist() == [[1, 4]]
+    assert model.calls == 1
+
+
 def test_facade_forward_can_expose_the_final_hidden_states() -> None:
     class HiddenModel(_FakeSpalmerModel):
         def __init__(self) -> None:
@@ -571,4 +648,20 @@ def test_facade_rejects_batch_padding_and_hf_cache_objects_before_forward() -> N
         )
     with pytest.raises(ValueError, match="unsupported HF cache options"):
         runtime.generate(torch.ones((1, 2), dtype=torch.long), past_key_values=object())
+    with pytest.raises(ValueError, match="unsupported non-default.*num_beams"):
+        runtime.generate(torch.ones((1, 2), dtype=torch.long), num_beams=2)
+    with pytest.raises(ValueError, match="unsupported non-default.*unknown_option"):
+        runtime.generate(torch.ones((1, 2), dtype=torch.long), unknown_option=True)
+    with pytest.raises(ValueError, match="repetition_penalty must be positive"):
+        runtime.generate(torch.ones((1, 2), dtype=torch.long), repetition_penalty=0.0)
+    with pytest.raises(ValueError, match="non-negative integer"):
+        runtime.generate(torch.ones((1, 2), dtype=torch.long), no_repeat_ngram_size=1.5)
+
+    unchanged = runtime.generate(
+        torch.ones((1, 2), dtype=torch.long),
+        max_new_tokens=0,
+        num_beams=1,
+        return_dict_in_generate=False,
+    )
+    assert unchanged.tolist() == [[1, 1]]
     assert model.calls == 0
