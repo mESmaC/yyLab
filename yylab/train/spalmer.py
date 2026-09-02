@@ -482,6 +482,16 @@ def normalize_spalmer_config(
         value = str(training.get(name) or expected).strip().casefold()
         if value != expected:
             raise ValueError(f"SPALMER training requires {name}={expected!r}")
+    optimizer_state_offload = str(
+        training.get(
+            "optimizer_state_offload",
+            cfg.get("optimizer_state_offload", "cpu"),
+        )
+        or "cpu"
+    ).strip().casefold()
+    if optimizer_state_offload != "cpu":
+        raise ValueError("SPALMER yyLab training requires optimizer_state_offload='cpu'")
+    cfg["optimizer_state_offload"] = optimizer_state_offload
     for name in (
         "device",
         "require_cuda",
@@ -681,6 +691,7 @@ def build_spalmer_training_config(
         compute_dtype="bfloat16",
         parameter_dtype="bfloat16",
         optimizer_state_dtype="float32",
+        optimizer_state_offload=str(cfg.get("optimizer_state_offload") or "cpu"),
         stochastic_parameter_rounding=_bool(
             cfg.get("stochastic_parameter_rounding"), default=True
         ),
@@ -1100,6 +1111,42 @@ def _parameter_accounting_payload(accounting: Any) -> dict[str, Any]:
     return payload
 
 
+def _optimizer_placement_payload(optimizer: Any) -> dict[str, Any]:
+    reporter = getattr(optimizer, "state_placement", None)
+    if not callable(reporter):
+        raise RuntimeError("SPALMER optimizer does not expose physical state placement")
+    payload = _jsonable(reporter())
+    if not isinstance(payload, dict):
+        raise RuntimeError("SPALMER optimizer returned invalid state-placement telemetry")
+    dense = payload.get("dense")
+    if not isinstance(dense, dict) or dense.get("policy") != "cpu":
+        raise RuntimeError("SPALMER FP32 optimizer moments are not configured for CPU offload")
+    return payload
+
+
+def _validate_initialized_optimizer_offload(payload: Mapping[str, Any]) -> None:
+    dense = payload.get("dense")
+    if not isinstance(dense, Mapping):
+        raise RuntimeError("SPALMER dense optimizer placement telemetry is missing")
+    problems: list[str] = []
+    if not bool(dense.get("initialized")):
+        problems.append("optimizer moments were not initialized")
+    if str(dense.get("moment_dtype") or "") != "float32":
+        problems.append("optimizer moments are not FP32")
+    devices = [str(value) for value in dense.get("devices") or []]
+    if devices != ["cpu"]:
+        problems.append(f"optimizer moment devices are {devices or ['missing']}, not CPU")
+    parameter_devices = [str(value) for value in dense.get("parameter_devices") or []]
+    if not parameter_devices or any(not value.startswith("cuda") for value in parameter_devices):
+        problems.append("BF16 master parameters are not accelerator-resident")
+    if int(dense.get("moment_bytes") or 0) <= 0:
+        problems.append("optimizer reports no physical moment storage")
+    if problems:
+        raise RuntimeError(
+            "SPALMER optimizer-state offload placement proof failed: " + "; ".join(problems)
+        )
+
+
 def _tokenized_view_manifest(
     batches: YYLabSPALMERBatchSource,
     *,
@@ -1286,6 +1333,8 @@ def run_spalmer_base(config: Mapping[str, Any], rd: Path) -> dict[str, Any]:
     telemetry = _TelemetryWriter(rd, max_steps=int(prepared.training.max_steps))
 
     def periodic_checkpoint(trainer: Any, metrics: Any) -> None:
+        placement = _optimizer_placement_payload(trainer.optimizer)
+        _validate_initialized_optimizer_offload(placement)
         step = int(_metric_value(metrics, "step", trainer.progress.completed_steps))
         step_dir = output / "steps" / f"step-{step:08d}"
         _save_bundle_checkpoint(
@@ -1305,6 +1354,20 @@ def run_spalmer_base(config: Mapping[str, Any], rd: Path) -> dict[str, Any]:
         prepared.training,
         on_checkpoint=periodic_checkpoint,
         on_telemetry=telemetry.record,
+    )
+    optimizer_placement = _optimizer_placement_payload(trainer.optimizer)
+    dense_placement = optimizer_placement["dense"]
+    pinned_state = dense_placement.get("cpu_pinned")
+    host_memory = (
+        "pinned when available"
+        if pinned_state is None
+        else ("pinned" if pinned_state else "pageable")
+    )
+    print(
+        "SPALMER optimizer: BF16 accelerator masters; FP32 moments CPU-offloaded; "
+        f"update_chunk={int(prepared.training.optimizer_update_chunk_size):,}; "
+        f"host_memory={host_memory}",
+        flush=True,
     )
     last_metrics: Any = None
     exhausted = False
@@ -1327,6 +1390,8 @@ def run_spalmer_base(config: Mapping[str, Any], rd: Path) -> dict[str, Any]:
             "selected SPALMER corpora produced no complete optimizer step; "
             "check shards, filters, sequence length, and accumulation size"
         )
+    optimizer_placement = _optimizer_placement_payload(trainer.optimizer)
+    _validate_initialized_optimizer_offload(optimizer_placement)
     if telemetry.last_step < int(_metric_value(last_metrics, "step", 0)):
         telemetry.record(last_metrics)
     final_progress = _metric_payload(
@@ -1361,6 +1426,7 @@ def run_spalmer_base(config: Mapping[str, Any], rd: Path) -> dict[str, Any]:
         "tokens": tokens_seen,
         "data_exhausted": exhausted,
         "final": _metric_payload(last_metrics, max_steps=int(prepared.training.max_steps)),
+        "optimizer_state_placement": optimizer_placement,
     }
     manifest = {
         "schema_version": MANIFEST_SCHEMA_VERSION,
@@ -1378,6 +1444,7 @@ def run_spalmer_base(config: Mapping[str, Any], rd: Path) -> dict[str, Any]:
         "directional_config": _jsonable(prepared.bundle.directional),
         "atxy_config": _jsonable(prepared.bundle.atxy),
         "training_config": prepared.training.to_dict(),
+        "optimizer_state_placement": optimizer_placement,
         "parameter_accounting": accounting_payload,
         "data_provenance": data_provenance,
         "result": result,
@@ -1403,6 +1470,7 @@ def run_spalmer_base(config: Mapping[str, Any], rd: Path) -> dict[str, Any]:
             "expert_activations": prepared.bundle.experts.expert_activation_format,
             "master_weights": prepared.bundle.experts.expert_master_dtype,
             "expert_qat_backend": prepared.bundle.experts.expert_qat_backend,
+            "optimizer_moments": "float32_cpu_offload",
         },
         "training_sequence_length": int(prepared.training.sequence_length),
         "data_provenance": data_provenance,

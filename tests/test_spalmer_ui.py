@@ -101,6 +101,7 @@ def test_spalmer_ui_config_preserves_canonical_architecture_and_budget(monkeypat
     normalized = normalize_spalmer_config(config, require_runtime=True)
 
     assert config["architecture_type"] == "spalmer_v1"
+    assert config["recipe_version"] == 2
     assert config["model_family"] == "spalmer"
     assert config["initialization"] == {
         "mode": "scratch",
@@ -116,10 +117,12 @@ def test_spalmer_ui_config_preserves_canonical_architecture_and_budget(monkeypat
     assert config["spalmer"]["experts"]["max_resident_experts"] == 20
     assert config["training"]["parameter_dtype"] == "bfloat16"
     assert config["training"]["optimizer_state_dtype"] == "float32"
+    assert config["training"]["optimizer_state_offload"] == "cpu"
     assert config["training"]["activation_checkpointing"] is False
     assert config["training"]["validation_interval_steps"] == 246
     assert normalized["max_steps"] == 245
     assert normalized["activation_checkpointing"] is False
+    assert normalized["optimizer_state_offload"] == "cpu"
     assert normalized["spalmer"]["require_fla"] is True
 
 

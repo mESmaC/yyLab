@@ -989,7 +989,18 @@ class Engine:
             )
 
         settings = dict(spec.settings)
-        settings.update(context_mode="native", rope_scaling="none", rope_factor=1.0)
+        expert_offload = bool(settings.get("spalmer_expert_offload", True))
+        raw_cache_size = int(settings.get("spalmer_expert_cache_size") or 0)
+        if raw_cache_size < 0:
+            raise ValueError("spalmer_expert_cache_size cannot be negative")
+        expert_cache_size = raw_cache_size if raw_cache_size > 0 else None
+        settings.update(
+            context_mode="native",
+            rope_scaling="none",
+            rope_factor=1.0,
+            spalmer_expert_offload=expert_offload,
+            spalmer_expert_cache_size=expert_cache_size,
+        )
         spec = replace(spec, quant="checkpoint", settings=settings)
         with self._lock:
             if self.model is not None:
@@ -1004,6 +1015,8 @@ class Engine:
                     if int(settings.get("max_context_tokens") or 0) > 0
                     else None
                 ),
+                expert_offload=expert_offload,
+                expert_cache_size=expert_cache_size,
             )
             self.model = facade
             self.tokenizer = facade.tokenizer

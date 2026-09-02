@@ -98,6 +98,14 @@ def test_adaptive_telemetry_formatter_reports_native_controller_values() -> None
             "resident_bytes": 8 * 2**20,
             "lane_loads": 4,
             "h2d_bytes": 8 * 2**20,
+            "physical_expert_offload": True,
+            "expert_masters_pinned": True,
+            "expert_master_bytes": 40 * 2**20,
+            "expert_cache_bytes": 8 * 2**20,
+            "expert_cache_capacity": 20,
+            "expert_cache_device": "cuda:0",
+            "expert_cache_stage_operations": 3,
+            "expert_cache_transfer_bytes": 12 * 2**20,
             "stop_reason": "marginal NLL gain below threshold",
         }
     )
@@ -108,7 +116,32 @@ def test_adaptive_telemetry_formatter_reports_native_controller_values() -> None
     assert "expand 3 / contract 1 / redo 2" in text
     assert "resident 4 (8.0 MiB)" in text
     assert "lane loads 4 / H2D 8.0 MiB" in text
+    assert "physical offload: pinned CPU masters 40.0 MiB → cuda:0 cache 8.0 MiB" in text
+    assert "stages 3 / transferred 12.0 MiB" in text
     assert "marginal NLL gain below threshold" in text
+
+
+def test_fixed_spalmer_residency_telemetry_is_visible() -> None:
+    text = _routing_telemetry_text(
+        {
+            "routing_mode": "fixed_resident",
+            "active_experts": 2,
+            "minimum_experts": 2,
+            "maximum_experts": 2,
+            "active_fraction": 0.01,
+            "resident_expert_count": 2,
+            "resident_capacity": 20,
+            "physical_expert_offload": True,
+            "expert_master_bytes": 100 * 2**20,
+            "expert_cache_bytes": 2 * 2**20,
+            "expert_cache_capacity": 20,
+            "expert_cache_device": "cuda:0",
+        }
+    )
+
+    assert "Fixed experts 2 (2–2)" in text
+    assert "resident 2/20" in text
+    assert "physical offload: CPU masters 100.0 MiB → cuda:0 cache 2.0 MiB" in text
 
 
 def test_chat_telemetry_reader_safely_handles_optional_engine_api() -> None:

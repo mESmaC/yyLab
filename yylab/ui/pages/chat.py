@@ -135,13 +135,16 @@ def _engine_routing_telemetry(engine) -> dict | None:
 def _routing_telemetry_text(telemetry: dict | None) -> str:
     """Format artifact-native adaptive telemetry with optional future fields."""
 
-    if not telemetry or telemetry.get("routing_mode") != "adaptive_surprise":
+    if not telemetry:
+        return ""
+    routing_mode = str(telemetry.get("routing_mode") or "")
+    if routing_mode not in {"adaptive_surprise", "fixed_resident"}:
         return ""
     active = int(telemetry.get("active_experts") or 0)
     minimum = int(telemetry.get("minimum_experts") or 0)
     maximum = int(telemetry.get("maximum_experts") or 0)
     occupancy = float(telemetry.get("active_fraction") or 0.0) * 100.0
-    text = f"Adaptive experts {active}"
+    text = f"{'Adaptive' if routing_mode == 'adaptive_surprise' else 'Fixed'} experts {active}"
     if minimum and maximum:
         text += f" ({minimum}–{maximum})"
     text += f" · occupancy {occupancy:.2f}%"
@@ -191,6 +194,21 @@ def _routing_telemetry_text(telemetry: dict | None) -> str:
         text += f" · lane loads {int(lane_loads)}"
     if h2d_bytes is not None:
         text += f" / H2D {float(h2d_bytes) / 2**20:.1f} MiB"
+    if telemetry.get("physical_expert_offload"):
+        master_bytes = float(telemetry.get("expert_master_bytes") or 0)
+        cache_bytes = float(telemetry.get("expert_cache_bytes") or 0)
+        cache_capacity = int(telemetry.get("expert_cache_capacity") or 0)
+        cache_device = str(telemetry.get("expert_cache_device") or "accelerator")
+        pinned = "pinned " if telemetry.get("expert_masters_pinned") else ""
+        text += (
+            f" · physical offload: {pinned}CPU masters {master_bytes / 2**20:.1f} MiB"
+            f" → {cache_device} cache {cache_bytes / 2**20:.1f} MiB"
+        )
+        if cache_capacity:
+            text += f" (cap {cache_capacity})"
+        transfer_bytes = float(telemetry.get("expert_cache_transfer_bytes") or 0)
+        stage_operations = int(telemetry.get("expert_cache_stage_operations") or 0)
+        text += f" · stages {stage_operations} / transferred {transfer_bytes / 2**20:.1f} MiB"
     reason = str(telemetry.get("stop_reason") or "").strip()
     if reason:
         text += f" · {reason}"
@@ -244,7 +262,7 @@ def chat_page():
                 )
                 load_btn = ui.button("Load", icon="download").props("dense no-caps")
                 unload_btn = ui.button("Unload", icon="eject").props("dense flat no-caps")
-            with ui.row().classes("w-full items-center gap-3 mt-2"):
+            with ui.row().classes("w-full items-center gap-3 mt-2 flex-wrap"):
                 status_lbl = ui.label(ENGINE.status()).classes("text-xs text-gray-400")
                 engine_badge = ui.badge(
                     f"{engine_settings['attn_implementation']} · cache {engine_settings['cache_implementation']}"
@@ -261,6 +279,21 @@ def chat_page():
                     "Starts at two resident experts and expands only when effective surprise warrants it."
                 )
                 spalmer_dynamic.visible = False
+                spalmer_cache_size = (
+                    ui.number(
+                        "SPALMER cache cap (0 = checkpoint)",
+                        value=0,
+                        min=0,
+                        max=200,
+                        step=1,
+                    )
+                    .props("dense outlined")
+                    .classes("w-56")
+                    .tooltip(
+                        "Hard accelerator-resident expert limit. Zero uses the checkpoint's native cap."
+                    )
+                )
+                spalmer_cache_size.visible = False
             with ui.row().classes("w-full gap-3 mt-2 items-end"):
                 prompt_mode = (
                     ui.select(
@@ -421,6 +454,7 @@ def chat_page():
             adp_sel.value = ""
             adp_sel.update()
             spalmer_dynamic.visible = spalmer
+            spalmer_cache_size.visible = spalmer
             if spalmer:
                 adp_sel.disable()
                 rtr_sel.disable()
@@ -516,6 +550,10 @@ def chat_page():
                 str(context_mode.value or "native"),
             )
             load_settings["spalmer_dynamic_residency"] = bool(spalmer_dynamic.value)
+            load_settings["spalmer_expert_offload"] = True
+            load_settings["spalmer_expert_cache_size"] = int(
+                spalmer_cache_size.value or 0
+            )
             spec = LoadSpec(
                 ref=ckpt_row["ref"],
                 quant=resolve_quant(ckpt_row, adapter_row),
@@ -554,8 +592,10 @@ def chat_page():
                     routing_mode = "adaptive 2–20" if resolved.get(
                         "spalmer_dynamic_residency", True
                     ) else "fixed learned route"
+                    cache_cap = resolved.get("spalmer_expert_cache_size") or "checkpoint cap"
                     engine_badge.text = (
                         f"SPALMER · recurrent KDA/NoPE MLA · {routing_mode} · "
+                        f"CPU→GPU expert cache {cache_cap} · "
                         f"ctx {ENGINE.context_limit():,}"
                     )
                 else:

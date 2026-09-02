@@ -79,6 +79,32 @@ def test_normalize_spalmer_config_accepts_ui_contract_without_mutation():
         "expert_qat_backend": "reference",
     }
     assert normalized["spalmer"]["expert_plan_evidence"]["max_active_experts"] == 20
+    assert normalized["optimizer_state_offload"] == "cpu"
+
+
+def test_normalize_spalmer_config_requires_cpu_optimizer_state_offload():
+    config = _config(
+        training={
+            "compute_dtype": "bfloat16",
+            "parameter_dtype": "bfloat16",
+            "optimizer_state_dtype": "float32",
+            "optimizer_state_offload": "none",
+        }
+    )
+    with pytest.raises(ValueError, match="optimizer_state_offload='cpu'"):
+        bridge.normalize_spalmer_config(config)
+
+
+def test_training_config_enables_cpu_optimizer_state_offload():
+    api = SimpleNamespace(
+        TrainingConfig=lambda **values: SimpleNamespace(**values),
+    )
+
+    training = bridge.build_spalmer_training_config(_config(), api=api)
+
+    assert training.parameter_dtype == "bfloat16"
+    assert training.optimizer_state_dtype == "float32"
+    assert training.optimizer_state_offload == "cpu"
 
 
 @pytest.mark.parametrize(
@@ -319,7 +345,21 @@ class _FakeTrainer:
         self.on_checkpoint = on_checkpoint
         self.on_telemetry = on_telemetry
         self.progress = SimpleNamespace(completed_steps=0, tokens_seen=0)
-        self.optimizer = SimpleNamespace(zero_grad=lambda **_kwargs: None)
+        self.optimizer = SimpleNamespace(
+            zero_grad=lambda **_kwargs: None,
+            state_placement=lambda: {
+                "dense": {
+                    "policy": "cpu",
+                    "moment_dtype": "float32",
+                    "initialized": True,
+                    "moment_bytes": 128,
+                    "devices": ["cpu"],
+                    "cpu_pinned": False,
+                    "parameter_devices": ["cuda:0"],
+                },
+                "sparse": None,
+            },
+        )
 
     def run(self):
         metric = SimpleNamespace(
@@ -351,6 +391,7 @@ def test_run_writes_native_artifact_metadata_without_real_training(tmp_path, mon
         seed=0,
         deterministic_algorithms=False,
         device="cpu",
+        optimizer_update_chunk_size=1_048_576,
     )
     experts = _ConfigObject(
         expert_activation_format="mxfp8",
@@ -427,4 +468,6 @@ def test_run_writes_native_artifact_metadata_without_real_training(tmp_path, mon
         "expert_activations": "mxfp8",
         "master_weights": "bfloat16",
         "expert_qat_backend": "reference",
+        "optimizer_moments": "float32_cpu_offload",
     }
+    assert manifest["optimizer_state_placement"]["dense"]["devices"] == ["cpu"]

@@ -128,15 +128,21 @@ def _stack_lock(cfg: Mapping[str, object]) -> dict[str, object]:
     content_addressed = bool(checkpoint and checkpoint.get("content_addressed")) and (
         adapter is None or bool(adapter.get("content_addressed"))
     )
+    model_family = cfg.get("model_family") or family_from_reference(cfg.get("checkpoint_ref"))
     value = {
         "schema_version": "yylab.benchmark-stack-lock.v1",
         "checkpoint": checkpoint,
         "adapter": adapter,
         "quant": cfg.get("quant"),
         "adapter_arch": cfg.get("adapter_arch"),
-        "model_family": cfg.get("model_family") or family_from_reference(cfg.get("checkpoint_ref")),
+        "model_family": model_family,
         "fully_content_addressed": content_addressed,
     }
+    if model_family == "spalmer":
+        value["spalmer_runtime"] = {
+            "physical_expert_offload": bool(cfg.get("spalmer_expert_offload", True)),
+            "expert_cache_size": cfg.get("spalmer_expert_cache_size"),
+        }
     value["stack_fingerprint"] = hashlib.sha256(canonical_json(value).encode()).hexdigest()
     return value
 
@@ -333,6 +339,12 @@ def _workload_contract(
         "max_new_tokens_override": cfg.get("max_new_tokens"),
         "enable_thinking_override": cfg.get("enable_thinking"),
         "max_thinking_tokens_override": cfg.get("max_thinking_tokens") if thinking_enabled else None,
+        "spalmer_expert_offload": (
+            bool(cfg.get("spalmer_expert_offload", True))
+            if str(cfg.get("model_family") or "").casefold() in {"spalmer", "spalmer_v1"}
+            else None
+        ),
+        "spalmer_expert_cache_size": cfg.get("spalmer_expert_cache_size"),
         "cells": cells,
     }
 
@@ -379,6 +391,11 @@ def _generation_comparison_fingerprint(workload_contract: Mapping[str, object]) 
             "rope_scaling": workload_contract.get("rope_scaling"),
             "rope_factor": workload_contract.get("rope_factor"),
             "max_context_tokens": workload_contract.get("max_context_tokens"),
+        }
+    if workload_contract.get("spalmer_expert_offload") is not None:
+        fingerprint_value["spalmer_expert_placement"] = {
+            "physical_expert_offload": workload_contract.get("spalmer_expert_offload"),
+            "expert_cache_size": workload_contract.get("spalmer_expert_cache_size"),
         }
     return _fingerprint(fingerprint_value)
 
@@ -1242,6 +1259,11 @@ def run_quality_benchmark(
         backend_settings: dict[str, object] = {
             "attn_implementation": str(cfg.get("attn_implementation") or "sdpa"),
         }
+        if str(cfg.get("model_family") or "").casefold() in {"spalmer", "spalmer_v1"}:
+            backend_settings.update(
+                spalmer_expert_offload=bool(cfg.get("spalmer_expert_offload", True)),
+                spalmer_expert_cache_size=cfg.get("spalmer_expert_cache_size"),
+            )
         if str(cfg.get("rope_scaling") or "none") != "none":
             backend_settings.update(
                 rope_scaling=str(cfg["rope_scaling"]),

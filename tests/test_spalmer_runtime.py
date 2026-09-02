@@ -179,6 +179,7 @@ class _FakeSpalmerModel(nn.Module):
         self.residency = SimpleNamespace(
             config=SimpleNamespace(
                 num_experts=200,
+                active_experts=2,
                 min_active_experts=2,
                 max_active_experts=20,
                 resident_cap=20,
@@ -295,6 +296,127 @@ def test_load_spalmer_runtime_unwraps_an_hf_tokenizer_adapter(tmp_path, monkeypa
     assert runtime.config.max_position_embeddings == 512
     assert runtime.dynamic_residency is False
     assert model.calls == 0
+
+
+def _offload_snapshot(*, coherent: bool = True) -> SimpleNamespace:
+    resident = (0, 1)
+    return SimpleNamespace(
+        enabled=True,
+        target_device="cuda:0",
+        capacity=20,
+        resident_expert_ids=resident,
+        layer_count=4,
+        master_devices=("cpu",) * 4,
+        master_pinned_by_layer=(True,) * 4,
+        cache_devices=("cuda:0",) * 4,
+        cached_expert_ids_by_layer=(resident,) * 4 if coherent else (resident, (), resident, resident),
+        master_bytes=8 * 2**20,
+        cache_bytes=128 * 2**10,
+        cache_index_bytes=6_400,
+        stage_operations=1,
+        transferred_expert_rows=8,
+        evicted_expert_rows=0,
+        transfer_bytes=128 * 2**10,
+        occupancy=0.1,
+        masters_on_cpu=True,
+        masters_pinned=True,
+        caches_on_target=True,
+    )
+
+
+class _FakeOffloadedSpalmerModel(_FakeSpalmerModel):
+    def __init__(self, *, coherent: bool = True) -> None:
+        super().__init__()
+        self.enable_calls: list[dict[str, object]] = []
+        self.to_devices: list[str] = []
+        self.snapshot = _offload_snapshot(coherent=coherent)
+        self._execution_device = torch.device("cpu")
+
+    @property
+    def execution_device(self) -> torch.device:
+        return self._execution_device
+
+    def to(self, *args, **kwargs):
+        device = kwargs.get("device")
+        if device is not None:
+            self.to_devices.append(str(device))
+            if torch.device(device).type == "cuda":
+                raise AssertionError("yyLab must not blanket-place an offloaded model on CUDA")
+        return super().to(*args, **kwargs)
+
+    def enable_expert_offload(self, device, **kwargs):
+        self.enable_calls.append({"device": str(device), **kwargs})
+        self._execution_device = torch.device("cuda:0")
+        return self.snapshot
+
+    def expert_offload_telemetry(self):
+        return self.snapshot if self.enable_calls else None
+
+
+def test_cuda_load_uses_physical_expert_offload_and_proves_placement(tmp_path, monkeypatch) -> None:
+    checkpoint = tmp_path / "spalmer.pt"
+    checkpoint.write_bytes(b"loader is mocked")
+    model = _FakeOffloadedSpalmerModel()
+    tokenizer = _GenericTokenizer()
+    tokenizer.identity = SimpleNamespace(backend="spalmer-rpd-v2")
+    _fake_spalmer_module(monkeypatch, model, tokenizer, {})
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+    runtime = load_spalmer_runtime(checkpoint)
+
+    assert model.enable_calls == [
+        {
+            "device": "cuda",
+            "cache_size": None,
+            "non_blocking": True,
+            "pin_memory": True,
+        }
+    ]
+    assert "cuda" not in model.to_devices
+    assert runtime.device == torch.device("cuda:0")
+    placement = runtime.expert_offload_telemetry()
+    assert placement is not None
+    assert placement["physical_expert_offload"] is True
+    assert placement["expert_masters_on_cpu"] is True
+    assert placement["expert_cache_on_target"] is True
+    assert placement["expert_cache_capacity"] == 20
+    assert placement["resident_experts"] == [0, 1]
+    assert any("Physical SPALMER expert offload enabled" in note for note in runtime.notes)
+
+
+def test_cuda_load_fails_closed_when_native_placement_proof_is_incoherent(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    checkpoint = tmp_path / "spalmer.pt"
+    checkpoint.write_bytes(b"loader is mocked")
+    model = _FakeOffloadedSpalmerModel(coherent=False)
+    tokenizer = _GenericTokenizer()
+    tokenizer.identity = SimpleNamespace(backend="spalmer-rpd-v2")
+    _fake_spalmer_module(monkeypatch, model, tokenizer, {})
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+    with pytest.raises(RuntimeError, match="placement proof failed"):
+        load_spalmer_runtime(checkpoint)
+
+    assert len(model.enable_calls) == 1
+    assert "cuda" not in model.to_devices
+
+
+def test_cuda_load_rejects_cache_capacity_above_checkpoint_policy(tmp_path, monkeypatch) -> None:
+    checkpoint = tmp_path / "spalmer.pt"
+    checkpoint.write_bytes(b"loader is mocked")
+    model = _FakeOffloadedSpalmerModel()
+    tokenizer = _GenericTokenizer()
+    tokenizer.identity = SimpleNamespace(backend="spalmer-rpd-v2")
+    _fake_spalmer_module(monkeypatch, model, tokenizer, {})
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+    with pytest.raises(ValueError, match="cannot exceed.*resident cap"):
+        load_spalmer_runtime(checkpoint, expert_cache_size=21)
+
+    assert model.enable_calls == []
+    assert "cuda" not in model.to_devices
 
 
 class _Streamer:

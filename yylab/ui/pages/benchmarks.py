@@ -85,6 +85,7 @@ def _quality_job_config(
     max_thinking_tokens: int = 1024,
     context_mode: str = "native",
     continue_on_error: bool = True,
+    spalmer_expert_cache_size: int | None = None,
 ) -> dict[str, Any]:
     """Build the stable worker contract without training-artifact status fields."""
 
@@ -97,10 +98,11 @@ def _quality_job_config(
         raise ValueError("thinking requires chat prompt mode")
     rope_scaling, rope_factor, max_context_tokens = QUALITY_CONTEXT_MODES[context_mode]
 
-    return {
+    model_family = checkpoint_family(checkpoint)
+    config = {
         "checkpoint_id": checkpoint["id"],
         "checkpoint_ref": checkpoint["ref"],
-        "model_family": checkpoint_family(checkpoint),
+        "model_family": model_family,
         "quant": quant,
         # Deliberately not named adapter_id: generic training failure cleanup
         # must never mutate an already-trained benchmark subject.
@@ -125,6 +127,14 @@ def _quality_job_config(
         "max_context_tokens": max_context_tokens,
         "continue_on_error": continue_on_error,
     }
+    if model_family == "spalmer":
+        if spalmer_expert_cache_size is not None and spalmer_expert_cache_size <= 0:
+            raise ValueError("spalmer_expert_cache_size must be positive")
+        config.update(
+            spalmer_expert_offload=True,
+            spalmer_expert_cache_size=spalmer_expert_cache_size,
+        )
+    return config
 
 
 def _train_perf_job_config(
@@ -282,7 +292,12 @@ def _quality_contract_text(config: dict[str, Any]) -> str:
     else:
         thinking_text = "no-think"
     context = str(config.get("context_mode") or "native").replace("_", " ")
-    return f"{prompt_mode} · answer {answer_text} · {thinking_text} · {context}"
+    text = f"{prompt_mode} · answer {answer_text} · {thinking_text} · {context}"
+    if str(config.get("model_family") or "").casefold() == "spalmer":
+        cache_size = config.get("spalmer_expert_cache_size")
+        cap = str(int(cache_size)) if isinstance(cache_size, int | float) and cache_size else "native"
+        text += f" · physical expert offload ({cap} cap)"
+    return text
 
 
 def _history_rows() -> list[dict[str, Any]]:
@@ -761,6 +776,18 @@ def benchmarks_page() -> None:
                             .props("dense outlined")
                             .classes("w-full")
                         )
+                    spalmer_cache_size = (
+                        ui.number(
+                            "SPALMER expert cache cap (0 = checkpoint)",
+                            value=0,
+                            min=0,
+                            max=200,
+                            step=1,
+                        )
+                        .props("dense outlined")
+                        .classes("w-full")
+                    )
+                    spalmer_cache_size.visible = False
                     thinking_budget.visible = False
                     baselines = {"": "(none)"}
                     for row in db.q(
@@ -990,6 +1017,7 @@ def benchmarks_page() -> None:
                     "matrix": "Base + dynamic + every expert",
                     "expert": "One forced expert",
                 }
+            spalmer_cache_size.visible = spalmer
             policy.update()
             update_quality_controls()
 
@@ -1068,6 +1096,11 @@ def benchmarks_page() -> None:
                 max_thinking_tokens=int(thinking_budget.value or 1024),
                 context_mode=str(context_mode.value or "native"),
                 continue_on_error=bool(continue_errors.value),
+                spalmer_expert_cache_size=(
+                    int(spalmer_cache_size.value)
+                    if int(spalmer_cache_size.value or 0) > 0
+                    else None
+                ),
             )
             try:
                 rid, pid = _launch_benchmark(QUALITY_KIND, config)

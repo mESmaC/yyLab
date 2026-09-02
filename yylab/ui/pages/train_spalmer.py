@@ -26,7 +26,7 @@ from ..shell import ACCENT, panel, shell
 from .train_mole import corpus_options
 
 SPALMER_RUN_KIND = "spalmer_base"
-SPALMER_RECIPE_VERSION = 1
+SPALMER_RECIPE_VERSION = 2
 DEFAULT_SOURCE_SPLITS = ("train", "unspecified")
 PARAMETER_TARGETS = {
     "10M": 10_000_000,
@@ -459,6 +459,7 @@ def build_spalmer_run_config(
         "compute_dtype": "bfloat16",
         "parameter_dtype": "bfloat16",
         "optimizer_state_dtype": "float32",
+        "optimizer_state_offload": "cpu",
         "stochastic_parameter_rounding": True,
         "optimizer_update_chunk_size": 1_048_576,
         "fused_adamw": "auto",
@@ -737,7 +738,8 @@ def train_spalmer_page() -> None:
                     )
                 ui.label(
                     "Canonical expert policy: 200 coherent identities · training top-k 2 · "
-                    "request residency 2–20 · grouped execution · BF16 master / FP32 moments."
+                    "request residency 2–20 · grouped execution · BF16 master / "
+                    "CPU-offloaded FP32 moments."
                 ).classes("text-xs text-violet-300")
 
                 ui.separator().classes("my-3")

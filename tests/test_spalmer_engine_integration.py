@@ -24,8 +24,23 @@ def test_engine_dispatches_spalmer_before_hf_context_loading(monkeypatch):
     facade = _Facade()
     calls = []
 
-    def load(ref, *, dynamic_residency, max_context_tokens):
-        calls.append((ref, dynamic_residency, max_context_tokens))
+    def load(
+        ref,
+        *,
+        dynamic_residency,
+        max_context_tokens,
+        expert_offload,
+        expert_cache_size,
+    ):
+        calls.append(
+            (
+                ref,
+                dynamic_residency,
+                max_context_tokens,
+                expert_offload,
+                expert_cache_size,
+            )
+        )
         return facade
 
     monkeypatch.setattr("yylab.models.spalmer.load_spalmer_runtime", load)
@@ -44,11 +59,13 @@ def test_engine_dispatches_spalmer_before_hf_context_loading(monkeypatch):
         )
     )
 
-    assert calls == [("fixture.pt", False, 3072)]
+    assert calls == [("fixture.pt", False, 3072, True, None)]
     assert engine.model is facade
     assert engine.tokenizer is facade.tokenizer
     assert engine.spec.model_family == "spalmer"
     assert engine.spec.quant == "checkpoint"
+    assert engine.spec.settings["spalmer_expert_offload"] is True
+    assert engine.spec.settings["spalmer_expert_cache_size"] is None
     assert notes == ["native SPALMER"]
     assert engine.routing_telemetry()["active_experts"] == 4
 

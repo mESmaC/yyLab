@@ -97,8 +97,8 @@ Initial conventional defaults:
 | C09 | Weight numerics and sparsity | QAT with selectable NVFP4/MXFP4 forward weights, MXFP8 activations, and optional structured 2:4 sparsity | Reference lane implemented |
 | C10 | Plasticity and potentiation | Expert-by-expert forward-precision promotion using each 0.5% expert group as the control unit | Candidate |
 | C11 | Output projection | Standard untied linear vocabulary head, softmax, and next-token cross-entropy | Candidate |
-| C12 | Backward and optimizer state | FP8/MXFP8 backward, adaptive FP8 persistent state, CPU offload | Partially implemented |
-| C13 | Inference residency controller | Dynamically activate 2–20 of roughly 200 experts, with a provisional 10% expert-pool cap | Candidate |
+| C12 | Backward and optimizer state | FP8/MXFP8 backward, adaptive FP8 persistent state, CPU offload | Partially implemented; CPU FP32-moment offload is operational |
+| C13 | Inference residency controller | Dynamically activate 2–20 of roughly 200 experts, with a provisional 10% expert-pool cap | Implemented prototype with physical CPU/GPU residency |
 | C14 | Adaptation interfaces | SFT, continued pretraining, RL, LoRA/MoLE, and Soft LoRA experiments | Captured |
 | C15 | Evaluation and observability | Perplexity/NLL, coherence, routing, memory, and benchmark evidence | Captured |
 | C16 | Directional neural subnetworks | Feature-gated feed-forward, feedback, lateral, and lateral active-silencing paths may coexist in each block | Candidate |
@@ -638,8 +638,11 @@ for the preliminary model.
   milestone and must not be reported as implemented yet.
 - Potentiation promotes complete expert groups whose telemetry indicates that
   low-precision execution or updates are limiting them.
-- ZeRO-Offload and CPU optimizer-state offload are available for additional
-  accelerator-memory headroom.
+- The implemented CPU-offload lane keeps persistent FP32 Adam moments in host
+  memory (pinned when available) and stages only bounded update chunks on the
+  accelerator. BF16 parameters and gradients remain accelerator-resident.
+  This provides the single-device optimizer-state benefit associated with
+  ZeRO-Offload; it is not distributed ZeRO partitioning.
 - Forward weights, backward numerics, persistent master/plastic state, gradients,
   and optimizer moments are independently configurable concepts.
 
@@ -648,12 +651,12 @@ Interfaces still to specify:
 - exact dgrad/wgrad formats and scaling;
 - optimizer family and moment representation;
 - whether masterless training is the default or one experimental lane;
-- device placement and synchronization cadence;
+- distributed optimizer partitioning and its synchronization cadence;
 - overflow, underflow, and lost-update telemetry.
 
 ### C13. Dynamic expert rounding and inference residency
 
-**State:** Candidate.
+**State:** Implemented prototype.
 
 The term **dynamic expert rounding** currently refers to dynamically selecting
 how much of the total expert/weight pool becomes resident and active at
@@ -695,13 +698,26 @@ Thus “10% active” refers to the expert pool. It does not imply that the alwa
 available shared base, vocabulary path, and router disappear from active model
 capacity.
 
-Interfaces still to specify:
+The current physical implementation keeps the complete checkpoint-visible BF16
+expert masters in CPU memory and places the shared base, vocabulary path, router,
+and a bounded expert-row cache on the accelerator. One global residency commit
+stages the same expert identities across every layer before publishing the new
+routing mask. Accepted expansion remains fixed throughout autoregressive decode;
+rejected expansion restores both the prior identities and per-token capacity.
+Fixed inference also starts from the bounded minimum rather than materializing
+the complete expert pool. Cache tensors are derived runtime state and are not
+stored in checkpoints.
 
-- request-level versus token-level residency changes;
-- interaction with KV cache stability and autoregressive decoding;
-- transfer, prefetch, eviction, and rollback rules;
-- whether dynamic rounding also changes the numerical precision of resident
-  experts.
+Current boundaries:
+
+- Residency changes are request-level during prefill/recomputation, not
+  independently token-level during decode.
+- Transfers are synchronous with the residency commit boundary. Asynchronous
+  predictive prefetch, multi-request cache sharing, and LRU scheduling remain
+  later runtime work.
+- Resident caches mirror BF16 masters; MXFP4/NVFP4 execution values and MXFP8 or
+  BF16 potentiated values are derived after staging. Packed low-bit cache storage
+  remains coupled to the future native mixed-W4A8 kernel backend.
 
 ### C14. Adaptation interfaces
 
@@ -831,6 +847,7 @@ composable as more ideas are added.
 | 2026-09-02 | Made duplicate FP32 shadow weights non-target architecture state; selected single-payload expert precision migration and compensated direct low-precision updates as the preferred masterless direction, with BF16 canonical storage as the simplest transitional lane. |
 | 2026-09-02 | Selected the first base-pretraining QAT contract: selectable NVFP4/MXFP4 forward weights, MXFP8 activations, and BF16 optimizer-resident master/shadow weights; masterless FP4 remains a later experiment. This adapts Kimi K3's reported MXFP4/MXFP8 split from post-training to base pretraining. |
 | 2026-09-02 | Implemented the routed-expert reference QAT lane in SPALMER with format-faithful MXFP4/NVFP4 weights, MXFP8 activations, one BF16 parameter/master payload, FP32 Adam moments, stochastic BF16 writeback, strict native-backend failure, and checkpointed precision/tokenizer provenance. Native mixed W4A8 and MXFP8 backward remain explicit later backends. |
+| 2026-09-02 | Implemented physical request-level expert residency: full BF16 expert masters remain CPU-backed while coherent bounded expert rows are staged per layer on the accelerator, with transactional expansion/rollback, fixed-route bounds, checkpoint-independent caches, and placement/transfer telemetry. Added the single-device C12 CPU-offloaded FP32 Adam-moment lane with bounded accelerator update chunks. |
 
 ## Template for the next idea
 

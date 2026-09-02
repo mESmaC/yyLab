@@ -325,6 +325,9 @@ class SpalmerCausalLMFacade(nn.Module):
 
     @property
     def device(self) -> torch.device:
+        execution_device = getattr(self.model, "execution_device", None)
+        if execution_device is not None:
+            return torch.device(execution_device)
         parameter = next(self.model.parameters(), None)
         if parameter is not None:
             return parameter.device
@@ -335,7 +338,14 @@ class SpalmerCausalLMFacade(nn.Module):
         self.dynamic_residency = bool(enabled)
 
     def routing_telemetry(self) -> dict[str, object] | None:
-        return None if self.last_routing_telemetry is None else dict(self.last_routing_telemetry)
+        if self.last_routing_telemetry is not None:
+            return dict(self.last_routing_telemetry)
+        return _fixed_residency_telemetry(self.model)
+
+    def expert_offload_telemetry(self) -> dict[str, object] | None:
+        """Return a serialization-safe physical placement snapshot."""
+
+        return _expert_offload_telemetry(self.model)
 
     def forward(
         self,
@@ -462,6 +472,7 @@ class SpalmerCausalLMFacade(nn.Module):
                 self.last_routing_telemetry = _residency_telemetry(self.model, decision)
             else:
                 output = self.model(generated, attention_mask=mask)
+                self.last_routing_telemetry = _fixed_residency_telemetry(self.model)
             token_states = output.token_mixer_states
             channel_states = output.channel_mixer_states
 
@@ -509,12 +520,16 @@ def load_spalmer_runtime(
     *,
     dynamic_residency: bool = True,
     max_context_tokens: int | None = None,
+    expert_offload: bool = True,
+    expert_cache_size: int | None = None,
 ) -> SpalmerCausalLMFacade:
     """Load a native bundle and return an HF-shaped inference facade."""
 
     checkpoint_path = resolve_spalmer_checkpoint(ref)
     if max_context_tokens is not None and max_context_tokens <= 0:
         raise ValueError("max_context_tokens must be positive")
+    if expert_cache_size is not None and expert_cache_size <= 0:
+        raise ValueError("expert_cache_size must be positive")
 
     # Keep SPALMER optional for yyLab installations that only use HF models.
     from spalmer import load_checkpoint
@@ -522,9 +537,51 @@ def load_spalmer_runtime(
     model, loaded_tokenizer, metadata = load_checkpoint(checkpoint_path, map_location="cpu")
     cuda = torch.cuda.is_available()
     device = torch.device("cuda" if cuda else "cpu")
-    dtype = torch.bfloat16 if cuda else torch.float32
-    model.to(device=device, dtype=dtype)
-    model.eval()
+    offload: dict[str, object] | None = None
+    if cuda:
+        # Checkpoint loading is deliberately CPU-first.  Casting on CPU is
+        # safe; the selective placement call below is the only operation that
+        # may move SPALMER weights onto the accelerator.
+        model.to(device="cpu", dtype=torch.bfloat16)
+        model.eval()
+        if expert_offload:
+            enable_offload = getattr(model, "enable_expert_offload", None)
+            if not callable(enable_offload):
+                raise RuntimeError(
+                    "this SPALMER runtime does not implement physical expert offload"
+                )
+            native_cap = _native_resident_cap(model)
+            if expert_cache_size is not None and expert_cache_size > native_cap:
+                raise ValueError(
+                    "expert_cache_size cannot exceed the checkpoint's bounded "
+                    f"resident cap ({native_cap})"
+                )
+            snapshot = enable_offload(
+                device,
+                cache_size=expert_cache_size,
+                non_blocking=True,
+                pin_memory=True,
+            )
+            try:
+                offload = _validated_expert_offload_telemetry(
+                    model,
+                    snapshot,
+                    expected_device=device,
+                    expected_capacity=expert_cache_size,
+                )
+            except BaseException:
+                disable_offload = getattr(model, "disable_expert_offload", None)
+                if callable(disable_offload):
+                    try:
+                        disable_offload(device="cpu")
+                    except Exception:  # noqa: BLE001 - preserve the placement-proof failure
+                        pass
+                raise
+        else:
+            model.to(device=device)
+    else:
+        model.to(device=device, dtype=torch.float32)
+        model.eval()
 
     context_limit = int(
         max_context_tokens or _metadata_context_limit(metadata) or DEFAULT_CONTEXT_LIMIT
@@ -549,8 +606,26 @@ def load_spalmer_runtime(
     notes = [
         "Loaded native SPALMER checkpoint.",
         "SPALMER uses NoPE and native recurrent KDA/MLA state; HF RoPE and KV-cache modes do not apply.",
-        f"SPALMER parameters run as {'BF16 on CUDA' if cuda else 'FP32 on CPU'}.",
     ]
+    if offload is not None:
+        pinned = "pinned " if offload["expert_masters_pinned"] else ""
+        notes.extend(
+            (
+                "Physical SPALMER expert offload enabled: complete expert master banks "
+                f"remain in {pinned}CPU RAM and only request-resident rows execute on "
+                f"{offload['expert_cache_device']}.",
+                "SPALMER expert cache is hard-bounded at "
+                f"{offload['expert_cache_capacity']}/{offload['total_experts']} identities "
+                "for fixed and adaptive routing.",
+            )
+        )
+    elif cuda:
+        notes.append("SPALMER parameters run as BF16 on CUDA; physical expert offload is disabled.")
+    else:
+        notes.append(
+            "SPALMER is using the FP32 CPU fallback; all experts remain CPU-resident and "
+            "an accelerator expert cache is not applicable."
+        )
     return SpalmerCausalLMFacade(
         model,
         tokenizer,
@@ -735,6 +810,182 @@ def _stopping_requested(criteria: object, input_ids: Tensor, scores: Tensor) -> 
     return bool(result)
 
 
+def _native_resident_cap(model: nn.Module) -> int:
+    residency = getattr(model, "residency", None)
+    config = getattr(residency, "config", None)
+    cap = int(getattr(config, "resident_cap", 0) or 0)
+    if cap < 1:
+        raise RuntimeError("SPALMER checkpoint does not declare a bounded expert resident cap")
+    return cap
+
+
+def _expert_offload_telemetry(
+    model: nn.Module,
+    snapshot: object | None = None,
+) -> dict[str, object] | None:
+    """Normalize SPALMER's dataclass telemetry for UI and JSON artifacts."""
+
+    if snapshot is None:
+        getter = getattr(model, "expert_offload_telemetry", None)
+        if not callable(getter):
+            return None
+        snapshot = getter()
+    if snapshot is None:
+        return None
+
+    resident_ids = tuple(int(value) for value in getattr(snapshot, "resident_expert_ids", ()))
+    cached_by_layer = tuple(
+        tuple(int(value) for value in layer)
+        for layer in getattr(snapshot, "cached_expert_ids_by_layer", ())
+    )
+    capacity = int(getattr(snapshot, "capacity", 0) or 0)
+    cache_bytes = int(getattr(snapshot, "cache_bytes", 0) or 0)
+    config = getattr(getattr(model, "residency", None), "config", None)
+    total_experts = int(getattr(config, "num_experts", capacity) or capacity)
+    cache_devices = tuple(str(value) for value in getattr(snapshot, "cache_devices", ()))
+    target_device = str(getattr(snapshot, "target_device", "") or "")
+    return {
+        "physical_expert_offload": bool(getattr(snapshot, "enabled", False)),
+        "expert_offload_mode": "cpu_master_gpu_cache",
+        "expert_masters_on_cpu": bool(getattr(snapshot, "masters_on_cpu", False)),
+        "expert_masters_pinned": bool(getattr(snapshot, "masters_pinned", False)),
+        "expert_master_devices": [
+            str(value) for value in getattr(snapshot, "master_devices", ())
+        ],
+        "expert_master_bytes": int(getattr(snapshot, "master_bytes", 0) or 0),
+        "expert_cache_on_target": bool(getattr(snapshot, "caches_on_target", False)),
+        "expert_cache_device": target_device,
+        "expert_cache_devices": list(cache_devices),
+        "expert_cache_capacity": capacity,
+        "expert_cache_occupancy": float(getattr(snapshot, "occupancy", 0.0) or 0.0),
+        "expert_cache_bytes": cache_bytes,
+        "expert_cache_index_bytes": int(getattr(snapshot, "cache_index_bytes", 0) or 0),
+        "expert_cache_stage_operations": int(
+            getattr(snapshot, "stage_operations", 0) or 0
+        ),
+        "expert_cache_transferred_rows": int(
+            getattr(snapshot, "transferred_expert_rows", 0) or 0
+        ),
+        "expert_cache_evicted_rows": int(
+            getattr(snapshot, "evicted_expert_rows", 0) or 0
+        ),
+        "expert_cache_transfer_bytes": int(getattr(snapshot, "transfer_bytes", 0) or 0),
+        "expert_cache_layer_count": int(getattr(snapshot, "layer_count", 0) or 0),
+        "expert_cache_ids_by_layer": [list(layer) for layer in cached_by_layer],
+        "resident_expert_count": len(resident_ids),
+        "resident_experts": list(resident_ids),
+        "resident_capacity": capacity,
+        "resident_bytes": cache_bytes,
+        "total_experts": total_experts,
+    }
+
+
+def _validated_expert_offload_telemetry(
+    model: nn.Module,
+    snapshot: object,
+    *,
+    expected_device: torch.device,
+    expected_capacity: int | None,
+) -> dict[str, object]:
+    """Fail closed unless native telemetry proves bounded selective placement."""
+
+    value = _expert_offload_telemetry(model, snapshot)
+    assert value is not None
+    problems: list[str] = []
+    if not value["physical_expert_offload"]:
+        problems.append("offload backend is not enabled")
+    if not value["expert_masters_on_cpu"]:
+        problems.append("complete expert masters are not all on CPU")
+    if not value["expert_cache_on_target"]:
+        problems.append("layer caches are not all on the execution device")
+
+    target_text = str(value["expert_cache_device"])
+    try:
+        target = torch.device(target_text)
+    except (RuntimeError, ValueError):
+        problems.append(f"invalid cache target {target_text!r}")
+    else:
+        if target.type != expected_device.type or (
+            expected_device.index is not None and target.index != expected_device.index
+        ):
+            problems.append(f"cache target {target} does not match {expected_device}")
+
+    capacity = int(value["expert_cache_capacity"])
+    native_cap = _native_resident_cap(model)
+    resident_ids = tuple(int(item) for item in value["resident_experts"])
+    if not 1 <= len(resident_ids) <= capacity <= native_cap:
+        problems.append(
+            "resident identity count/capacity is outside the checkpoint's bounded policy"
+        )
+    if expected_capacity is not None and capacity != expected_capacity:
+        problems.append(f"cache capacity {capacity} does not match requested {expected_capacity}")
+    layer_count = int(value["expert_cache_layer_count"])
+    ids_by_layer = tuple(tuple(layer) for layer in value["expert_cache_ids_by_layer"])
+    if layer_count < 1 or len(ids_by_layer) != layer_count:
+        problems.append("cache telemetry does not cover every expert layer")
+    elif any(layer != resident_ids for layer in ids_by_layer):
+        problems.append("layer caches do not share one coherent resident identity set")
+    if int(value["expert_master_bytes"]) <= 0 or int(value["expert_cache_bytes"]) <= 0:
+        problems.append("physical expert storage reports no allocated bytes")
+    if problems:
+        raise RuntimeError("SPALMER physical expert placement proof failed: " + "; ".join(problems))
+    return value
+
+
+def _assert_live_expert_placement(
+    value: Mapping[str, object],
+    *,
+    expected_ids: tuple[int, ...] | None,
+) -> None:
+    """Reject stale or escaped caches instead of publishing misleading telemetry."""
+
+    resident_ids = tuple(int(item) for item in value["resident_experts"])
+    capacity = int(value["expert_cache_capacity"])
+    coherent = all(
+        tuple(int(item) for item in layer) == resident_ids
+        for layer in value["expert_cache_ids_by_layer"]
+    )
+    if (
+        not value["physical_expert_offload"]
+        or not value["expert_masters_on_cpu"]
+        or not value["expert_cache_on_target"]
+        or not 1 <= len(resident_ids) <= capacity
+        or not coherent
+        or (expected_ids is not None and resident_ids != expected_ids)
+    ):
+        raise RuntimeError("SPALMER physical expert cache lost placement or identity coherence")
+
+
+def _fixed_residency_telemetry(model: nn.Module) -> dict[str, object] | None:
+    physical = _expert_offload_telemetry(model)
+    if physical is None:
+        return None
+    residency = getattr(model, "residency", None)
+    config = getattr(residency, "config", None)
+    logical_ids = tuple(int(value) for value in getattr(residency, "ids", ()))
+    _assert_live_expert_placement(physical, expected_ids=logical_ids or None)
+    active = int(
+        getattr(config, "active_experts", 0)
+        or getattr(config, "min_active_experts", 0)
+        or 0
+    )
+    total = int(physical["total_experts"] or 1)
+    return {
+        "routing_mode": "fixed_resident",
+        "active_experts": active,
+        "minimum_experts": active,
+        "maximum_experts": active,
+        "active_fraction": active / max(1, total),
+        "mean_active_experts": float(active),
+        "peak_active_experts": active,
+        "expansions": 0,
+        "contractions": 0,
+        "recomputations": 0,
+        "stop_reason": "fixed request-resident expert cache",
+        **physical,
+    }
+
+
 def _residency_telemetry(model: nn.Module, decision: object) -> dict[str, object]:
     resident_ids = tuple(int(value) for value in decision.resident_ids)
     active = int(decision.active_experts)
@@ -744,11 +995,17 @@ def _residency_telemetry(model: nn.Module, decision: object) -> dict[str, object
     minimum = int(getattr(config, "min_active_experts", active) or active)
     maximum = int(getattr(config, "max_active_experts", active) or active)
     resident_cap = int(getattr(config, "resident_cap", maximum) or maximum)
+    physical = _expert_offload_telemetry(model)
+    if physical is not None:
+        _assert_live_expert_placement(physical, expected_ids=resident_ids)
+        physical_cap = int(physical["expert_cache_capacity"])
+        maximum = min(maximum, physical_cap)
+        resident_cap = min(resident_cap, physical_cap)
     trace = tuple((int(count), float(signal)) for count, signal in decision.trace)
     expansions = tuple(tuple(int(value) for value in group) for group in decision.expansions)
     effective_nll = getattr(decision, "effective_nll", None)
     signal = float(decision.predictive_entropy if effective_nll is None else effective_nll)
-    return {
+    value = {
         "routing_mode": "adaptive_surprise",
         "active_experts": active,
         "minimum_experts": minimum,
@@ -769,6 +1026,9 @@ def _residency_telemetry(model: nn.Module, decision: object) -> dict[str, object
         "expansion_groups": [list(group) for group in expansions],
         "stop_reason": "request capacity selected at prefill",
     }
+    if physical is not None:
+        value.update(physical)
+    return value
 
 
 __all__ = [

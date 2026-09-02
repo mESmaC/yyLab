@@ -72,7 +72,7 @@ explicit = true
 
 [tool.uv.sources]
 torch = { index = "pytorch-cu128" }
-spalmer = { git = "https://github.com/mESmaC/spalmer.git", rev = "fc7c45f39133c5886525abaf63143c56781a47bb" }
+spalmer = { git = "https://github.com/mESmaC/spalmer.git", rev = "d826b803d4810662c02ee6519dc55f06e23e28c9" }
 
 [tool.ruff]
 line-length = 110

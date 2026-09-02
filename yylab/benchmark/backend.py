@@ -273,7 +273,7 @@ class YyLabBenchmarkBackend:
         self._policy = ""
 
     def identity(self) -> dict[str, object]:
-        return {
+        value = {
             "backend": "yylab-direct",
             "model_family": self.model_family,
             "checkpoint_ref": self.checkpoint_ref,
@@ -293,6 +293,15 @@ class YyLabBenchmarkBackend:
                 "seed",
             ],
         }
+        if self.model_family == "spalmer":
+            value["expert_placement"] = {
+                "requested_physical_offload": bool(
+                    self.settings.get("spalmer_expert_offload", True)
+                ),
+                "requested_cache_size": self.settings.get("spalmer_expert_cache_size"),
+                "actual_placement": "reported per generation in routing telemetry",
+            }
+        return value
 
     def configure_policy(self, policy: str) -> list[str]:
         from ..infer.engine import LoadSpec
