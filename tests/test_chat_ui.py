@@ -1,13 +1,32 @@
 from __future__ import annotations
 
 import pytest
+from nicegui.elements.markdown import prepare_content
 
 from yylab.ui.pages.chat import (
+    ASSISTANT_MARKDOWN_EXTRAS,
+    _assistant_markdown_content,
     _chat_load_settings,
     _context_telemetry_text,
     _generation_snapshot,
     _user_message,
 )
+
+
+def test_final_assistant_markdown_preserves_streamed_text() -> None:
+    streamed = " First line\n<S>tep 1\n<T>ake the numbers\nThis stays intact"
+
+    content = _assistant_markdown_content(streamed)
+    rendered = prepare_content(content, extras=" ".join(ASSISTANT_MARKDOWN_EXTRAS))
+
+    assert content == (
+        "First line\n&lt;S&gt;tep 1\n&lt;T&gt;ake the numbers\nThis stays intact"
+    )
+    assert "&lt;S&gt;tep 1" in rendered
+    assert "&lt;T&gt;ake the numbers" in rendered
+    assert "\ntep 1" not in rendered
+    assert "\nake the numbers" not in rendered
+    assert rendered.count("<br />") == 3
 
 
 @pytest.mark.parametrize(

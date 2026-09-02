@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import queue as queue_mod
 import threading
+from html import escape
 from pathlib import Path
 
 from nicegui import ui
@@ -43,6 +44,23 @@ CHAT_PROMPT_MODES = {
     "chat": "Chat template",
     "raw": "Raw completion",
 }
+
+ASSISTANT_MARKDOWN_EXTRAS = ["fenced-code-blocks", "tables", "break-on-newline"]
+
+
+def _assistant_markdown_content(text: str) -> str:
+    """Preserve generated text across NiceGUI's final Markdown conversion.
+
+    NiceGUI dedents Markdown from the first non-empty line and accepts raw HTML.
+    A model response beginning with one space can therefore lose the first
+    character of later lines, while generated text such as ``<S>tep`` is
+    interpreted as an HTML tag and displayed as ``tep``.  The leading space is
+    already discarded by the renderer; removing it first prevents destructive
+    dedentation, and HTML escaping keeps tag-shaped model text literal without
+    disabling ordinary Markdown syntax.
+    """
+
+    return escape(text.lstrip(), quote=False)
 
 
 def _user_message(text: str, *, atxy_t: object = "", atxy_x: object = "", atxy_y: object = "") -> dict:
@@ -413,7 +431,10 @@ def chat_page():
                 elif not buf:
                     ui.label("(empty response)").classes("text-sm text-gray-500 italic")
                 else:
-                    ui.markdown(buf).classes("assistant-md w-full")
+                    ui.markdown(
+                        _assistant_markdown_content(buf),
+                        extras=ASSISTANT_MARKDOWN_EXTRAS,
+                    ).classes("assistant-md w-full")
             stream_state["col"] = None
             stream_state["label"] = None
             stream_state["spin"] = None
