@@ -11,7 +11,7 @@ from nicegui import ui
 
 from ... import db
 from ...ingest.domains import DOMAINS
-from ...tokenizer_registry import list_tokenizers
+from ...tokenizer_registry import hub_preset, hub_preset_options, list_tokenizers
 from ...train.data import (
     CORPUS_MIX_CONCATENATE,
     CORPUS_MIX_ROUND_ROBIN,
@@ -592,6 +592,17 @@ def train_spalmer_page() -> None:
                     .props("dense outlined")
                     .classes("w-full")
                 )
+                hub_preset_select = (
+                    ui.select(
+                        {"": "None", **hub_preset_options()},
+                        value="",
+                        label="Hugging Face preset (fills the direct reference)",
+                    )
+                    .props("dense outlined")
+                    .classes("w-full")
+                )
+                hub_preset_note = ui.label("").classes("text-xs text-teal-300")
+                hub_preset_note.visible = False
                 preview_vocab = (
                     ui.number(
                         "Tokenizer vocabulary for planning",
@@ -1023,6 +1034,24 @@ def train_spalmer_page() -> None:
                     preview_vocab.update()
             update_plan_preview()
 
+        def apply_hub_preset() -> None:
+            preset = hub_preset(str(hub_preset_select.value or ""))
+            if preset is None:
+                hub_preset_note.visible = False
+                return
+            direct_tokenizer_ref.value = preset.repo_id
+            direct_tokenizer_ref.update()
+            if preset.vocab_size:
+                preview_vocab.value = preset.vocab_size
+                preview_vocab.update()
+            hub_preset_note.text = (
+                f"{preset.note} The worker downloads it when the run starts and replans with the "
+                "actual vocabulary. Import it under Tokenizers to make it a registered option with a "
+                "verified, catalogued vocabulary."
+            )
+            hub_preset_note.visible = True
+            update_plan_preview()
+
         def update_backend_status() -> None:
             attention = attention_backend_status(str(attention_backend.value or "auto"))
             attention_status_label.text = attention["detail"]
@@ -1331,6 +1360,7 @@ def train_spalmer_page() -> None:
         target_scale.on_value_change(lambda _: update_target_controls())
         registered_tokenizer.on_value_change(lambda _: update_registered_tokenizer())
         direct_tokenizer_ref.on_value_change(lambda _: update_plan_preview())
+        hub_preset_select.on_value_change(lambda _: apply_hub_preset())
         preview_vocab.on_value_change(lambda _: update_plan_preview())
         expert_weight_format.on_value_change(
             lambda _: (update_backend_status(), update_plan_preview())

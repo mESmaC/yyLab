@@ -12,6 +12,7 @@ from typing import Any
 
 from .. import db
 from ..artifacts import run_dir, tokenizer_dir, write_json
+from ..config import get_settings
 from ..tokenizer_registry import (
     TOKENIZER_ACTION_IMPORT,
     TOKENIZER_ACTION_TRAIN,
@@ -19,6 +20,7 @@ from ..tokenizer_registry import (
     artifact_checksum,
     mark_tokenizer_failed,
     mark_tokenizer_ready,
+    parse_tokenizer_source,
 )
 from ..train.compact_tokenizer import (
     CAUSAL_SPECIAL_TOKENS,
@@ -150,35 +152,101 @@ def _configure_imported_tokenizer(
     }
 
 
+def effective_vocab_size(tokenizer: Any) -> int:
+    """Vocabulary size the way SPALMER sizes embeddings.
+
+    The maximum of ``len(tokenizer)``, the declared ``vocab_size``, and the
+    highest token id plus one; for contiguous vocabularies all three agree.
+    Cataloguing the same number keeps the SPALMER page's "registered vocabulary
+    is authoritative" rule exact.
+    """
+
+    candidates: list[int] = []
+    try:
+        candidates.append(int(len(tokenizer)))
+    except (TypeError, AttributeError):
+        pass
+    declared = getattr(tokenizer, "vocab_size", None)
+    if declared is not None:
+        candidates.append(int(declared))
+    get_vocab = getattr(tokenizer, "get_vocab", None)
+    if callable(get_vocab):
+        try:
+            vocab = get_vocab()
+        except Exception:  # noqa: BLE001 - some backends cannot enumerate
+            vocab = {}
+        if vocab:
+            candidates.append(max(int(value) for value in vocab.values()) + 1)
+    if not candidates or max(candidates) <= 0:
+        raise ValueError("cannot infer a positive vocabulary size from the tokenizer")
+    return max(candidates)
+
+
+def _hub_snapshot_dir(repo_id: str, revision: str | None, token: str | None) -> Path | None:
+    """Locate the cached hub snapshot a tokenizer was loaded from (best effort)."""
+
+    try:
+        from huggingface_hub import hf_hub_download
+
+        path = Path(
+            hf_hub_download(
+                repo_id,
+                "tokenizer_config.json",
+                revision=revision or None,
+                token=token or None,
+            )
+        )
+    except Exception:  # noqa: BLE001 - offline or unusual repo layout
+        return None
+    return path.parent
+
+
 def import_tokenizer_artifact(
     source: str | Path,
     destination: str | Path,
     *,
     special_token_profile: str = "auto",
     custom_special_tokens: Iterable[str] = (),
+    source_kind: str | None = None,
+    revision: str | None = None,
+    hf_token: str | None = None,
 ):
-    """Load a raw tokenizer.json or HF directory and save a clean local copy."""
+    """Load a raw tokenizer.json, an HF directory, or a hub repo and save a clean local copy."""
 
     from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
-    source_path = Path(source).expanduser().resolve()
-    raw_artifact = source_path.is_file()
-    if raw_artifact:
-        if source_path.name.casefold() != "tokenizer.json":
-            raise ValueError("raw tokenizer import expects a tokenizer.json file")
-        tokenizer = PreTrainedTokenizerFast(
-            tokenizer_file=str(source_path),
-            clean_up_tokenization_spaces=False,
-        )
-    elif source_path.is_dir():
+    if source_kind is None:
+        source_kind, reference = parse_tokenizer_source(source)
+    else:
+        reference = str(source)
+    raw_artifact = False
+    if source_kind == "hub":
         tokenizer = AutoTokenizer.from_pretrained(
-            source_path,
-            local_files_only=True,
+            reference,
+            revision=revision or None,
             use_fast=True,
             trust_remote_code=False,
+            token=hf_token or None,
         )
     else:
-        raise FileNotFoundError(f"tokenizer source does not exist: {source_path}")
+        source_path = Path(reference).expanduser().resolve()
+        raw_artifact = source_path.is_file()
+        if raw_artifact:
+            if source_path.name.casefold() != "tokenizer.json":
+                raise ValueError("raw tokenizer import expects a tokenizer.json file")
+            tokenizer = PreTrainedTokenizerFast(
+                tokenizer_file=str(source_path),
+                clean_up_tokenization_spaces=False,
+            )
+        elif source_path.is_dir():
+            tokenizer = AutoTokenizer.from_pretrained(
+                source_path,
+                local_files_only=True,
+                use_fast=True,
+                trust_remote_code=False,
+            )
+        else:
+            raise FileNotFoundError(f"tokenizer source does not exist: {source_path}")
     if not bool(getattr(tokenizer, "is_fast", False)):
         raise ValueError("tokenizer import requires a fast tokenizer convertible to tokenizer.json")
     special = _configure_imported_tokenizer(
@@ -511,7 +579,13 @@ def run_train_job(cfg: dict[str, Any], rd: Path) -> dict[str, Any]:
 
 def run_import_job(cfg: dict[str, Any], rd: Path) -> dict[str, Any]:
     tokenizer_id = str(cfg["tokenizer_id"])
-    source = Path(str(cfg.get("source") or "")).expanduser().resolve()
+    source_kind = str(cfg.get("source_kind") or "").strip()
+    if source_kind:
+        source_ref = str(cfg.get("source") or "").strip()
+    else:
+        source_kind, source_ref = parse_tokenizer_source(cfg.get("source"))
+    revision = str(cfg.get("hub_revision") or "").strip() or None
+    hf_token = (get_settings().get("hf_token") or None) if source_kind == "hub" else None
     _write_progress(
         rd,
         stage="importing tokenizer",
@@ -519,15 +593,24 @@ def run_import_job(cfg: dict[str, Any], rd: Path) -> dict[str, Any]:
         total=1,
         value=0,
         label="files",
-        message=str(source),
+        message=source_ref,
     )
-    source_checksum = tokenizer_source_checksum(source)
     tokenizer, special = import_tokenizer_artifact(
-        source,
+        source_ref,
         tokenizer_dir(tokenizer_id),
         special_token_profile=str(cfg.get("special_token_profile") or "auto"),
         custom_special_tokens=cfg.get("custom_special_tokens") or (),
+        source_kind=source_kind,
+        revision=revision,
+        hf_token=hf_token,
     )
+    hub_commit = ""
+    if source_kind == "hub":
+        snapshot = _hub_snapshot_dir(source_ref, revision, hf_token)
+        source_checksum = tokenizer_source_checksum(snapshot) if snapshot is not None else ""
+        hub_commit = snapshot.name if snapshot is not None else ""
+    else:
+        source_checksum = tokenizer_source_checksum(source_ref)
     output = tokenizer_dir(tokenizer_id)
     payload_checksum = artifact_checksum(output)
     probe_text = "yyLab tokenizer probe: ASCII, λ, 数学, 🧪\n"
@@ -537,13 +620,18 @@ def run_import_job(cfg: dict[str, Any], rd: Path) -> dict[str, Any]:
         max_documents=1,
         max_bytes=len(probe_text.encode("utf-8")),
     )
+    vocab_size = effective_vocab_size(tokenizer)
     artifact_config = {
         **cfg,
-        "source": str(source),
+        "source": source_ref,
+        "source_kind": source_kind,
+        "hub_revision": revision or "",
+        "hub_commit": hub_commit,
         "special_token_configuration": special,
     }
     stats = {
         "actual_vocab_size": int(len(tokenizer)),
+        "effective_vocab_size": int(vocab_size),
         "source_sha256": source_checksum,
         "tokenizer_payload_sha256": payload_checksum,
         "evaluation": evaluation,
@@ -563,7 +651,7 @@ def run_import_job(cfg: dict[str, Any], rd: Path) -> dict[str, Any]:
         tokenizer_id,
         path=output,
         kind="imported",
-        vocab_size=len(tokenizer),
+        vocab_size=vocab_size,
         config=artifact_config,
         stats=stats,
     )
@@ -574,7 +662,7 @@ def run_import_job(cfg: dict[str, Any], rd: Path) -> dict[str, Any]:
         total=1,
         value=1,
         label="files",
-        message=f"ready; {len(tokenizer):,} vocabulary entries",
+        message=f"ready; {vocab_size:,} vocabulary entries",
     )
     return stats
 

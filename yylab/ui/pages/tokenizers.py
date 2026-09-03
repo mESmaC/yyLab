@@ -14,8 +14,11 @@ from ...tokenizer_registry import (
     TOKENIZER_RUN_KIND,
     create_tokenizer_record,
     get_tokenizer,
+    hub_preset,
+    hub_preset_options,
     list_tokenizers,
     mark_tokenizer_failed,
+    parse_tokenizer_source,
 )
 from ...train.compact_tokenizer import CompactTokenizerSpec
 from ...train.data import normalize_source_splits
@@ -76,12 +79,15 @@ def build_tokenizer_import_config(
     source: str,
     special_token_profile: str = "auto",
     custom_special_tokens: list[str] | None = None,
+    hub_revision: str = "",
 ) -> dict[str, Any]:
-    source_path = Path(source).expanduser().resolve()
-    if not source_path.exists():
-        raise FileNotFoundError(f"tokenizer source does not exist: {source_path}")
-    if source_path.is_file() and source_path.name.casefold() != "tokenizer.json":
-        raise ValueError("select an HF tokenizer directory or a raw tokenizer.json file")
+    source_kind, source_ref = parse_tokenizer_source(source)
+    if source_kind == "path":
+        source_path = Path(source_ref)
+        if source_path.is_file() and source_path.name.casefold() != "tokenizer.json":
+            raise ValueError(
+                "select an HF tokenizer directory, a raw tokenizer.json file, or a Hugging Face repo id"
+            )
     profile = str(special_token_profile or "auto").strip().casefold()
     if profile not in {"auto", "causal", "chat", "custom"}:
         raise ValueError("import profile must be auto, causal, chat, or custom")
@@ -91,7 +97,9 @@ def build_tokenizer_import_config(
     return {
         "action": TOKENIZER_ACTION_IMPORT,
         "tokenizer_id": tokenizer_id,
-        "source": str(source_path),
+        "source": source_ref,
+        "source_kind": source_kind,
+        "hub_revision": str(hub_revision or "").strip(),
         "special_token_profile": profile,
         "custom_special_tokens": custom,
     }
@@ -362,18 +370,47 @@ def tokenizers_page():
         with ui.dialog() as import_dialog, ui.card().classes("w-[680px] max-w-[95vw] p-5"):
             ui.label("Import tokenizer").classes("text-lg font-semibold")
             hint(
-                "Choose a Hugging Face tokenizer directory or type the full path to a raw tokenizer.json. "
-                "yyLab creates its own self-contained copy and never mutates the source."
+                "Pick a large hub tokenizer preset, type a Hugging Face repo id (owner/name), choose a "
+                "local tokenizer directory, or give the full path to a raw tokenizer.json. yyLab "
+                "downloads or copies it into a self-contained artifact and never mutates the source."
             )
+            import_preset = ui.select(
+                {"": "Custom source", **hub_preset_options()},
+                value="",
+                label="Hugging Face preset",
+            ).props("outlined dense").classes("w-full")
+            import_preset_note = ui.label("").classes("text-xs text-teal-300")
+            import_preset_note.visible = False
             import_name = ui.input("Artifact name", value="imported-tokenizer").props("outlined dense").classes("w-full")
             with ui.row().classes("w-full items-end gap-2"):
-                import_source = ui.input("Source directory or tokenizer.json", value="").props(
-                    "outlined dense"
-                ).classes("flex-1")
+                import_source = ui.input(
+                    "Source: Hugging Face repo id, tokenizer directory, or tokenizer.json", value=""
+                ).props("outlined dense").classes("flex-1")
                 import_browser = dir_browser(
                     "Select tokenizer directory", lambda path: import_source.set_value(path)
                 )
                 ui.button(icon="folder", on_click=import_browser.open).props("outline dense")
+            import_revision = ui.input(
+                "Hub revision (optional branch, tag, or commit)", value=""
+            ).props("outlined dense").classes("w-full")
+            hint(
+                "Gated repos (for example Gemma) need the Hugging Face token saved under Settings. "
+                "The catalogued vocabulary is the size SPALMER will plan with."
+            )
+
+            def apply_import_preset() -> None:
+                preset = hub_preset(str(import_preset.value or ""))
+                if preset is None:
+                    import_preset_note.visible = False
+                    return
+                import_source.value = preset.repo_id
+                import_source.update()
+                import_name.value = preset.label
+                import_name.update()
+                import_preset_note.text = preset.note
+                import_preset_note.visible = True
+
+            import_preset.on_value_change(lambda _: apply_import_preset())
             import_profile = ui.select(
                 {
                     "auto": "Auto / preserve HF mappings",
@@ -442,6 +479,7 @@ def tokenizers_page():
                     source=str(import_source.value or ""),
                     special_token_profile=str(import_profile.value),
                     custom_special_tokens=_special_tokens(import_custom.value),
+                    hub_revision=str(import_revision.value or ""),
                 )
                 _, run_id, pid = _launch_registered_tokenizer(
                     name=str(import_name.value or "").strip(),

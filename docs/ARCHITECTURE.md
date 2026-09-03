@@ -713,11 +713,20 @@ The detached `tokenizer` worker has two actions:
   validation/test are preferred for evaluation. If no held-out records exist,
   a deterministic second pass over the training selection supplies a clearly
   labelled compression sample.
-- **Import** loads an existing fast HF directory or a raw `tokenizer.json`,
-  attaches usable Transformers EOS/PAD/chat metadata, then saves and reloads a
-  separate copy. Source files are never modified. Raw CDAS-style byte BPEs with
-  `<|endoftext|>` already in vocabulary retain their vocabulary size and use
-  that token as shared EOS/PAD.
+- **Import** loads an existing fast HF directory, a raw `tokenizer.json`, or a
+  Hugging Face hub repo id (`owner/name`, optional revision; gated repos use
+  the HF token from Settings), attaches usable Transformers EOS/PAD/chat
+  metadata, then saves and reloads a separate copy. Source files are never
+  modified; hub imports record the resolved commit and the checksum of the
+  downloaded tokenizer files. Raw CDAS-style byte BPEs with `<|endoftext|>`
+  already in vocabulary retain their vocabulary size and use that token as
+  shared EOS/PAD. The catalogued vocabulary follows SPALMER's rule (the
+  maximum of `len(tokenizer)`, the declared size, and the highest id plus
+  one), so the SPALMER page's "registered vocabulary is authoritative" check
+  is exact. `tokenizer_registry.HF_TOKENIZER_PRESETS` lists large open
+  tokenizers (o200k via `openai/gpt-oss-20b`, Qwen 3, Qwen 2.5, an ungated
+  Llama 3.2 mirror, gated Gemma 3) that both the import dialog and the SPALMER
+  page offer as one-click choices.
 
 Every trained tokenizer includes the full 256-byte alphabet. Minimal causal
 mode therefore starts at 257 entries (one shared EOS/PAD), built-in chat mode

@@ -73,8 +73,10 @@ Artifacts live in `./artifacts` (override with `YYLAB_HOME`).
   and keeps legacy explicit-step and epoch-derived caps replayable.
 - **Tokenizer laboratory** — train reusable byte-level BPE artifacts directly
   from any corpus/split/domain selection without materializing the corpus in
-  RAM, or import an HF tokenizer directory/raw `tokenizer.json` into an
-  independent self-contained copy. Vocabulary size is arbitrary above the
+  RAM, or import an HF tokenizer directory, raw `tokenizer.json`, or Hugging
+  Face hub repo id into an independent self-contained copy (presets cover
+  o200k via gpt-oss, Qwen 3, Qwen 2.5, Llama 3.2, and gated Gemma 3, and the
+  SPALMER page offers the same presets). Vocabulary size is arbitrary above the
   chosen byte-coverage floor: 257 for minimal causal, 264 for built-in chat
   roles, or 256 plus a custom special-token list. No normalization (exact byte
   round trip) is the default; NFKC and NFKC+lowercase are explicit options.
