@@ -45,6 +45,11 @@ from .data import (
 MODEL_FAMILY = "spalmer"
 MANIFEST_SCHEMA_VERSION = 1
 TOKENIZER_CONTRACT_VERSION = 1
+INITIALIZATION_SCRATCH = "scratch"
+INITIALIZATION_CHECKPOINT = "checkpoint"
+CHECKPOINT_EXECUTION_KEYS = frozenset(
+    {"attention_backend", "require_fla", "allow_reference_attention"}
+)
 
 _EXPERT_RUNTIME_FIELDS = frozenset(
     {
@@ -100,20 +105,27 @@ class PreparedSpalmerRun:
     plan: Any
     bundle: Any
     training: Any
+    model: Any = None
+    parent: dict[str, Any] | None = None
 
 
 def _load_spalmer_api() -> SimpleNamespace:
     """Import the optional sibling package only at an execution boundary."""
 
     try:
-        from spalmer import save_checkpoint
+        from spalmer import load_checkpoint, save_checkpoint
+        from spalmer.attention import KDAConfig, MLAConfig
         from spalmer.attention.backends import fla_available
+        from spalmer.config import SPALMERConfig
+        from spalmer.directional import DirectionalConfig
         from spalmer.experiment.planning import (
             ATXYScaleConfig,
             DirectionalScaleConfig,
             ScaleSearchSpace,
             plan_configuration,
         )
+        from spalmer.experts import MicroExpertsConfig
+        from spalmer.memory import ATXYConfig
         from spalmer.presets import assert_accounting_matches_plan, build_configs
         from spalmer.tokenizer import HFTokenizerAdapter
         from spalmer.training import (
@@ -128,16 +140,23 @@ def _load_spalmer_api() -> SimpleNamespace:
             "install yyLab with its SPALMER training dependency"
         ) from exc
     return SimpleNamespace(
+        ATXYConfig=ATXYConfig,
         ATXYScaleConfig=ATXYScaleConfig,
         CausalBatch=CausalBatch,
+        DirectionalConfig=DirectionalConfig,
         DirectionalScaleConfig=DirectionalScaleConfig,
         ExperimentTrainer=ExperimentTrainer,
         HFTokenizerAdapter=HFTokenizerAdapter,
+        KDAConfig=KDAConfig,
+        MLAConfig=MLAConfig,
+        MicroExpertsConfig=MicroExpertsConfig,
+        SPALMERConfig=SPALMERConfig,
         ScaleSearchSpace=ScaleSearchSpace,
         TrainingConfig=TrainingConfig,
         assert_accounting_matches_plan=assert_accounting_matches_plan,
         build_configs=build_configs,
         fla_available=fla_available,
+        load_checkpoint=load_checkpoint,
         plan_configuration=plan_configuration,
         save_checkpoint=save_checkpoint,
         seed_everything=seed_everything,
@@ -231,92 +250,67 @@ def _normalize_optional_component(
     return component
 
 
-def normalize_spalmer_config(
-    config: Mapping[str, Any],
-    *,
-    require_runtime: bool = False,
-) -> dict[str, Any]:
-    """Canonicalize and validate one replayable SPALMER base-training recipe."""
+def _loads_json_object(value: object) -> dict[str, Any]:
+    try:
+        parsed = json.loads(str(value or "{}"))
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
-    cfg = dict(config)
-    family = str(
-        cfg.get("model_family") or cfg.get("architecture_type") or ""
-    ).strip().casefold()
+
+def _normalize_checkpoint_initialization(initialization: Mapping[str, Any]) -> dict[str, Any]:
+    """Resolve a registry checkpoint ID to a SPALMER bundle for continued training."""
+
+    from ..models.spalmer import resolve_spalmer_checkpoint
+
+    checkpoint_id = str(initialization.get("checkpoint_id") or "").strip()
+    if not checkpoint_id:
+        raise ValueError("SPALMER continued training requires initialization.checkpoint_id")
+    row = db.q1("SELECT * FROM checkpoints WHERE id=?", (checkpoint_id,))
+    if row is None:
+        raise ValueError(f"unknown parent checkpoint: {checkpoint_id}")
+    meta = _loads_json_object(row.get("meta_json"))
+    family = str(meta.get("model_family") or meta.get("family") or "").strip().casefold()
     if family != MODEL_FAMILY:
-        raise ValueError("SPALMER base training requires model_family='spalmer'")
-    cfg["model_family"] = MODEL_FAMILY
+        raise ValueError(f"parent checkpoint {checkpoint_id} is not a SPALMER checkpoint")
+    try:
+        bundle_path = resolve_spalmer_checkpoint(str(row.get("ref") or row.get("path") or ""))
+    except (FileNotFoundError, ValueError) as exc:
+        raise ValueError(
+            f"parent checkpoint {checkpoint_id} bundle is unavailable: {exc}"
+        ) from exc
+    return {
+        "mode": INITIALIZATION_CHECKPOINT,
+        "checkpoint_id": checkpoint_id,
+        "checkpoint_ref": str(bundle_path),
+    }
 
-    objective = normalize_training_objective(cfg.get("objective"))
-    if objective != OBJECTIVE_CAUSAL_LM:
-        raise ValueError("SPALMER base pretraining currently supports only causal_lm")
-    cfg["objective"] = objective
-    method = str(cfg.get("method") or "full").strip().casefold()
-    if method != "full":
-        raise ValueError("SPALMER scratch initialization supports full-parameter training only")
-    cfg["method"] = method
 
-    initialization = _mapping(cfg.get("initialization"), "initialization")
-    mode = str(initialization.get("mode") or "scratch").strip().casefold()
-    if mode != "scratch":
-        raise ValueError("the first SPALMER base-training path supports scratch initialization only")
-    tokenizer_ref = str(
-        initialization.get("tokenizer_ref")
-        or cfg.get("tokenizer_ref")
-        or _mapping(cfg.get("spalmer"), "spalmer").get("tokenizer_ref")
-        or ""
-    ).strip()
-    if not tokenizer_ref:
-        raise ValueError("SPALMER scratch training requires a registered or direct HF tokenizer")
-    initialization.update(mode="scratch", tokenizer_ref=tokenizer_ref)
-    cfg["initialization"] = initialization
-    cfg["tokenizer_ref"] = tokenizer_ref
+def _normalize_checkpoint_execution(spalmer: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep only attention preflight keys; the loaded bundle owns everything else."""
 
-    corpora = normalize_corpus_ids(cfg.get("corpora", cfg.get("corpus")))
-    if not corpora:
-        raise ValueError("SPALMER base training requires at least one corpus")
-    cfg["corpora"] = corpora
-    cfg["domains"] = _normalize_string_list(cfg.get("domains"), "domains") or None
-    cfg["splits"] = normalize_source_splits(
-        cfg.get("splits", cfg.get("source_splits"))
-    ) or None
-    cfg["corpus_mix"] = normalize_corpus_mix(cfg.get("corpus_mix"))
-    cfg["cross_corpus_dedup"] = _bool(
-        cfg.get("cross_corpus_dedup"), default=True
-    )
-
-    weights = _mapping(cfg.get("corpus_weights"), "corpus_weights")
-    normalized_weights: dict[str, float] = {}
-    for corpus_id, value in weights.items():
-        key = str(corpus_id)
-        if key not in corpora:
-            raise ValueError(f"corpus weight references an unselected corpus: {key!r}")
-        normalized_weights[key] = _finite_float(
-            value, f"corpus_weights[{key!r}]", minimum=0.0
+    forbidden = sorted(set(spalmer) - CHECKPOINT_EXECUTION_KEYS)
+    if forbidden:
+        raise ValueError(
+            "SPALMER continued training inherits its architecture from the parent "
+            "checkpoint; remove " + ", ".join(forbidden)
         )
-        if normalized_weights[key] == 0:
-            raise ValueError("corpus weights must be positive")
-    cfg["corpus_weights"] = normalized_weights
-    source_ratio = cfg.get("source_max_ratio")
-    cfg["source_max_ratio"] = (
-        None
-        if source_ratio in {None, "", 0, 0.0}
-        else _finite_float(source_ratio, "source_max_ratio", minimum=0.0, maximum=1.0)
+    attention_backend = str(spalmer.get("attention_backend") or "auto").strip().casefold()
+    if attention_backend not in {"auto", "fla", "reference"}:
+        raise ValueError("attention_backend must be 'auto', 'fla', or 'reference'")
+    require_fla = _bool(
+        spalmer.get("require_fla"),
+        default=(
+            attention_backend != "reference"
+            and not _bool(spalmer.get("allow_reference_attention"), default=False)
+        ),
     )
-    if cfg["source_max_ratio"] == 0:
-        cfg["source_max_ratio"] = None
-    if cfg["corpus_mix"] != CORPUS_MIX_TOKEN_BALANCED and (
-        normalized_weights or cfg["source_max_ratio"] is not None
-    ):
-        raise ValueError("corpus weights and source_max_ratio require token-balanced mixing")
-    if len(corpora) < 2:
-        cfg["source_max_ratio"] = None
-    elif (
-        cfg["source_max_ratio"] is not None
-        and cfg["source_max_ratio"] < 1 / len(corpora)
-    ):
-        raise ValueError("source_max_ratio is smaller than the feasible equal share")
+    return {"attention_backend": attention_backend, "require_fla": require_fla}
 
-    spalmer = _mapping(cfg.get("spalmer"), "spalmer")
+
+def _normalize_scratch_architecture(cfg: dict[str, Any], spalmer: dict[str, Any]) -> None:
+    """Validate the plan-driving architecture recipe for scratch initialization."""
+
     target = spalmer.get("target_parameters", cfg.get("target_parameters"))
     if target is None:
         raise ValueError("SPALMER requires an inclusive total target_parameters value")
@@ -450,6 +444,103 @@ def normalize_spalmer_config(
         spalmer["plan"] = submitted_plan
     cfg["spalmer"] = spalmer
     cfg["target_parameters"] = spalmer["target_parameters"]
+
+
+def normalize_spalmer_config(
+    config: Mapping[str, Any],
+    *,
+    require_runtime: bool = False,
+) -> dict[str, Any]:
+    """Canonicalize and validate one replayable SPALMER base-training recipe."""
+
+    cfg = dict(config)
+    family = str(
+        cfg.get("model_family") or cfg.get("architecture_type") or ""
+    ).strip().casefold()
+    if family != MODEL_FAMILY:
+        raise ValueError("SPALMER base training requires model_family='spalmer'")
+    cfg["model_family"] = MODEL_FAMILY
+
+    objective = normalize_training_objective(cfg.get("objective"))
+    if objective != OBJECTIVE_CAUSAL_LM:
+        raise ValueError("SPALMER base pretraining currently supports only causal_lm")
+    cfg["objective"] = objective
+    method = str(cfg.get("method") or "full").strip().casefold()
+    if method != "full":
+        raise ValueError("SPALMER scratch initialization supports full-parameter training only")
+    cfg["method"] = method
+
+    initialization = _mapping(cfg.get("initialization"), "initialization")
+    mode = str(initialization.get("mode") or INITIALIZATION_SCRATCH).strip().casefold()
+    if mode == INITIALIZATION_SCRATCH:
+        tokenizer_ref = str(
+            initialization.get("tokenizer_ref")
+            or cfg.get("tokenizer_ref")
+            or _mapping(cfg.get("spalmer"), "spalmer").get("tokenizer_ref")
+            or ""
+        ).strip()
+        if not tokenizer_ref:
+            raise ValueError("SPALMER scratch training requires a registered or direct HF tokenizer")
+        initialization.update(mode=INITIALIZATION_SCRATCH, tokenizer_ref=tokenizer_ref)
+        cfg["tokenizer_ref"] = tokenizer_ref
+    elif mode == INITIALIZATION_CHECKPOINT:
+        initialization = _normalize_checkpoint_initialization(initialization)
+        cfg["tokenizer_ref"] = None
+    else:
+        raise ValueError(f"unsupported SPALMER initialization mode: {mode!r}")
+    cfg["initialization"] = initialization
+
+    corpora = normalize_corpus_ids(cfg.get("corpora", cfg.get("corpus")))
+    if not corpora:
+        raise ValueError("SPALMER base training requires at least one corpus")
+    cfg["corpora"] = corpora
+    cfg["domains"] = _normalize_string_list(cfg.get("domains"), "domains") or None
+    cfg["splits"] = normalize_source_splits(
+        cfg.get("splits", cfg.get("source_splits"))
+    ) or None
+    cfg["corpus_mix"] = normalize_corpus_mix(cfg.get("corpus_mix"))
+    cfg["cross_corpus_dedup"] = _bool(
+        cfg.get("cross_corpus_dedup"), default=True
+    )
+
+    weights = _mapping(cfg.get("corpus_weights"), "corpus_weights")
+    normalized_weights: dict[str, float] = {}
+    for corpus_id, value in weights.items():
+        key = str(corpus_id)
+        if key not in corpora:
+            raise ValueError(f"corpus weight references an unselected corpus: {key!r}")
+        normalized_weights[key] = _finite_float(
+            value, f"corpus_weights[{key!r}]", minimum=0.0
+        )
+        if normalized_weights[key] == 0:
+            raise ValueError("corpus weights must be positive")
+    cfg["corpus_weights"] = normalized_weights
+    source_ratio = cfg.get("source_max_ratio")
+    cfg["source_max_ratio"] = (
+        None
+        if source_ratio in {None, "", 0, 0.0}
+        else _finite_float(source_ratio, "source_max_ratio", minimum=0.0, maximum=1.0)
+    )
+    if cfg["source_max_ratio"] == 0:
+        cfg["source_max_ratio"] = None
+    if cfg["corpus_mix"] != CORPUS_MIX_TOKEN_BALANCED and (
+        normalized_weights or cfg["source_max_ratio"] is not None
+    ):
+        raise ValueError("corpus weights and source_max_ratio require token-balanced mixing")
+    if len(corpora) < 2:
+        cfg["source_max_ratio"] = None
+    elif (
+        cfg["source_max_ratio"] is not None
+        and cfg["source_max_ratio"] < 1 / len(corpora)
+    ):
+        raise ValueError("source_max_ratio is smaller than the feasible equal share")
+
+    spalmer = _mapping(cfg.get("spalmer"), "spalmer")
+    if mode == INITIALIZATION_CHECKPOINT:
+        cfg["spalmer"] = _normalize_checkpoint_execution(spalmer)
+        cfg.pop("target_parameters", None)
+    else:
+        _normalize_scratch_architecture(cfg, spalmer)
 
     training = _mapping(cfg.get("training"), "training")
     training_aliases = {
@@ -1260,6 +1351,75 @@ def _validate_fast_attention(config: Mapping[str, Any], api: SimpleNamespace) ->
         )
 
 
+class ParentPlan:
+    """Read-only view of the scale plan recorded in a parent bundle."""
+
+    def __init__(self, plan: Mapping[str, Any]) -> None:
+        self._plan = dict(plan)
+        self.target_parameters = int(self._plan.get("target_parameters") or 0)
+        self.relative_error = float(self._plan.get("relative_error") or 0.0)
+        self.fingerprint = str(self._plan.get("fingerprint") or "")
+        self.config = SimpleNamespace(**_mapping(self._plan.get("config"), "plan.config"))
+        self.parameters = SimpleNamespace(
+            **_mapping(self._plan.get("parameters"), "plan.parameters")
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return dict(self._plan)
+
+
+def _optional_config(factory: Callable[..., Any], value: object, name: str) -> Any:
+    return None if value is None else factory(**_mapping(value, name))
+
+
+def _prepare_checkpoint_run(cfg: dict[str, Any], symbols: SimpleNamespace) -> PreparedSpalmerRun:
+    """Load a parent bundle as the starting point of a new full-parameter run."""
+
+    from ..models.spalmer import load_spalmer_checkpoint_payload, relocated_spalmer_tokenizer
+
+    initialization = _mapping(cfg.get("initialization"), "initialization")
+    checkpoint_path = Path(str(initialization["checkpoint_ref"]))
+    payload = load_spalmer_checkpoint_payload(checkpoint_path)
+    if int(payload.get("format_version") or 0) != 5:
+        raise ValueError(
+            "SPALMER continued training requires a format-version-5 bundle; "
+            f"found {payload.get('format_version')!r}"
+        )
+    binding = payload.get("tokenizer_binding")
+    override = relocated_spalmer_tokenizer(binding if isinstance(binding, Mapping) else None)
+    load_kwargs: dict[str, Any] = {"map_location": "cpu"}
+    if override is not None:
+        load_kwargs["tokenizer_override"] = override
+    model, tokenizer, metadata = symbols.load_checkpoint(checkpoint_path, **load_kwargs)
+    metadata = dict(metadata or {})
+    plan_payload = metadata.get("plan")
+    if not isinstance(plan_payload, Mapping) or not plan_payload:
+        raise ValueError("parent checkpoint metadata does not record a SPALMER scale plan")
+    plan = ParentPlan(plan_payload)
+    bundle = SimpleNamespace(
+        plan=plan,
+        model=symbols.SPALMERConfig(**_mapping(payload.get("model_config"), "model_config")),
+        kda=symbols.KDAConfig(**_mapping(payload.get("kda_config"), "kda_config")),
+        mla=symbols.MLAConfig(**_mapping(payload.get("mla_config"), "mla_config")),
+        experts=symbols.MicroExpertsConfig(
+            **_mapping(payload.get("experts_config"), "experts_config")
+        ),
+        directional=_optional_config(
+            symbols.DirectionalConfig, payload.get("directional_config"), "directional_config"
+        ),
+        atxy=_optional_config(symbols.ATXYConfig, payload.get("atxy_config"), "atxy_config"),
+    )
+    training = build_spalmer_training_config(cfg, api=symbols)
+    _validate_fast_attention(cfg, symbols)
+    parent = {
+        "checkpoint_id": str(initialization.get("checkpoint_id") or ""),
+        "checkpoint_path": str(checkpoint_path),
+        "run_id": str(metadata.get("run_id") or ""),
+        "plan_fingerprint": plan.fingerprint,
+    }
+    return PreparedSpalmerRun(cfg, tokenizer, plan, bundle, training, model=model, parent=parent)
+
+
 def prepare_spalmer_run(
     config: Mapping[str, Any],
     *,
@@ -1269,6 +1429,8 @@ def prepare_spalmer_run(
 
     cfg = normalize_spalmer_config(config, require_runtime=True)
     symbols = api or _load_spalmer_api()
+    if cfg["initialization"]["mode"] == INITIALIZATION_CHECKPOINT:
+        return _prepare_checkpoint_run(cfg, symbols)
     tokenizer = resolve_spalmer_tokenizer(cfg, api=symbols)
     plan = plan_spalmer_configuration(cfg, int(tokenizer.vocab_size), api=symbols)
     bundle = build_spalmer_bundle(cfg, tokenizer, plan, api=symbols)
@@ -1302,6 +1464,8 @@ def _save_bundle_checkpoint(
         "batch_source": dict(trainer.batches.state_dict()),
         "data_provenance": dict(data_provenance),
     }
+    if prepared.parent:
+        metadata["parent_checkpoint"] = dict(prepared.parent)
     return api.save_checkpoint(
         destination,
         trainer.model,
@@ -1336,6 +1500,7 @@ def run_spalmer_base(config: Mapping[str, Any], rd: Path) -> dict[str, Any]:
         print(f"data warning: {warning}", flush=True)
     data_provenance = dict(preflight["provenance"])
     data_provenance["objective"] = OBJECTIVE_CAUSAL_LM
+    data_provenance["initialization"] = str(cfg["initialization"]["mode"])
 
     api = _load_spalmer_api()
     prepared = prepare_spalmer_run(cfg, api=api)
@@ -1355,7 +1520,16 @@ def run_spalmer_base(config: Mapping[str, Any], rd: Path) -> dict[str, Any]:
     import torch
 
     destination_device = torch.device(prepared.training.device)
-    if destination_device.type == "cuda":
+    if prepared.model is not None:
+        parent = dict(prepared.parent or {})
+        model = prepared.model.to(destination_device)
+        print(
+            "SPALMER continued training: "
+            f"parent={parent.get('checkpoint_id')}; plan={plan.fingerprint[:16]}…; "
+            "optimizer moments and learning-rate schedule start fresh",
+            flush=True,
+        )
+    elif destination_device.type == "cuda":
         # Construct directly on the destination to avoid a second, transient
         # full-sized host copy before ExperimentTrainer takes ownership.
         with torch.device(destination_device):
@@ -1363,7 +1537,8 @@ def run_spalmer_base(config: Mapping[str, Any], rd: Path) -> dict[str, Any]:
     else:
         model = prepared.bundle.build()
     accounting = model.parameter_accounting()
-    api.assert_accounting_matches_plan(plan, accounting)
+    if prepared.model is None:
+        api.assert_accounting_matches_plan(plan, accounting)
     accounting_payload = _parameter_accounting_payload(accounting)
 
     batches = build_spalmer_batch_source(
@@ -1509,6 +1684,7 @@ def run_spalmer_base(config: Mapping[str, Any], rd: Path) -> dict[str, Any]:
         "checkpoint_path": str(Path(checkpoint_path).resolve()),
         "plan": plan.to_dict(),
         "plan_fingerprint": plan.fingerprint,
+        "parent_checkpoint": dict(prepared.parent or {}) or None,
         "tokenizer": prepared.tokenizer.identity.to_dict(),
         "model_config": prepared.bundle.model.to_dict(),
         "kda_config": _jsonable(prepared.bundle.kda),
@@ -1532,7 +1708,8 @@ def run_spalmer_base(config: Mapping[str, Any], rd: Path) -> dict[str, Any]:
         "model_family": MODEL_FAMILY,
         "checkpoint_format": manifest["checkpoint_format"],
         "checkpoint_file": manifest["checkpoint_file"],
-        "initialization": "scratch",
+        "initialization": str(cfg["initialization"]["mode"]),
+        "parent_checkpoint_id": (prepared.parent or {}).get("checkpoint_id"),
         "architecture": "SPALMER",
         "plan": plan.to_dict(),
         "plan_fingerprint": plan.fingerprint,
@@ -1569,6 +1746,7 @@ def run_spalmer_base(config: Mapping[str, Any], rd: Path) -> dict[str, Any]:
         "parameters": actual_parameters,
         "plan": plan.to_dict(),
         "plan_fingerprint": plan.fingerprint,
+        "parent_checkpoint": dict(prepared.parent or {}) or None,
         "docs_seen": batches.docs_seen,
         "tokens": tokens_seen,
         "corpora": list(cfg["corpora"]),

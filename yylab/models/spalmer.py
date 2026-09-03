@@ -17,6 +17,8 @@ from typing import Any
 import torch
 from torch import Tensor, nn
 
+from ..config import PATHS
+
 SPALMER_FORMAT = "spalmer.prototype.checkpoint"
 SPALMER_FILENAME = "spalmer.pt"
 DEFAULT_CONTEXT_LIMIT = 8_192
@@ -45,13 +47,11 @@ def is_spalmer_checkpoint(ref: str | Path) -> bool:
     return True
 
 
-def scan_spalmer_checkpoint(ref: str | Path) -> dict[str, Any]:
-    """Inspect a trusted local SPALMER bundle without constructing its model.
+def load_spalmer_checkpoint_payload(ref: str | Path) -> dict[str, Any]:
+    """Load a trusted bundle's payload without constructing its model.
 
     ``weights_only=True`` constrains unpickling to PyTorch's safe allowlist and
-    ``mmap=True`` prevents registration from materializing a second in-memory
-    copy of all checkpoint tensors.  SPALMER's checkpoint payload is required
-    to remain a plain mapping of primitive metadata and tensors.
+    ``mmap=True`` avoids materializing tensors that the caller never touches.
     """
 
     path = resolve_spalmer_checkpoint(ref)
@@ -65,6 +65,20 @@ def scan_spalmer_checkpoint(ref: str | Path) -> dict[str, Any]:
         raise TypeError("SPALMER checkpoint payload must be a plain dictionary")
     if payload.get("format") != SPALMER_FORMAT:
         raise ValueError("not a SPALMER checkpoint")
+    return payload
+
+
+def scan_spalmer_checkpoint(ref: str | Path) -> dict[str, Any]:
+    """Inspect a trusted local SPALMER bundle without constructing its model.
+
+    ``weights_only=True`` constrains unpickling to PyTorch's safe allowlist and
+    ``mmap=True`` prevents registration from materializing a second in-memory
+    copy of all checkpoint tensors.  SPALMER's checkpoint payload is required
+    to remain a plain mapping of primitive metadata and tensors.
+    """
+
+    path = resolve_spalmer_checkpoint(ref)
+    payload = load_spalmer_checkpoint_payload(path)
 
     model_config = _plain_dict(payload.get("model_config"), "model_config")
     model_state = _tensor_mapping(payload.get("model_state"), "model_state")
@@ -556,6 +570,75 @@ class SpalmerCausalLMFacade(nn.Module):
                 streamer.end()
 
 
+def _checkpoint_tokenizer_binding(path: Path) -> dict[str, Any] | None:
+    """Read only the tokenizer binding from a bundle, without building tensors."""
+
+    payload = load_spalmer_checkpoint_payload(path)
+    return _optional_plain_dict(payload.get("tokenizer_binding"), "tokenizer_binding")
+
+
+def _local_tokenizer_artifacts(preferred_name: str) -> list[Path]:
+    """Return local tokenizer artifact directories, same-named candidate first."""
+
+    root = Path(PATHS.tokenizers)
+    if not root.is_dir():
+        return []
+    candidates = sorted(
+        candidate.resolve()
+        for candidate in root.iterdir()
+        if candidate.is_dir() and (candidate / "tokenizer.json").is_file()
+    )
+    return sorted(candidates, key=lambda candidate: candidate.name != preferred_name)
+
+
+def relocated_spalmer_tokenizer(binding: Mapping[str, Any] | None) -> Any | None:
+    """Rebuild a checkpoint's Hugging Face tokenizer when its recorded path moved.
+
+    SPALMER records a local tokenizer artifact by absolute path.  Checkpoints
+    copied from another machine (or another artifact root) therefore point at
+    a directory that no longer exists, and Hugging Face would misread that
+    path as a Hub repository id.  The tokenizer identity is content-addressed,
+    so a local artifact with the same fingerprint is the same tokenizer; it is
+    returned as a ``tokenizer_override`` that SPALMER re-verifies on load.
+    Returns ``None`` whenever the recorded reference should be resolved by
+    SPALMER itself.
+    """
+
+    if not binding or binding.get("kind") != "huggingface":
+        return None
+    identity = _plain_dict(binding.get("identity"), "tokenizer_binding.identity")
+    source = str(identity.get("source") or "")
+    source_path = Path(source).expanduser()
+    if not source_path.is_absolute() or source_path.exists():
+        return None
+    expected = str(identity.get("artifact_fingerprint") or "").strip()
+    if not expected:
+        raise ValueError("SPALMER tokenizer binding is missing its artifact_fingerprint")
+
+    from spalmer.tokenizer import HFTokenizerAdapter, SpecialTokenIds, fingerprint_local_artifact
+
+    candidates = _local_tokenizer_artifacts(source_path.name)
+    for candidate in candidates:
+        if fingerprint_local_artifact(candidate) != expected:
+            continue
+        special_tokens = _plain_dict(
+            identity.get("special_tokens") or {}, "tokenizer_binding.identity.special_tokens"
+        )
+        return HFTokenizerAdapter.from_pretrained(
+            str(candidate),
+            revision=identity.get("revision"),
+            local_files_only=True,
+            trust_remote_code=False,
+            special_tokens=SpecialTokenIds(**special_tokens),
+        )
+    raise FileNotFoundError(
+        "SPALMER checkpoint tokenizer was recorded at "
+        f"{source}, which does not exist on this machine, and none of the "
+        f"{len(candidates)} local tokenizer artifacts under {PATHS.tokenizers} match "
+        f"artifact fingerprint {expected}; import the original tokenizer artifact first"
+    )
+
+
 def load_spalmer_runtime(
     ref: str | Path,
     *,
@@ -580,7 +663,12 @@ def load_spalmer_runtime(
     # Keep SPALMER optional for yyLab installations that only use HF models.
     from spalmer import load_checkpoint
 
-    model, loaded_tokenizer, metadata = load_checkpoint(checkpoint_path, map_location="cpu")
+    binding = _checkpoint_tokenizer_binding(checkpoint_path)
+    tokenizer_override = relocated_spalmer_tokenizer(binding)
+    load_kwargs: dict[str, Any] = {"map_location": "cpu"}
+    if tokenizer_override is not None:
+        load_kwargs["tokenizer_override"] = tokenizer_override
+    model, loaded_tokenizer, metadata = load_checkpoint(checkpoint_path, **load_kwargs)
     cuda = torch.cuda.is_available()
     device = torch.device("cuda" if cuda else "cpu")
     offload: dict[str, object] | None = None
@@ -665,6 +753,13 @@ def load_spalmer_runtime(
         "Loaded native SPALMER checkpoint.",
         "SPALMER uses NoPE and native recurrent KDA/MLA state; HF RoPE and KV-cache modes do not apply.",
     ]
+    if tokenizer_override is not None:
+        recorded_source = str((binding or {}).get("identity", {}).get("source") or "")
+        notes.append(
+            f"SPALMER tokenizer relocated: the checkpoint recorded {recorded_source}, "
+            "which does not exist here; using the fingerprint-matched local artifact "
+            f"{tokenizer_override.identity.source}."
+        )
     if offload is not None:
         pinned = "pinned " if offload["expert_masters_pinned"] else ""
         if expert_paging:
