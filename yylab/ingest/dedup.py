@@ -9,11 +9,20 @@ import math
 import re
 import sys
 import tokenize
+import warnings
 from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
 import xxhash
+
+# ``ast.parse`` on corpus documents compiles arbitrary third-party Python, and
+# the compiler reports every invalid escape sequence in *their* string
+# literals as a SyntaxWarning on stderr (filename ``<unknown>``).  Those are
+# facts about the data, not about yyLab, and with worker processes every
+# process would print its own copy.  Only anonymous compile sources are
+# silenced; warnings from real modules are untouched.
+warnings.filterwarnings("ignore", category=SyntaxWarning, module=r"^<(unknown|string)>$")
 
 NUM_PERM = 128
 SHINGLE_K = 5
@@ -119,7 +128,11 @@ def _generic_code_structure(text: str) -> str:
 
 def _python_structure(text: str) -> tuple[str, str, list[str]]:
     try:
-        tree = ast.parse(text)
+        with warnings.catch_warnings():
+            # Belt and braces with the module-level filter: the compiler's
+            # SyntaxWarnings describe the corpus document, not yyLab.
+            warnings.simplefilter("ignore", SyntaxWarning)
+            tree = ast.parse(text)
     except SyntaxError as error:
         location = f"{error.lineno or 0}:{error.offset or 0}"
         return _generic_code_structure(text), "invalid", [f"python_parse_error:{location}"]
