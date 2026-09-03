@@ -7,10 +7,11 @@ import sys
 from collections import Counter, deque
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from .. import db
-from ..artifacts import corpus_dir
+from ..artifacts import corpus_bucket_dir, corpus_dir
 from ..ingest.dedup import sha256_hex
 from ..ingest.pipeline import _iter_shards
 from ..ingest.records import (
@@ -584,8 +585,14 @@ class ExpertDataPlan:
         )
 
 
-def corpus_shards(corpus_id: str) -> list[str]:
-    cdir = corpus_dir(corpus_id) / "data"
+def corpus_data_dir(corpus_id: str) -> Path:
+    """Live ``data`` directory of a corpus, resolved through its generation pointer."""
+
+    return corpus_bucket_dir(corpus_id, "data", root=corpus_dir(corpus_id))
+
+
+def corpus_shards(corpus_id: str, data_dir: Path | None = None) -> list[str]:
+    cdir = data_dir if data_dir is not None else corpus_data_dir(corpus_id)
     return sorted(p.name for p in cdir.glob("shard-*.jsonl.zst"))
 
 
@@ -625,10 +632,13 @@ def iter_corpus_docs(
             raise ValueError("source_max_ratio must be in (0, 1]")
 
     def corpus_stream(corpus_id: str) -> Iterator[dict]:
-        shards = corpus_shards(corpus_id)
+        # Resolve the generation once per stream so a re-import published
+        # mid-run cannot mix old and new shards into the same epoch.
+        data_dir = corpus_data_dir(corpus_id)
+        shards = corpus_shards(corpus_id, data_dir=data_dir)
         if not shards:
             return
-        for line in _iter_shards(corpus_dir(corpus_id) / "data", shards):
+        for line in _iter_shards(data_dir, shards):
             split = infer_source_split(line.get("source", ""), line.get("split"))
             if (domain_set is None or line.get("domain") in domain_set) and (
                 split_set is None or split in split_set

@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator
+from itertools import pairwise
 from pathlib import Path
 
 import orjson
 
 from ..records import Doc, infer_source_split, normalize_chat_messages
-from .base import Adapter
+from .base import Adapter, ChunkSpec
 
 FULL_DOCUMENT_FIELDS = (
     "text",
@@ -64,6 +65,11 @@ _ADDITIONAL_METADATA_FIELDS = (
     "path",
     "source_path",
 )
+_BOM = b"\xef\xbb\xbf"
+#: Byte-range chunks for line-oriented files.  Boundaries always snap to a
+#: physical line start, so every chunk holds whole lines.
+CHUNK_BYTES = 16 * 2**20
+MIN_CHUNKED_FILE_BYTES = 2 * CHUNK_BYTES
 
 
 def _format_tool_calls(calls) -> list[str]:
@@ -360,126 +366,69 @@ def _report_unsupported_type(on_error, locator: str, value: object) -> None:
         on_error(locator, "unsupported_record_type", type(value).__name__)
 
 
-def _iter_records(path: Path, on_error=None) -> Iterator[dict]:
-    """Stream line-oriented JSON without materializing the entire source file.
+def _first_nonempty_line(fh) -> tuple[bytes, int, int]:
+    """Return ``(raw_line, start, end)`` of the first non-blank physical line."""
 
-    Pretty-printed objects and top-level arrays still use the compatible
-    whole-document path. Normal JSONL/NDJSON, including a single compact object,
-    stays bounded to one physical line.
+    position = 0
+    for raw_line in fh:
+        start = position
+        position += len(raw_line)
+        if raw_line.strip():
+            return raw_line, start, position
+    return b"", position, position
+
+
+def _head_mode(first: bytes, suffix: str) -> tuple[str, object, bool]:
+    """Classify a file from its first non-blank line.
+
+    Returns ``(mode, first_record, decode_failed)`` where ``mode`` is ``lines``
+    for a file that is read one physical line at a time or ``whole`` for the
+    compatibility path (top-level arrays and pretty-printed objects).
     """
 
-    with path.open("rb") as fh:
-        first = b""
-        for raw_line in fh:
-            if raw_line.strip():
-                first = raw_line
-                break
-        if not first:
-            return
-
-        if first.startswith(b"\xef\xbb\xbf"):
-            first = first[3:]
-
-        stripped = first.lstrip()
-        if not stripped.startswith(b"["):
-            decode_failed = False
-            try:
-                first_record = _loads_record(first)
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                first_record = None
-                decode_failed = True
-            if isinstance(first_record, dict):
-                yield first_record
-                for line_number, raw_line in enumerate(fh, start=2):
-                    raw_line = raw_line.strip()
-                    if not raw_line:
-                        continue
-                    try:
-                        record = _loads_record(raw_line)
-                    except (json.JSONDecodeError, UnicodeDecodeError) as error:
-                        if on_error is not None:
-                            on_error(
-                                f"line={line_number}",
-                                "json_decode_error",
-                                f"{type(error).__name__}: {error}",
-                            )
-                        continue
-                    if isinstance(record, dict):
-                        yield record
-                    else:
-                        _report_unsupported_type(
-                            on_error,
-                            f"line={line_number}",
-                            record,
-                        )
-                return
-            if (
-                path.suffix.casefold() in {".jsonl", ".ndjson"}
-                and stripped.strip() != b"{"
-            ):
-                if on_error is not None:
-                    if decode_failed:
-                        on_error(
-                            "line=1",
-                            "json_decode_error",
-                            "first line is not a valid JSON object",
-                        )
-                    else:
-                        _report_unsupported_type(on_error, "line=1", first_record)
-                for line_number, raw_line in enumerate(fh, start=2):
-                    raw_line = raw_line.strip()
-                    if not raw_line:
-                        continue
-                    try:
-                        record = _loads_record(raw_line)
-                    except (json.JSONDecodeError, UnicodeDecodeError) as error:
-                        if on_error is not None:
-                            on_error(
-                                f"line={line_number}",
-                                "json_decode_error",
-                                f"{type(error).__name__}: {error}",
-                            )
-                        continue
-                    if isinstance(record, dict):
-                        yield record
-                    else:
-                        _report_unsupported_type(
-                            on_error,
-                            f"line={line_number}",
-                            record,
-                        )
-                return
-
-    # A top-level array or pretty-printed object cannot be decoded one line at
-    # a time. This compatibility path is deliberately the only unbounded case.
-    raw = path.read_bytes().strip()
-    if raw.startswith(b"\xef\xbb\xbf"):
-        raw = raw[3:]
-    if not raw:
-        return
+    if first.startswith(_BOM):
+        first = first[3:]
+    stripped = first.lstrip()
+    if stripped.startswith(b"["):
+        return "whole", None, False
     decode_failed = False
     try:
-        parsed = _loads_record(raw)
+        first_record = _loads_record(first)
     except (json.JSONDecodeError, UnicodeDecodeError):
-        parsed = None
+        first_record = None
         decode_failed = True
-    if isinstance(parsed, list):
-        for item_index, record in enumerate(parsed, start=1):
-            if isinstance(record, dict):
-                yield record
-            else:
-                _report_unsupported_type(on_error, f"item={item_index}", record)
-        return
-    if isinstance(parsed, dict):
-        yield parsed
-        return
-    if not decode_failed:
-        _report_unsupported_type(on_error, "$document", parsed)
-        return
+    if isinstance(first_record, dict):
+        return "lines", first_record, False
+    if suffix in {".jsonl", ".ndjson"} and stripped.strip() != b"{":
+        return "lines", first_record, decode_failed
+    return "whole", first_record, decode_failed
 
-    # Match the previous adapter's recovery behavior for mixed/broken JSONL:
-    # malformed physical lines are skipped while valid object lines survive.
-    for line_number, raw_line in enumerate(raw.splitlines(), start=1):
+
+def _iter_line_range(
+    fh,
+    *,
+    start: int,
+    end: int | None,
+    first_line_number: int,
+    on_error,
+    stats: dict[str, int],
+) -> Iterator[dict]:
+    """Yield JSON object records from lines whose start offset is in [start, end).
+
+    Line numbers are assigned from ``first_line_number`` in physical order,
+    counting blank lines, exactly like the historical streaming reader.
+    """
+
+    fh.seek(start)
+    position = start
+    line_number = first_line_number - 1
+    for raw_line in fh:
+        line_start = position
+        position += len(raw_line)
+        if end is not None and line_start >= end:
+            break
+        line_number += 1
+        stats["lines"] += 1
         raw_line = raw_line.strip()
         if not raw_line:
             continue
@@ -494,6 +443,155 @@ def _iter_records(path: Path, on_error=None) -> Iterator[dict]:
                 )
             continue
         if isinstance(record, dict):
+            stats["records"] += 1
+            yield record
+        else:
+            _report_unsupported_type(on_error, f"line={line_number}", record)
+
+
+def plan_line_chunks(path: Path) -> list[ChunkSpec] | None:
+    """Split a large line-oriented JSON file into whole-line byte ranges."""
+
+    size = path.stat().st_size
+    if size < MIN_CHUNKED_FILE_BYTES:
+        return None
+    with path.open("rb") as fh:
+        first, _first_start, first_end = _first_nonempty_line(fh)
+        if not first:
+            return None
+        mode, _record, _failed = _head_mode(first, path.suffix.casefold())
+        if mode != "lines":
+            return None
+        bounds = [0]
+        target = max(first_end, CHUNK_BYTES)
+        while target < size:
+            fh.seek(target)
+            partial = fh.readline()
+            next_start = target + len(partial)
+            if next_start >= size:
+                break
+            bounds.append(next_start)
+            target = next_start + CHUNK_BYTES
+        bounds.append(size)
+    if len(bounds) < 3:
+        return None
+    return [
+        ChunkSpec(index=index, kind="lines", start=start, end=end, estimated_bytes=end - start)
+        for index, (start, end) in enumerate(pairwise(bounds))
+    ]
+
+
+def _iter_records(
+    path: Path,
+    on_error=None,
+    *,
+    stats: dict[str, int] | None = None,
+    chunk: ChunkSpec | None = None,
+) -> Iterator[dict]:
+    """Stream line-oriented JSON without materializing the entire source file.
+
+    Pretty-printed objects and top-level arrays still use the compatible
+    whole-document path. Normal JSONL/NDJSON, including a single compact object,
+    stays bounded to one physical line.  A ``lines`` chunk restricts the read to
+    one byte range; only the chunk that starts at offset 0 applies the file-head
+    rules, later chunks number their lines and records locally from 1.
+    """
+
+    stats = stats if stats is not None else {}
+    stats.setdefault("lines", 0)
+    stats.setdefault("records", 0)
+    end: int | None = None
+    if chunk is not None and chunk.kind == "lines":
+        end = chunk.end
+        if chunk.start > 0:
+            with path.open("rb") as fh:
+                yield from _iter_line_range(
+                    fh,
+                    start=chunk.start,
+                    end=end,
+                    first_line_number=1,
+                    on_error=on_error,
+                    stats=stats,
+                )
+            return
+
+    with path.open("rb") as fh:
+        first, _first_start, first_end = _first_nonempty_line(fh)
+        if not first:
+            return
+        mode, first_record, decode_failed = _head_mode(first, path.suffix.casefold())
+        if mode == "lines":
+            stats["lines"] += 1
+            if isinstance(first_record, dict):
+                stats["records"] += 1
+                yield first_record
+            elif on_error is not None:
+                if decode_failed:
+                    on_error(
+                        "line=1",
+                        "json_decode_error",
+                        "first line is not a valid JSON object",
+                    )
+                else:
+                    _report_unsupported_type(on_error, "line=1", first_record)
+            yield from _iter_line_range(
+                fh,
+                start=first_end,
+                end=end,
+                first_line_number=2,
+                on_error=on_error,
+                stats=stats,
+            )
+            return
+
+    # A top-level array or pretty-printed object cannot be decoded one line at
+    # a time. This compatibility path is deliberately the only unbounded case.
+    raw = path.read_bytes().strip()
+    if raw.startswith(_BOM):
+        raw = raw[3:]
+    if not raw:
+        return
+    decode_failed = False
+    try:
+        parsed = _loads_record(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        parsed = None
+        decode_failed = True
+    if isinstance(parsed, list):
+        for item_index, record in enumerate(parsed, start=1):
+            if isinstance(record, dict):
+                stats["records"] += 1
+                yield record
+            else:
+                _report_unsupported_type(on_error, f"item={item_index}", record)
+        return
+    if isinstance(parsed, dict):
+        stats["records"] += 1
+        yield parsed
+        return
+    if not decode_failed:
+        _report_unsupported_type(on_error, "$document", parsed)
+        return
+
+    # Match the previous adapter's recovery behavior for mixed/broken JSONL:
+    # malformed physical lines are skipped while valid object lines survive.
+    for line_number, raw_line in enumerate(raw.splitlines(), start=1):
+        stats["lines"] += 1
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
+        try:
+            record = _loads_record(raw_line)
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            if on_error is not None:
+                on_error(
+                    f"line={line_number}",
+                    "json_decode_error",
+                    f"{type(error).__name__}: {error}",
+                )
+            continue
+        if isinstance(record, dict):
+            stats["records"] += 1
             yield record
         else:
             _report_unsupported_type(on_error, f"line={line_number}", record)
@@ -501,13 +599,35 @@ def _iter_records(path: Path, on_error=None) -> Iterator[dict]:
 
 class JsonlAdapter(Adapter):
     name = "jsonl"
+    version = 2
     extensions = {".jsonl", ".ndjson", ".json"}
     default_domain = "other"
 
+    def __init__(self) -> None:
+        self._stats: dict[str, int] = {"lines": 0, "records": 0}
+
+    def plan_chunks(self, path: Path) -> list[ChunkSpec] | None:
+        return plan_line_chunks(path)
+
+    def chunk_stats(self) -> tuple[int, int]:
+        return (int(self._stats.get("records", 0)), int(self._stats.get("lines", 0)))
+
     def extract(self, path: Path) -> Iterator[Doc]:
+        yield from self._extract(path, None)
+
+    def extract_chunk(self, path: Path, chunk: ChunkSpec) -> Iterator[Doc]:
+        if chunk.kind == "whole":
+            yield from self._extract(path, None)
+            return
+        if chunk.kind != "lines":
+            raise ValueError(f"jsonl adapter cannot extract {chunk.kind} chunks")
+        yield from self._extract(path, chunk)
+
+    def _extract(self, path: Path, chunk: ChunkSpec | None) -> Iterator[Doc]:
         self._reset_issues()
+        self._stats = {"lines": 0, "records": 0}
         for record_index, rec in enumerate(
-            _iter_records(path, self._record_issue),
+            _iter_records(path, self._record_issue, stats=self._stats, chunk=chunk),
             start=1,
         ):
             messages = _record_messages(rec)

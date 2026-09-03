@@ -13,7 +13,7 @@ from yylab.train import data
 
 
 def _fake_corpus_streams(monkeypatch, documents: dict[str, list[dict]]) -> None:
-    monkeypatch.setattr(data, "corpus_shards", lambda corpus_id: [f"{corpus_id}.jsonl.zst"])
+    monkeypatch.setattr(data, "corpus_shards", lambda corpus_id, **_: [f"{corpus_id}.jsonl.zst"])
     monkeypatch.setattr(data, "corpus_dir", lambda corpus_id: Path(corpus_id))
 
     def iter_shards(directory: Path, _shards: list[str]):

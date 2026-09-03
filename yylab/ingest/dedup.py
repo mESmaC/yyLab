@@ -313,11 +313,44 @@ def _band_fingerprints(
     )
 
 
+def minhash_band_fingerprints(
+    text: str,
+    threshold: float = DEFAULT_THRESHOLD,
+) -> tuple[int, ...] | None:
+    """Return the band-qualified LSH fingerprints of ``text`` (or ``None``).
+
+    This is the process-independent half of MinHash deduplication: shingling,
+    the 128 permutations, and band hashing.  The decision itself only needs the
+    returned integers, so parallel workers can compute fingerprints while the
+    coordinator keeps the single ordered index.
+    """
+
+    hs = _shingle_hashes(text)
+    if hs is None or len(hs) == 0:
+        return None
+    return _band_fingerprints(_signature(hs), _band_ranges_for_threshold(float(threshold)))
+
+
+def encode_band_fingerprints(fingerprints: tuple[int, ...] | None) -> list[str] | None:
+    """Hex-encode fingerprints (they exceed 64 bits, so JSON needs strings)."""
+
+    if fingerprints is None:
+        return None
+    return [format(value, "x") for value in fingerprints]
+
+
+def decode_band_fingerprints(encoded: object) -> tuple[int, ...] | None:
+    if not isinstance(encoded, list) or not encoded:
+        return None
+    return tuple(int(str(value), 16) for value in encoded)
+
+
 class MinHashDedup:
     """Boolean MinHash LSH index with no per-document keys or candidate sets."""
 
     def __init__(self, threshold: float = DEFAULT_THRESHOLD) -> None:
-        self._band_ranges = _band_ranges_for_threshold(float(threshold))
+        self.threshold = float(threshold)
+        self._band_ranges = _band_ranges_for_threshold(self.threshold)
         self._seen_bands: set[int] = set()
         self._n = 0
 
@@ -343,16 +376,22 @@ class MinHashDedup:
             return None
         return _signature(hs)
 
-    def _is_duplicate_signature(self, signature: np.ndarray) -> bool:
-        fingerprints = _band_fingerprints(signature, self._band_ranges)
+    def fingerprints(self, text: str) -> tuple[int, ...] | None:
+        return minhash_band_fingerprints(text, self.threshold)
+
+    def is_duplicate_bands(self, fingerprints: tuple[int, ...] | None) -> bool:
+        """Check and index precomputed band fingerprints; first occurrence wins."""
+
+        if not fingerprints:
+            return False
         if any(fingerprint in self._seen_bands for fingerprint in fingerprints):
             return True
         self._seen_bands.update(fingerprints)
         self._n += 1
         return False
 
+    def _is_duplicate_signature(self, signature: np.ndarray) -> bool:
+        return self.is_duplicate_bands(_band_fingerprints(signature, self._band_ranges))
+
     def is_duplicate(self, text: str) -> bool:
-        signature = self._minhash(text)
-        if signature is None:
-            return False
-        return self._is_duplicate_signature(signature)
+        return self.is_duplicate_bands(self.fingerprints(text))

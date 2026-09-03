@@ -379,28 +379,87 @@ Legacy stage-2 prompt-router training uses the same guarded planner.
 
 ## Corpora intake pipeline
 
-1. Walk folder (skip hidden/`.git`/`node_modules`, size cap), dispatch each
-   file to the first adapter that claims it (by extension).
-2. Extract `Doc(text, source, domain)` → NFKC normalize + length/printable
-   filters.
-3. Exact dedup (canonical normalized sha256, per-run set + optional global
-   `doc_hashes` table). New records persist one canonical hash; lookups retain
-   compatibility with older two-hash corpora and rejection tables.
-4. Optional MinHash LSH near-dedup (threshold 0.8, word 5-grams). The default
-   lane keeps datasketch-compatible 9×13 band decisions as band-qualified
-   XXH3-128 fingerprints, avoiding per-document keys and candidate sets.
-5. Domain: adapter hint if trusted (code/web/math/science), else content
-   heuristics.
-6. Stream to zstd JSONL shards (20k docs each). JSONL is parsed one physical
-   record at a time; Parquet reads projected columns in bounded record batches.
-7. Count accepted documents inline with each enabled tokenizer, per domain +
-   totals → `stats.json` (no decompression/reread pass over new shards).
+1. Walk folder (skip hidden/`.git`/`node_modules`), dispatch each file to the
+   first adapter that claims it (by signature, then extension). Size limits and
+   the CDAS asset-selection profile are catalog decisions, never silent skips.
+2. **Prepare** (order-independent, `ingest/prepare.py`): extract
+   `Doc(text, meta, locator)`, NFC normalize, classify domain, build CDAS
+   evidence (`analyze_document`), dedup fingerprints, language, quality score,
+   and MinHash band fingerprints. This stage runs in spawned worker processes
+   (`ingest/parallel.py`, `ProcessPoolExecutor`; never fork, never the UI or
+   `yylab.db`). Large JSONL files are split into whole-line byte ranges and
+   Parquet files into row-group or sub-row-group row ranges
+   (`Adapter.plan_chunks`/`extract_chunk`), so a handful of big files keeps
+   every worker busy. Single-file assets are hashed by the worker that reads
+   them.
+3. **Decide** (one coordinator thread, strict file/chunk order,
+   `ingest/pipeline.py`): hygiene filter, language/quality quarantine, exact
+   local dedup per split (split-leakage evidence), the MinHash LSH decision
+   from precomputed bands, batched global `doc_hashes`/`rejected_hashes`
+   checks, shard writing, CDAS catalog rows, and stats. Chunk-local
+   `record=`/`row=`/`line=` locators are rebased from the preceding chunks'
+   record/line counts, so shards, `stats.json`, and `inventory.sqlite3` are
+   identical to a single-worker run (`tests/test_ingest_parallel.py` asserts
+   this byte for byte). Results are consumed in submission order through a
+   window bounded by finished-but-unconsumed bytes, so a slow chunk never
+   idles the pool and memory stays bounded.
+4. Count accepted documents inline with each enabled tokenizer, per domain and
+   split → `stats.json` (no reread of new shards).
+
+Worker count: `IngestConfig.workers`, else `YYLAB_INGEST_WORKERS`, else the
+`ingest_workers` setting (0 = auto = `min(cpu_count - 2, 8)`). One worker runs
+the same code in-process. Exactly one ingest or re-import runs per process
+(`ingest_in_progress()`); the global-dedup check-then-register sequence relies
+on it.
 
 The corpus-library **Fast ingest** action assumes a published dataset is already
-curated and runs steps 1–3 plus domain tagging/sharding, with tokenizer stats
-disabled. Language, quality, and MinHash cleaning remain explicit controls in
-the full ingest dialog; the dialog warns that MinHash is a full-corpus CPU/RAM
-pass. Parquet metadata supplies row-level progress inside large files.
+curated and runs discovery, extraction, exact dedup, domain tagging, and
+sharding, with tokenizer stats disabled. Language, quality, and MinHash
+cleaning remain explicit controls in the ingest dialog and can be applied later
+with **Re-import**.
+
+### Prepared-document cache and re-import
+
+`corpora/<id>/prepared.sqlite3` keeps every prepared document of every
+extracted asset: worker-serialized zstd JSONL chunk payloads (chunk-local
+locators, catalog JSON columns as written, per-chunk record/line counts and
+issues) plus per-tokenizer document token counts. Entries are keyed by the
+asset's content hash, adapter name/version, and the analysis key
+(normalization/signal/identity versions plus domain override), stored per
+asset so a run that changes the key only replaces what it re-extracts. An
+asset row is written only after all of its chunks were prepared without
+error, so partial extractions never replay, and a completed walk prunes
+assets that vanished from the source. Workers never import `yylab.db`
+(`yylab/ingest/__init__.py` re-exports lazily).
+
+`reimport_corpus(progress, cid, cfg)` re-runs discovery and the decide stage
+for the corpus's recorded source folder with new policies (selection profile,
+path regexes, size limit, language/quality/MinHash, `min_chars`, tokenizers).
+Unchanged assets replay from the cache; new, changed, previously excluded, or
+newly supported files are extracted in parallel and cached. MinHash bands
+missing from cached documents are computed by the pool and written back. The
+Re-import dialog is prefilled from `stats.json["ingest_config"]`.
+
+Re-import keeps the corpus id (reviews, verdicts, and training references
+survive) and leaves the corpus `ready` for the whole run; a `reimport` marker
+in `stats_json` shows it is in flight. The complete new output goes to
+`corpora/<id>/gen-<n>/` and is published by atomically replacing
+`current.json` (`artifacts.publish_corpus_generation`); the root `stats.json`
+is replaced at the same time. Readers (`train/data.py`, `review.py`, the
+corpora page) resolve the generation once per stream and list shards from
+that directory, so a training run that started on the old shards finishes on
+them. Retired outputs are deleted only when a directory rename proves nothing
+holds them open: right after publishing on Windows (where an open file makes
+the rename fail), and otherwise at app start and before the next re-import.
+Kept hashes are staged in a run-local SQLite file; after the generation is
+published they are swapped into `doc_hashes` in one transaction
+(`db.replace_corpus_hashes`) and the staged file is removed. If the swap
+fails or the app dies in between, the staged file stays beside the live
+generation and `startup_housekeeping()` (also run before the next re-import)
+completes the commit; a re-import that fails before publishing leaves the
+corpus, its hashes, and its cache untouched. Start-up housekeeping also marks
+corpora left in `processing` by a dead app as `failed`, which keeps them
+re-importable.
 
 ### Adding a filetype adapter
 

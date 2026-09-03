@@ -13,5 +13,5 @@ def main() -> None:
     start(port=args.port, show=not args.no_browser)
 
 
-if __name__ in {"__main__", "__mp_main__"}:
+if __name__ == "__main__":
     main()

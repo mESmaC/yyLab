@@ -1,16 +1,19 @@
 from __future__ import annotations
 
+import os
 import shutil
 
 import orjson
 from nicegui import ui
 
 from ... import db
-from ...artifacts import corpus_dir, fmt_bytes
+from ...artifacts import corpus_bucket_dir, corpus_dir, fmt_bytes, read_corpus_layout
 from ...config import get_settings, update_settings
+from ...ingest.cache import cache_size_bytes, clear_cache
 from ...ingest.domains import DOMAINS
 from ...ingest.library import ingested_by_source, scan_dataset_folders
-from ...ingest.pipeline import IngestConfig, _iter_shards, run_ingest
+from ...ingest.parallel import auto_worker_count, resolve_worker_count
+from ...ingest.pipeline import IngestConfig, _iter_shards, ingest_in_progress, reimport_corpus, run_ingest
 from ...ingest.tokenize_stats import SPEC_KEYS, SPEC_LABELS
 from ...jobs import JOBS
 from ..components import dir_browser, empty_state, hint, status_badge
@@ -26,6 +29,25 @@ def _domain_tokens(stats: dict, tok: str) -> dict[str, int]:
     for dom, d in stats.get("domains", {}).items():
         out[dom] = d.get("tokens", {}).get(tok, 0) or d.get("chars", 0)
     return out
+
+
+def _same_source(left: str, right: str) -> bool:
+    try:
+        return os.path.normcase(os.path.normpath(left)) == os.path.normcase(os.path.normpath(right))
+    except (TypeError, ValueError):
+        return False
+
+
+def ingested_corpus_for_source(source: str) -> dict | None:
+    """Return the ingested corpus that already covers ``source``, if any."""
+
+    for row in db.q(
+        "SELECT id, name, status, source_path, stats_json FROM corpora "
+        "WHERE COALESCE(kind,'ingested')='ingested' AND source_path != ''"
+    ):
+        if _same_source(str(row["source_path"]), source):
+            return row
+    return None
 
 
 def curated_library_ingest_config(*, path: str, name: str) -> IngestConfig:
@@ -71,8 +93,11 @@ def corpora_page():
         table_container = ui.column().classes("w-full")
         detail_container = ui.column().classes("w-full gap-4")
 
+        def busy() -> bool:
+            return bool(state["job"]) or ingest_in_progress()
+
         def start_library_ingest(path: str, name: str) -> None:
-            if state["job"]:
+            if busy():
                 ui.notify("An ingest job is already running", type="warning")
                 return
             cfg = curated_library_ingest_config(path=path, name=name)
@@ -110,12 +135,13 @@ def corpora_page():
                 ui.label(f"{len(folders)} dataset folders").classes("text-xs text-gray-500 mt-1")
                 hint(
                     "Fast ingest preserves dataset records, inventories provenance, and excludes obvious "
-                    "dataset sidecars (README/license/config/CSS/SVG/XML). Use Ingest folder to change "
-                    "the asset policy or enable language, quality, and MinHash cleaning."
+                    "dataset sidecars (README/license/config/CSS/SVG/XML). Use Re-import on an ingested "
+                    "folder to change the asset policy or enable language, quality, and MinHash cleaning "
+                    "without extracting unchanged files again."
                 )
                 for f in folders:
                     ing = known.get(f.path)
-                    busy = state["job"] is not None
+                    is_busy = busy()
                     with ui.row().classes("w-full items-center gap-3 py-1 border-b border-gray-800"):
                         ui.label(f.name).classes("text-sm text-gray-200 flex-1 truncate")
                         ui.label(f"{f.files} files · {fmt_bytes(f.size_bytes)}").classes(
@@ -123,14 +149,16 @@ def corpora_page():
                         )
                         if ing:
                             status_badge(ing["status"])
-                        elif busy:
-                            ui.button("Fast ingest", on_click=lambda p=f.path, n=f.name: start_library_ingest(p, n)).props(
-                                "dense no-caps outline"
-                            ).classes("w-28").set_enabled(False)
+                            ui.button(
+                                "Re-import",
+                                on_click=lambda cid=ing["id"]: open_reimport(cid),
+                            ).props("dense no-caps outline").classes("w-28").set_enabled(
+                                not is_busy and ing["status"] in {"ready", "failed"}
+                            )
                         else:
                             ui.button("Fast ingest", on_click=lambda p=f.path, n=f.name: start_library_ingest(p, n)).props(
                                 "dense no-caps outline"
-                            ).classes("w-28")
+                            ).classes("w-28").set_enabled(not is_busy)
 
         def corpus_rows() -> list[dict]:
             rows = []
@@ -167,7 +195,7 @@ def corpora_page():
                         "Point yyLab at a folder of text, code, or JSONL data. It will deduplicate, tag domains, "
                         "and count tokens across several tokenizer families.",
                         "Ingest folder",
-                        ingest_dlg.open,
+                        lambda: open_ingest(),
                     )
                     table_holder["t"] = None
                     return
@@ -236,6 +264,14 @@ def corpora_page():
                         ui.link("Review", f"/review?cid={cid}").props("no-caps dense outline").classes(
                             "no-underline text-gray-300"
                         )
+                        if (c.get("kind") or "ingested") == "ingested" and c["source_path"]:
+                            ui.button(
+                                "Re-import",
+                                icon="replay",
+                                on_click=lambda cid=cid: open_reimport(cid),
+                            ).props("dense no-caps outline").set_enabled(
+                                c["status"] in {"ready", "failed"} and not busy()
+                            )
                         ui.button(
                             "Delete",
                             icon="delete",
@@ -244,6 +280,57 @@ def corpora_page():
                 ui.label(f'source: {c["source_path"]}').classes("text-xs text-gray-500")
                 if c["error"]:
                     ui.label(c["error"]).classes("text-xs text-red-400")
+                reimport_marker = stats.get("reimport") if isinstance(stats.get("reimport"), dict) else None
+                if reimport_marker:
+                    ui.label(
+                        f"Re-import running since {reimport_marker.get('started_at', '?')} · the current "
+                        "shards stay usable until the new generation is published."
+                    ).classes("text-xs text-amber-400")
+                if stats.get("pending_hash_commit"):
+                    ui.label(
+                        "The last re-import was published but its global-dedup hashes were not "
+                        "committed; the next re-import or app start completes it."
+                    ).classes("text-xs text-amber-400")
+                timing = stats.get("timing") or {}
+                layout = read_corpus_layout(corpus_dir(cid))
+                cache = stats.get("prepared_cache") or {}
+                cache_bytes = cache_size_bytes(corpus_dir(cid))
+                details = []
+                if timing.get("seconds"):
+                    workers = int(timing.get("workers") or 1)
+                    details.append(
+                        f"last run {timing['seconds']:,.0f}s · {timing.get('docs_per_second', 0):,.0f} docs/s "
+                        f"· {workers} worker{'s' if workers != 1 else ''}"
+                    )
+                if layout["generation"]:
+                    details.append(f"generation {layout['generation']}")
+                    if layout["retired"]:
+                        details.append(f"{len(layout['retired'])} retired output(s) pending cleanup")
+                if cache.get("enabled"):
+                    reused = int(cache.get("assets_reused") or 0)
+                    stored = int(cache.get("assets_stored") or 0)
+                    details.append(
+                        f"prepared cache {fmt_bytes(cache_bytes)} · {int(cache.get('assets') or 0):,} assets"
+                        + (f" · reused {reused:,}, extracted {stored:,}" if reused or stored else "")
+                    )
+                elif cache_bytes:
+                    details.append(f"prepared cache {fmt_bytes(cache_bytes)} (disabled for the last run)")
+                if details:
+                    with ui.row().classes("w-full items-center gap-3"):
+                        ui.label(" · ".join(details)).classes("text-xs text-gray-500")
+                        if cache_bytes:
+
+                            def do_clear_cache(cid=cid) -> None:
+                                if busy():
+                                    ui.notify("Wait for the running ingest to finish", type="warning")
+                                    return
+                                clear_cache(corpus_dir(cid))
+                                ui.notify("Prepared-document cache cleared", type="info")
+                                render_detail()
+
+                            ui.button("Clear cache", icon="cleaning_services", on_click=do_clear_cache).props(
+                                "flat dense no-caps"
+                            )
 
                 with ui.row().classes("w-full gap-3 flex-wrap mt-2"):
                     stat_card("Documents", f'{stats.get("docs_written", 0):,}')
@@ -344,7 +431,7 @@ def corpora_page():
                 sample = []
                 shards = stats.get("shards", [])
                 if shards:
-                    for line in _iter_shards(corpus_dir(cid) / "data", shards[:1]):
+                    for line in _iter_shards(corpus_bucket_dir(cid, "data"), shards[:1]):
                         sample.append(line)
                         if len(sample) >= 3:
                             break
@@ -357,6 +444,9 @@ def corpora_page():
                             ui.label(line["text"][:800]).classes("whitespace-pre-wrap text-gray-300 font-mono text-xs")
 
         def delete_corpus(cid: str) -> None:
+            if busy():
+                ui.notify("Wait for the running ingest to finish before deleting", type="warning")
+                return
             db.execute("DELETE FROM doc_hashes WHERE corpus_id=?", (cid,))
             db.execute("DELETE FROM corpora WHERE id=?", (cid,))
             shutil.rmtree(corpus_dir(cid), ignore_errors=True)
@@ -379,7 +469,7 @@ def corpora_page():
             if job.status == "done":
                 state["job"] = None
                 progress_row.visible = False
-                ui.notify("Corpus processed", type="positive")
+                ui.notify("Corpus re-imported" if job.kind == "reimport" else "Corpus processed", type="positive")
                 refresh_table()
                 render_library()
                 if isinstance(job.result, str):
@@ -387,9 +477,12 @@ def corpora_page():
             elif job.status == "error":
                 state["job"] = None
                 progress_row.visible = False
-                ui.notify(f"Ingest failed: {job.error.splitlines()[0]}", type="negative", multi_line=True)
+                verb = "Re-import" if job.kind == "reimport" else "Ingest"
+                ui.notify(f"{verb} failed: {job.error.splitlines()[0]}", type="negative", multi_line=True)
                 refresh_table()
                 render_library()
+                if job.kind == "reimport":
+                    render_detail()
 
         tok_select.on_value_change(lambda e: (state.update(tok=e.value), refresh_table(), render_detail()))
         ui.timer(1.0, poll_job)
@@ -415,13 +508,16 @@ def corpora_page():
             del_msg.text = f'"{name}" and its shards + dedup hashes will be removed permanently.'
             del_dlg.open()
 
+        dialog_state: dict = {"mode": "ingest", "cid": None}
         with ui.dialog() as ingest_dlg, ui.card().classes("w-[560px]").style("background: #16161d; border: 1px solid #262633"):
-            ui.label("Ingest corpora folder").classes("text-base font-semibold")
+            dlg_title = ui.label("Ingest corpora folder").classes("text-base font-semibold")
+            reimport_hint = ui.label("").classes("text-xs text-teal-300")
+            reimport_hint.visible = False
             name_in = ui.input("Corpus name").props("dense outlined").classes("w-full")
             with ui.row().classes("w-full items-end gap-2"):
                 src_in = ui.input("Source folder", placeholder="D:\\data\\corpora").props("dense outlined").classes("flex-1")
                 browser = dir_browser("Select corpora folder", lambda p: src_in.set_value(p))
-                ui.button(icon="folder", on_click=browser.open).props("dense outline")
+                src_btn = ui.button(icon="folder", on_click=browser.open).props("dense outline")
             dom_sel = ui.select(
                 ["auto"] + DOMAINS, value="auto", label="Domain override"
             ).props("dense outlined").classes("w-full")
@@ -469,19 +565,29 @@ def corpora_page():
             tok_multi = ui.select(
                 SPEC_LABELS, multiple=True, value=list(SPEC_KEYS), label="Tokenizers for stats"
             ).props("dense outlined use-chips").classes("w-full")
+            with ui.row().classes("w-full items-center gap-4"):
+                workers_in = ui.number(
+                    "Parallel workers (0 = auto)",
+                    value=0,
+                    min=0,
+                    max=64,
+                    step=1,
+                ).props("dense outlined").classes("w-56")
+                cache_chk = ui.checkbox("Keep prepared-document cache for quick re-import", value=True)
+            hint(
+                f"Auto uses {resolve_worker_count(None, get_settings().get('ingest_workers'))} worker "
+                f"processes (machine default {auto_worker_count()}; change it under Settings). Large JSONL "
+                "and Parquet files are split across workers; results are merged in file order, so output "
+                "is identical to a single-worker run. The cache stores every extracted document so a "
+                "later re-import with different policies skips unchanged files."
+            )
             with ui.row().classes("w-full justify-end gap-2 mt-2"):
                 ui.button("Cancel", on_click=ingest_dlg.close).props("flat dense no-caps")
 
-                def begin() -> None:
-                    src = (src_in.value or "").strip()
-                    if not src:
-                        ui.notify("Choose a source folder", type="warning")
-                        return
-                    if state["job"]:
-                        ui.notify("An ingest job is already running", type="warning")
-                        return
-                    cfg = IngestConfig(
-                        name=(name_in.value or "").strip() or src.rstrip("\\/").split("\\")[-1].split("/")[-1],
+                def dialog_config(name: str, src: str) -> IngestConfig:
+                    workers = int(workers_in.value or 0)
+                    return IngestConfig(
+                        name=name,
                         source_dir=src,
                         domain_override=None if dom_sel.value == "auto" else dom_sel.value,
                         near_dedup=nd_chk.value,
@@ -493,14 +599,121 @@ def corpora_page():
                         include_path_regex=(include_path_in.value or "").strip(),
                         exclude_path_regex=(exclude_path_in.value or "").strip(),
                         max_file_mb=float(max_file_mb_in.value or 0),
+                        workers=workers or None,
+                        prepared_cache=bool(cache_chk.value),
+                    )
+
+                def begin() -> None:
+                    src = (src_in.value or "").strip()
+                    if not src:
+                        ui.notify("Choose a source folder", type="warning")
+                        return
+                    if busy():
+                        ui.notify("An ingest job is already running", type="warning")
+                        return
+                    if dialog_state["mode"] == "reimport":
+                        cid = dialog_state["cid"]
+                        cfg = dialog_config(name=(name_in.value or "").strip() or "corpus", src=src)
+                        state["job"] = JOBS.submit("reimport", reimport_corpus, cid, cfg)
+                        progress_row.visible = True
+                        plabel.text = "queued · re-import"
+                        ingest_dlg.close()
+                        render_detail()
+                        return
+                    existing = ingested_corpus_for_source(src)
+                    if existing is not None and existing["status"] not in {"ready", "failed"}:
+                        ui.notify(
+                            f'"{existing["name"]}" already covers this folder but is still marked '
+                            f'{existing["status"]}; delete it or restart the app to clear the stale state.',
+                            type="warning",
+                            multi_line=True,
+                        )
+                        return
+                    if existing is not None:
+                        ui.notify(
+                            f'"{existing["name"]}" already covers this folder; a second corpus would only '
+                            "contain global duplicates. Re-importing it instead.",
+                            type="warning",
+                            multi_line=True,
+                        )
+                        open_reimport(existing["id"])
+                        return
+                    cfg = dialog_config(
+                        name=(name_in.value or "").strip() or src.rstrip("\\/").split("\\")[-1].split("/")[-1],
+                        src=src,
                     )
                     state["job"] = JOBS.submit("ingest", run_ingest, cfg)
                     progress_row.visible = True
                     ingest_dlg.close()
 
-                ui.button("Process", on_click=begin).props("dense no-caps")
+                process_btn = ui.button("Process", on_click=begin).props("dense no-caps")
 
-        ingest_btn.on_click(ingest_dlg.open)
+        def set_dialog_mode(mode: str) -> None:
+            dialog_state["mode"] = mode
+            reimporting = mode == "reimport"
+            dlg_title.text = "Re-import corpus" if reimporting else "Ingest corpora folder"
+            process_btn.text = "Re-import" if reimporting else "Process"
+            reimport_hint.visible = reimporting
+            name_in.set_enabled(not reimporting)
+            src_in.set_enabled(not reimporting)
+            src_btn.set_enabled(not reimporting)
+
+        def open_ingest() -> None:
+            set_dialog_mode("ingest")
+            dialog_state["cid"] = None
+            ingest_dlg.open()
+
+        def open_reimport(cid: str) -> None:
+            c = db.q1("SELECT * FROM corpora WHERE id=?", (cid,))
+            if not c:
+                ui.notify("Corpus not found", type="warning")
+                return
+            if busy():
+                ui.notify("An ingest job is already running", type="warning")
+                return
+            stats = _stats(c)
+            stored = stats.get("ingest_config") or {}
+            cfg = IngestConfig.from_ingest_config(
+                name=c["name"], source_dir=c["source_path"], ingest_config=stored
+            )
+            dialog_state["cid"] = cid
+            set_dialog_mode("reimport")
+            name_in.value = cfg.name
+            src_in.value = cfg.source_dir
+            dom_sel.value = cfg.domain_override or "auto"
+            nd_chk.value = bool(cfg.near_dedup)
+            gd_chk.value = bool(cfg.global_dedup)
+            lang_chk.value = bool(cfg.language_filter)
+            qual_chk.value = bool(cfg.quality_filter)
+            profile_select.value = cfg.selection_profile
+            include_path_in.value = cfg.include_path_regex
+            exclude_path_in.value = cfg.exclude_path_regex
+            max_file_mb_in.value = cfg.max_file_mb
+            tok_multi.value = list(cfg.tokenizer_keys)
+            cache_chk.value = bool(cfg.prepared_cache)
+            workers_in.value = 0
+            cache = stats.get("prepared_cache") or {}
+            cache_bytes = cache_size_bytes(corpus_dir(cid))
+            if cache.get("enabled") and cache_bytes:
+                cache_text = (
+                    f"{int(cache.get('assets') or 0):,} extracted files are cached ({fmt_bytes(cache_bytes)}); "
+                    "unchanged files are not extracted again."
+                )
+            else:
+                cache_text = "No prepared-document cache exists yet; every file is extracted once more."
+            warning = ""
+            if "domain_override" not in stored:
+                warning = (
+                    " The domain override was not recorded when this corpus was created; "
+                    f"domains seen: {', '.join(sorted(stats.get('domains') or {})) or 'none'}. Verify the override."
+                )
+            reimport_hint.text = (
+                "Settings are prefilled from the original ingest. The corpus keeps its id, reviews, and "
+                "verdict; the current shards stay usable until the new output is published. " + cache_text + warning
+            )
+            ingest_dlg.open()
+
+        ingest_btn.on_click(open_ingest)
 
         render_library()
         refresh_table()

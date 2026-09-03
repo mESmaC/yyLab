@@ -104,6 +104,13 @@ def digest_text(text: str) -> str:
     return sha256(text.encode("utf-8")).hexdigest()
 
 
+def source_digest(source_text: str) -> tuple[str, int]:
+    """Return ``(normalized_sha256, utf8_bytes)`` of the minimally normalized source."""
+
+    encoded = normalize_source_text(source_text).encode("utf-8")
+    return sha256(encoded).hexdigest(), len(encoded)
+
+
 def stable_identity(kind: str, *parts: str) -> str:
     """Return the same versioned, length-delimited identity contract as CDAS."""
 
@@ -501,13 +508,15 @@ class CorpusCatalog:
         self.compatibility_fold_would_change_docs = 0
         self.closed = False
 
-    def observe_asset(
+    def describe_asset(
         self,
         path: Path,
         *,
         adapter_name: str = "",
         hash_contents: bool = True,
     ) -> AssetObservation:
+        """Build an asset observation without touching the catalog database."""
+
         resolved = path.resolve()
         try:
             logical = resolved.relative_to(self.source_root).as_posix()
@@ -516,7 +525,7 @@ class CorpusCatalog:
         stat = resolved.stat()
         format_name = adapter_name or resolved.suffix.casefold().lstrip(".") or "unknown"
         media_type = mimetypes.guess_type(resolved.name)[0] or "application/octet-stream"
-        observation = AssetObservation(
+        return AssetObservation(
             asset_id=stable_identity("asset", self.source_id, logical),
             source_id=self.source_id,
             logical_path=logical,
@@ -527,6 +536,9 @@ class CorpusCatalog:
             media_type=media_type,
             adapter_name=adapter_name,
         )
+
+    def record_asset(self, observation: AssetObservation) -> AssetObservation:
+        adapter_name = observation.adapter_name
         self.connection.execute(
             """INSERT OR REPLACE INTO assets(
               asset_id,schema_version,source_id,logical_path,raw_sha256,byte_size,
@@ -549,6 +561,17 @@ class CorpusCatalog:
         )
         return observation
 
+    def observe_asset(
+        self,
+        path: Path,
+        *,
+        adapter_name: str = "",
+        hash_contents: bool = True,
+    ) -> AssetObservation:
+        return self.record_asset(
+            self.describe_asset(path, adapter_name=adapter_name, hash_contents=hash_contents)
+        )
+
     def record_issue(self, asset_id: str | None, locator: str, reason_code: str, detail: str) -> None:
         self.connection.execute(
             "INSERT INTO issues(asset_id,locator,reason_code,detail) VALUES(?,?,?,?)",
@@ -560,7 +583,6 @@ class CorpusCatalog:
         *,
         asset: AssetObservation,
         locator: str,
-        source_text: str,
         training_text: str | None,
         domain: str,
         language: str,
@@ -569,8 +591,35 @@ class CorpusCatalog:
         roles: list[str],
         signals: dict[str, Any],
         metadata: dict[str, Any],
+        source_text: str | None = None,
+        source_sha256: str | None = None,
+        source_utf8_bytes: int | None = None,
+        training_sha256: str | None = None,
+        signals_json: str | None = None,
+        roles_json: str | None = None,
+        metadata_json: str | None = None,
     ) -> None:
-        source_normalized = normalize_source_text(source_text)
+        """Record one selection decision.
+
+        Callers may pass digests and JSON columns precomputed elsewhere (a
+        worker process) instead of ``source_text``/``metadata``; the stored
+        values are identical either way.
+        """
+
+        if source_sha256 is None or source_utf8_bytes is None:
+            if source_text is None:
+                raise ValueError("record_document needs source_text or its precomputed digest")
+            source_sha256, source_utf8_bytes = source_digest(source_text)
+        if training_sha256 is None:
+            training_sha256 = digest_text(training_text) if training_text is not None else ""
+        if signals_json is None:
+            signals_json = json.dumps(signals, ensure_ascii=False, separators=(",", ":"))
+        if roles_json is None:
+            roles_json = json.dumps(roles, ensure_ascii=False, separators=(",", ":"))
+        if metadata_json is None:
+            metadata_json = json.dumps(
+                compact_metadata(metadata), ensure_ascii=False, separators=(",", ":")
+            )
         document_id = stable_identity("doc", asset.asset_id, locator)
         transformations = {
             "source_normalization_version": SOURCE_NORMALIZATION_VERSION,
@@ -584,16 +633,16 @@ class CorpusCatalog:
                 asset.source_id,
                 asset.asset_id,
                 locator,
-                digest_text(source_normalized),
-                digest_text(training_text) if training_text is not None else "",
-                len(source_normalized.encode("utf-8")),
+                source_sha256,
+                training_sha256,
+                int(source_utf8_bytes),
                 domain,
                 language,
                 selection,
                 json.dumps(sorted(set(reasons)), ensure_ascii=False, separators=(",", ":")),
-                json.dumps(roles, ensure_ascii=False, separators=(",", ":")),
-                json.dumps(signals, ensure_ascii=False, separators=(",", ":")),
-                json.dumps(compact_metadata(metadata), ensure_ascii=False, separators=(",", ":")),
+                roles_json,
+                signals_json,
+                metadata_json,
                 json.dumps(transformations, ensure_ascii=False, separators=(",", ":")),
             )
         )

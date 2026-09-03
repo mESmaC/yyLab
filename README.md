@@ -28,7 +28,15 @@ Artifacts live in `./artifacts` (override with `YYLAB_HOME`).
   corpora: canonical global dedup only, with MinHash/language/quality cleaning
   reserved for the explicit ingest dialog. When enabled, MinHash retains the
   same 9×13 band decision in a compact fingerprint index rather than keeping
-  document keys and candidate sets for every row.
+  document keys and candidate sets for every row. Extraction and analysis run
+  across parallel worker processes (large JSONL and Parquet files are split
+  into chunks) while one coordinator decides in file order, so the output is
+  identical to a single-worker run; the worker count is per run or a setting.
+  Every extracted document is kept in a per-corpus prepared cache so
+  **Re-import** applies changed policies (accepted file types, selection
+  profile, language/quality/MinHash cleaning, tokenizers) to an existing corpus
+  without extracting unchanged files again; the corpus keeps its id and stays
+  usable until the new output is published.
 - **Human-trained corpus ranker** — every review swipe is committed immediately
   with its text, provenance, queue component, and model score. A standardized
   logistic Stage-1 model trains from the unique human labels and reports strict

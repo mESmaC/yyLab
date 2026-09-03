@@ -54,6 +54,8 @@ DEFAULT_SETTINGS: dict = {
     "default_quant": "nf4",
     "datasets_root": "",
     "tokenizers_enabled": {},
+    # Parallel ingest worker processes; 0 picks a count from the CPU count.
+    "ingest_workers": 0,
     "engine": {
         "attn_implementation": "sdpa",
         "cache_implementation": "dynamic",

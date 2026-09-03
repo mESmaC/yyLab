@@ -4,13 +4,14 @@ import heapq
 import math
 import random
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 import orjson
 import zstandard as zstd
 
 from . import db
-from .artifacts import corpus_dir, write_json
+from .artifacts import corpus_dir, corpus_generation_dir, write_json
 from .config import PATHS
 from .ingest.dedup import sha256_hex, training_hash_key
 from .ingest.pipeline import _iter_shards
@@ -29,21 +30,26 @@ _ACTIVE_CANDIDATE_MULTIPLIER = 20
 _ACTIVE_MAX_CANDIDATES = 4_096
 
 
-def _buckets(cid: str, include_quarantine: bool) -> list[tuple[str, str, list[str]]]:
-    cdir = corpus_dir(cid)
-    stats_path = cdir / "stats.json"
-    stats = {}
-    if stats_path.exists():
-        stats = orjson.loads(stats_path.read_bytes())
-    out: list[tuple[str, str, list[str]]] = [("data", "data", stats.get("shards") or [])]
+def _buckets(cid: str, include_quarantine: bool) -> list[tuple[str, Path, list[str]]]:
+    """Resolve the live generation once so a queue never mixes generations."""
+
+    generation_dir = corpus_generation_dir(cid)
+
+    def names(directory: Path) -> list[str]:
+        if not directory.is_dir():
+            return []
+        return sorted(path.name for path in directory.glob("shard-*.jsonl.zst"))
+
+    out: list[tuple[str, Path, list[str]]] = [("data", generation_dir / "data", names(generation_dir / "data"))]
     if include_quarantine:
-        out.append(("quarantine", "data_quarantine", stats.get("quarantine_shards") or []))
+        quarantine_dir = generation_dir / "data_quarantine"
+        out.append(("quarantine", quarantine_dir, names(quarantine_dir)))
     return [(bucket, data_dir, shards) for bucket, data_dir, shards in out if shards]
 
 
 def _iter_review_docs(cid: str, include_quarantine: bool, reviewed: set[str]):
     for bucket, data_dir, shards in _buckets(cid, include_quarantine):
-        for line in _iter_shards(corpus_dir(cid) / data_dir, shards):
+        for line in _iter_shards(data_dir, shards):
             text = line.get("text", "")
             if not text:
                 continue

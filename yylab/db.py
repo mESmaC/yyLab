@@ -269,6 +269,37 @@ def transaction() -> Iterator[sqlite3.Connection]:
             con.close()
 
 
+def replace_corpus_hashes(corpus_id: str, staged_path) -> int:
+    """Atomically make ``corpus_id`` own exactly the hashes staged in ``staged_path``.
+
+    ``staged_path`` is a SQLite file with a single ``hashes(hash)`` table
+    produced by a re-import.  Hashes already owned by another corpus stay with
+    that corpus (``INSERT OR IGNORE``), matching the ordinary ingest rule that
+    the first corpus to register a hash keeps it.
+    """
+
+    with _lock:
+        con = sqlite3.connect(PATHS.db_file, timeout=30)
+        try:
+            con.execute("PRAGMA journal_mode=WAL")
+            con.execute("ATTACH DATABASE ? AS staged", (str(staged_path),))
+            con.execute("BEGIN IMMEDIATE")
+            con.execute("DELETE FROM doc_hashes WHERE corpus_id=?", (corpus_id,))
+            cur = con.execute(
+                "INSERT OR IGNORE INTO doc_hashes(hash, corpus_id) SELECT hash, ? FROM staged.hashes",
+                (corpus_id,),
+            )
+            inserted = int(cur.rowcount)
+            con.commit()
+            con.execute("DETACH DATABASE staged")
+            return inserted
+        except BaseException:
+            con.rollback()
+            raise
+        finally:
+            con.close()
+
+
 def new_id(prefix: str) -> str:
     return f"{prefix}_{dt.datetime.now():%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:6]}"
 

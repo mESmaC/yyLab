@@ -280,7 +280,7 @@ def test_training_stream_deduplicates_derived_and_source_corpora(monkeypatch):
             {"text": "A unique approved record.", "domain": "language", "origin": "approved-unique"},
         ],
     }
-    monkeypatch.setattr(data, "corpus_shards", lambda corpus_id: [f"{corpus_id}.jsonl.zst"])
+    monkeypatch.setattr(data, "corpus_shards", lambda corpus_id, **_: [f"{corpus_id}.jsonl.zst"])
     monkeypatch.setattr(data, "corpus_dir", lambda corpus_id: Path(corpus_id))
     monkeypatch.setattr(
         data,
@@ -303,7 +303,7 @@ def test_training_stream_does_not_casefold_code_for_hard_dedup(monkeypatch):
         "first": [{"text": "US = 1", "domain": "code"}],
         "second": [{"text": "us = 1", "domain": "code"}],
     }
-    monkeypatch.setattr(data, "corpus_shards", lambda corpus_id: [f"{corpus_id}.jsonl.zst"])
+    monkeypatch.setattr(data, "corpus_shards", lambda corpus_id, **_: [f"{corpus_id}.jsonl.zst"])
     monkeypatch.setattr(data, "corpus_dir", lambda corpus_id: Path(corpus_id))
     monkeypatch.setattr(
         data,
@@ -332,7 +332,7 @@ def test_token_balanced_mixing_accounts_for_document_size_and_honors_cap(monkeyp
             for index in range(10)
         ],
     }
-    monkeypatch.setattr(data, "corpus_shards", lambda corpus_id: [f"{corpus_id}.jsonl.zst"])
+    monkeypatch.setattr(data, "corpus_shards", lambda corpus_id, **_: [f"{corpus_id}.jsonl.zst"])
     monkeypatch.setattr(data, "corpus_dir", lambda corpus_id: Path(corpus_id))
     monkeypatch.setattr(
         data,
@@ -367,7 +367,7 @@ def test_token_balanced_guard_does_not_admit_one_giant_first_document(monkeypatc
             for index in range(10)
         ],
     }
-    monkeypatch.setattr(data, "corpus_shards", lambda corpus_id: [f"{corpus_id}.jsonl.zst"])
+    monkeypatch.setattr(data, "corpus_shards", lambda corpus_id, **_: [f"{corpus_id}.jsonl.zst"])
     monkeypatch.setattr(data, "corpus_dir", lambda corpus_id: Path(corpus_id))
     monkeypatch.setattr(
         data,
