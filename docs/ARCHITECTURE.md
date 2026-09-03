@@ -391,7 +391,11 @@ Legacy stage-2 prompt-router training uses the same guarded planner.
    Parquet files into row-group or sub-row-group row ranges
    (`Adapter.plan_chunks`/`extract_chunk`), so a handful of big files keeps
    every worker busy. Single-file assets are hashed by the worker that reads
-   them.
+   them. A failure while analyzing one document (for example third-party
+   Python source with NUL bytes, which CPython's tokenizer cannot handle) is
+   recorded as a `preparation_exception` issue for that record and the
+   document is skipped; only a failure of the container itself (the adapter
+   can no longer read the file) fails the corpus.
 3. **Decide** (one coordinator thread, strict file/chunk order,
    `ingest/pipeline.py`): hygiene filter, language/quality quarantine, exact
    local dedup per split (split-leakage evidence), the MinHash LSH decision

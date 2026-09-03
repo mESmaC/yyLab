@@ -211,7 +211,7 @@ def test_worker_import_does_not_touch_the_registry(tmp_path):
     assert not (home / "yylab.sqlite3").exists(), "spawned workers must not create or migrate the registry"
 
 
-def test_docs_seen_counts_a_record_whose_preparation_fails(tmp_path):
+def test_document_preparation_failure_is_catalogued_not_fatal(tmp_path):
     source = tmp_path / "src"
     source.mkdir()
     lines = [
@@ -221,11 +221,22 @@ def test_docs_seen_counts_a_record_whose_preparation_fails(tmp_path):
         json.dumps({"text": _sentence(4)}),
     ]
     (source / "records.jsonl").write_text("\n".join(lines) + "\n", "utf-8")
-    with pytest.raises(RuntimeError, match="asset extraction failed"):
-        run_ingest(lambda *args: None, _cfg(source, name="surrogate"))
-    row = db.q1("SELECT stats_json, status FROM corpora WHERE name='surrogate'")
-    assert row["status"] == "failed"
-    assert json.loads(row["stats_json"])["docs_seen"] == 3
+    cid = run_ingest(lambda *args: None, _cfg(source, name="surrogate"))
+    row = db.q1("SELECT stats_json, status FROM corpora WHERE id=?", (cid,))
+    stats = json.loads(row["stats_json"])
+    assert row["status"] == "ready"
+    assert stats["docs_seen"] == 4
+    assert stats["docs_written"] == 3
+    assert stats["records_failed"] == 1
+    assert stats["files_failed"] == 0
+    with sqlite3.connect(corpus_dir(cid) / "inventory.sqlite3") as con:
+        issues = con.execute("SELECT locator, reason_code, detail FROM issues").fetchall()
+        statuses = dict(con.execute("SELECT logical_path, status FROM assets"))
+    assert len(issues) == 1
+    assert issues[0][0] == "record=3"
+    assert issues[0][1] == "preparation_exception"
+    assert "UnicodeEncodeError" in issues[0][2]
+    assert statuses["records.jsonl"] == "normalized"
 
 
 def test_startup_marks_stale_processing_rows_failed():

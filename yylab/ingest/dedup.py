@@ -127,6 +127,16 @@ def _generic_code_structure(text: str) -> str:
 
 
 def _python_structure(text: str) -> tuple[str, str, list[str]]:
+    """Structural fingerprint of Python source, or the generic one when it cannot be parsed.
+
+    Corpus documents are arbitrary third-party code: besides ``SyntaxError`` the
+    compiler can raise ``ValueError`` (null bytes), ``RecursionError`` and
+    ``MemoryError`` (pathological nesting or size), and CPython occasionally
+    surfaces internal parser faults as ``SystemError``. None of those is a
+    reason to fail an ingest; the document simply gets the generic structure
+    and an explicit reason code.
+    """
+
     try:
         with warnings.catch_warnings():
             # Belt and braces with the module-level filter: the compiler's
@@ -136,12 +146,30 @@ def _python_structure(text: str) -> tuple[str, str, list[str]]:
     except SyntaxError as error:
         location = f"{error.lineno or 0}:{error.offset or 0}"
         return _generic_code_structure(text), "invalid", [f"python_parse_error:{location}"]
-    anonymized = _IdentifierAnonymizer().visit(tree)
-    ast.fix_missing_locations(anonymized)
-    return ast.dump(anonymized, include_attributes=False), "valid", []
+    except (ValueError, RecursionError, MemoryError, SystemError, OverflowError) as error:
+        return (
+            _generic_code_structure(text),
+            "invalid",
+            [f"python_parse_failed:{type(error).__name__}"],
+        )
+    try:
+        anonymized = _IdentifierAnonymizer().visit(tree)
+        ast.fix_missing_locations(anonymized)
+        return ast.dump(anonymized, include_attributes=False), "valid", []
+    except (RecursionError, MemoryError, SystemError) as error:
+        return (
+            _generic_code_structure(text),
+            "invalid",
+            [f"python_structure_failed:{type(error).__name__}"],
+        )
 
 
 def _python_tokens(text: str) -> list[str]:
+    if "\x00" in text:
+        # CPython 3.12's C tokenizer mishandles NUL bytes (it raises SystemError
+        # "returned a result with an exception set"); the compiler refuses them
+        # anyway, so use the generic token stream.
+        return _GENERIC_CODE_TOKEN.findall(text)
     tokens: list[str] = []
     try:
         stream = tokenize.generate_tokens(io.StringIO(text).readline)
@@ -164,7 +192,9 @@ def _python_tokens(text: str) -> list[str]:
                 tokens.append("<string>")
             else:
                 tokens.append(token.string)
-    except (IndentationError, tokenize.TokenError):
+    except (SyntaxError, ValueError, tokenize.TokenError, RecursionError, SystemError):
+        # IndentationError is a SyntaxError; the 3.12 tokenizer also raises
+        # plain SyntaxError for some malformed inputs.
         return _GENERIC_CODE_TOKEN.findall(text)
     return tokens
 

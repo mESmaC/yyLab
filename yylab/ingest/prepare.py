@@ -399,9 +399,12 @@ def prepare_chunk(
 
     ``adapter=None`` hashes the asset without extracting it (inventory-only and
     policy-excluded assets still record their content hash).  Adapter
-    exceptions are captured together with the documents prepared before the
-    failure so the coordinator can reproduce the sequential partial-flush and
-    corpus-failure semantics in order.
+    exceptions (the container itself cannot be read further) are captured
+    together with the documents prepared before the failure so the coordinator
+    can reproduce the sequential partial-flush and corpus-failure semantics in
+    order.  A failure while analyzing one document is a fact about that
+    document: it is reported as a ``preparation_exception`` issue and the
+    document is skipped, so one pathological record cannot fail a corpus.
     """
 
     raw_sha256 = ""
@@ -421,6 +424,7 @@ def prepare_chunk(
     if adapter is None:
         return ChunkResult(docs=[], issues=[], records_seen=0, lines_seen=0, raw_sha256=raw_sha256)
     docs: list[PreparedDoc] = []
+    preparation_issues: list[tuple[str, str, str]] = []
     error = ""
     error_type = ""
     docs_yielded = 0
@@ -428,19 +432,28 @@ def prepare_chunk(
         iterator = adapter.extract(path) if chunk is None else adapter.extract_chunk(path, chunk)
         for doc in iterator:
             docs_yielded += 1
-            docs.append(
-                prepare_document(
+            try:
+                prepared = prepare_document(
                     doc,
                     asset_logical_path=asset_logical_path,
                     asset_format_name=asset_format_name,
                     params=params,
                 )
-            )
+            except Exception as exc:  # noqa: BLE001 - one document's analysis, not the container
+                preparation_issues.append(
+                    (
+                        doc.locator or f"record={docs_yielded}",
+                        "preparation_exception",
+                        f"{type(exc).__name__}: {str(exc)[:500]}",
+                    )
+                )
+                continue
+            docs.append(prepared)
     except Exception as exc:  # noqa: BLE001 - reported to the catalog by the coordinator
         error = str(exc)
         error_type = type(exc).__name__
     drain = getattr(adapter, "drain_issues", None)
-    issues = list(drain()) if callable(drain) else []
+    issues = (list(drain()) if callable(drain) else []) + preparation_issues
     stats = getattr(adapter, "chunk_stats", None)
     records_seen, lines_seen = stats() if callable(stats) else (0, 0)
     payload = encode_payload(docs) if build_payload and not error else None
