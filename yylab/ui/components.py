@@ -73,7 +73,7 @@ def form_section(step: str, title: str, sub: str = ""):
 
 
 def hint(text: str):
-    ui.label(text).classes("text-xs text-gray-500")
+    return ui.label(text).classes("text-xs text-gray-500")
 
 
 def field_grid(cols: int = 3):

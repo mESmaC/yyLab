@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import asdict
 from functools import lru_cache
 from typing import Any
@@ -26,7 +26,7 @@ from ..shell import ACCENT, panel, shell
 from .train_mole import corpus_options
 
 SPALMER_RUN_KIND = "spalmer_base"
-SPALMER_RECIPE_VERSION = 2
+SPALMER_RECIPE_VERSION = 3
 DEFAULT_SOURCE_SPLITS = ("train", "unspecified")
 PARAMETER_TARGETS = {
     "10M": 10_000_000,
@@ -56,6 +56,37 @@ def _resolve_target(scale: str, custom_target: int | float | None) -> int:
     if target < 1:
         raise ValueError("custom target parameters must be positive")
     return target
+
+
+def _spalmer_checkpoint_rows() -> list[dict[str, Any]]:
+    """Registered base checkpoints whose metadata declares the SPALMER family."""
+
+    rows = db.q(
+        "SELECT id,name,params_b,hidden_size,num_layers,meta_json,created_at "
+        "FROM checkpoints WHERE kind='base' ORDER BY created_at DESC"
+    )
+    selected: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            meta = json.loads(row.get("meta_json") or "{}")
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(meta, dict):
+            continue
+        family = str(meta.get("model_family") or meta.get("family") or "").strip().casefold()
+        if family == "spalmer":
+            selected.append(dict(row))
+    return selected
+
+
+def _parent_plan(meta: Mapping[str, Any]) -> dict[str, Any]:
+    """Read a recorded scale plan from run-produced or scan-registered metadata."""
+
+    plan = meta.get("plan")
+    if not isinstance(plan, Mapping):
+        nested = meta.get("metadata")
+        plan = nested.get("plan") if isinstance(nested, Mapping) else None
+    return dict(plan) if isinstance(plan, Mapping) else {}
 
 
 def _resolve_budget(
@@ -308,15 +339,27 @@ def build_spalmer_run_config(
     atxy: dict[str, Any],
     out_checkpoint_id: str,
     data_preflight_warnings: Iterable[str] = (),
+    initialization_mode: str = "scratch",
+    parent_checkpoint_id: str | None = None,
+    epochs: int = 1,
 ) -> dict[str, Any]:
-    """Build the durable UI/worker boundary for one SPALMER scratch run."""
+    """Build the durable UI/worker boundary for one SPALMER scratch or continued run."""
 
     name = str(checkpoint_name or "").strip()
     reference = str(tokenizer_ref or "").strip()
+    mode = str(initialization_mode or "scratch").strip().casefold()
+    if mode not in {"scratch", "checkpoint"}:
+        raise ValueError(f"unsupported initialization mode: {initialization_mode!r}")
+    continuing = mode == "checkpoint"
+    parent_id = str(parent_checkpoint_id or "").strip()
     if not name:
         raise ValueError("checkpoint name is required")
-    if not reference:
+    if continuing and not parent_id:
+        raise ValueError("choose a parent checkpoint to continue from")
+    if not continuing and not reference:
         raise ValueError("choose a registered tokenizer or enter a tokenizer reference")
+    if int(epochs) < 1:
+        raise ValueError("epochs must be at least 1")
     selected_corpora = _ordered_values(corpora)
     if not selected_corpora:
         raise ValueError("choose at least one training corpus")
@@ -325,18 +368,20 @@ def build_spalmer_run_config(
     mix = normalize_corpus_mix(corpus_mix)
     target = int(target_parameters)
     vocabulary = int(tokenizer_preview_vocab_size)
-    if target < 1 or vocabulary < 1:
-        raise ValueError("target parameters and tokenizer preview vocabulary must be positive")
-    if int(resolved_plan.get("target_parameters") or 0) != target:
-        raise ValueError("resolved SPALMER plan does not match the requested target")
-    planned_config = dict(resolved_plan.get("config") or {})
-    if int(planned_config.get("vocab_size") or 0) != vocabulary:
-        raise ValueError("resolved SPALMER plan does not match the preview vocabulary")
-    if str(planned_config.get("expert_weight_format") or "") != expert_weight_format:
-        raise ValueError("resolved SPALMER plan does not match the expert weight format")
-    fingerprint = str(resolved_plan.get("fingerprint") or "")
-    if len(fingerprint) != 64:
-        raise ValueError("resolved SPALMER plan is missing its fingerprint")
+    fingerprint = ""
+    if not continuing:
+        if target < 1 or vocabulary < 1:
+            raise ValueError("target parameters and tokenizer preview vocabulary must be positive")
+        if int(resolved_plan.get("target_parameters") or 0) != target:
+            raise ValueError("resolved SPALMER plan does not match the requested target")
+        planned_config = dict(resolved_plan.get("config") or {})
+        if int(planned_config.get("vocab_size") or 0) != vocabulary:
+            raise ValueError("resolved SPALMER plan does not match the preview vocabulary")
+        if str(planned_config.get("expert_weight_format") or "") != expert_weight_format:
+            raise ValueError("resolved SPALMER plan does not match the expert weight format")
+        fingerprint = str(resolved_plan.get("fingerprint") or "")
+        if len(fingerprint) != 64:
+            raise ValueError("resolved SPALMER plan is missing its fingerprint")
 
     budget = _resolve_budget(
         token_budget=int(token_budget),
@@ -374,9 +419,11 @@ def build_spalmer_run_config(
     attention_status = attention_backend_status(attention_backend)
     if attention_backend in {"auto", "fla"} and not attention_status["available"]:
         raise ValueError(str(attention_status["detail"]))
-    qat_status = qat_backend_status(expert_weight_format, expert_qat_backend)
-    if expert_qat_backend == "native" and not qat_status["native_w4a8_available"]:
-        raise ValueError(str(qat_status["detail"]))
+    qat_status = None
+    if not continuing:
+        qat_status = qat_backend_status(expert_weight_format, expert_qat_backend)
+        if expert_qat_backend == "native" and not qat_status["native_w4a8_available"]:
+            raise ValueError(str(qat_status["detail"]))
 
     atxy_payload = dict(atxy)
     if atxy_payload.get("enabled"):
@@ -471,12 +518,43 @@ def build_spalmer_run_config(
         "checkpoint_interval_steps": int(save_every),
         "telemetry_interval_steps": int(log_every),
     }
-    tokenizer = {
-        "source": tokenizer_source,
-        "registry_id": tokenizer_registry_id,
-        "ref": reference,
-        "preview_vocab_size": vocabulary,
-    }
+    if continuing:
+        initialization = {"mode": "checkpoint", "checkpoint_id": parent_id}
+        tokenizer = {
+            "source": "checkpoint",
+            "registry_id": None,
+            "ref": "",
+            "preview_vocab_size": None,
+        }
+        spalmer_block: dict[str, Any] = {
+            "attention_backend": attention_backend,
+            "require_fla": attention_backend != "reference",
+            "allow_reference_attention": attention_backend == "reference",
+        }
+        architecture_keys: dict[str, Any] = {}
+    else:
+        initialization = {"mode": "scratch", "tokenizer_ref": reference}
+        tokenizer = {
+            "source": tokenizer_source,
+            "registry_id": tokenizer_registry_id,
+            "ref": reference,
+            "preview_vocab_size": vocabulary,
+        }
+        spalmer_block = spalmer
+        architecture_keys = {
+            "architecture": resolved_plan,
+            "precision": {
+                "recipe": "spalmer_w4a8_bf16_master_v1",
+                "parameter_dtype": "bfloat16",
+                "compute_dtype": "bfloat16",
+                "expert_weight_format": expert_weight_format,
+                "expert_activation_format": "mxfp8",
+                "expert_master_dtype": "bfloat16",
+                "expert_qat_backend": expert_qat_backend,
+                "ple_quant_bits": 4,
+                "ple_stochastic_rounding": True,
+            },
+        }
     return {
         "recipe_version": SPALMER_RECIPE_VERSION,
         "architecture_type": "spalmer_v1",
@@ -486,21 +564,10 @@ def build_spalmer_run_config(
         "checkpoint_name": name,
         "output_name": name,
         "out_checkpoint_id": str(out_checkpoint_id),
-        "initialization": {"mode": "scratch", "tokenizer_ref": reference},
+        "initialization": initialization,
         "tokenizer": tokenizer,
-        "spalmer": spalmer,
-        "architecture": resolved_plan,
-        "precision": {
-            "recipe": "spalmer_w4a8_bf16_master_v1",
-            "parameter_dtype": "bfloat16",
-            "compute_dtype": "bfloat16",
-            "expert_weight_format": expert_weight_format,
-            "expert_activation_format": "mxfp8",
-            "expert_master_dtype": "bfloat16",
-            "expert_qat_backend": expert_qat_backend,
-            "ple_quant_bits": 4,
-            "ple_stochastic_rounding": True,
-        },
+        "spalmer": spalmer_block,
+        **architecture_keys,
         "training": training,
         "corpora": selected_corpora,
         "domains": normalized_domains or None,
@@ -514,7 +581,7 @@ def build_spalmer_run_config(
         "micro_batch": int(micro_batch),
         "grad_accum": int(gradient_accumulation),
         "max_steps": resolved_steps,
-        "epochs": 1,
+        "epochs": int(epochs),
         "seed": int(seed),
         "shuffle_buffer": 128,
         "shuffle_buffer_bytes": 64 * 2**20,
@@ -567,180 +634,216 @@ def train_spalmer_page() -> None:
             (tokenizer_rows.get(first_tokenizer_id) or {}).get("vocab_size") or 8192
         )
         corpora = corpus_options()
+        parent_rows = {row["id"]: row for row in _spalmer_checkpoint_rows()}
+        parent_choices = {
+            checkpoint_id: (
+                f"{row['name']} · "
+                f"{_format_parameters(int(round(float(row.get('params_b') or 0) * 1e9)))}"
+            )
+            for checkpoint_id, row in parent_rows.items()
+        }
+        first_parent_id = next(iter(parent_choices), None)
         with ui.row().classes("w-full gap-4 items-start flex-wrap"):
             with panel().classes("shrink-0").style("width: 720px; max-width: 100%"):
-                form_section("1", "Output and tokenizer")
+                form_section("1", "Initialization and output")
                 checkpoint_name = (
                     ui.input("Checkpoint name", value="spalmer-10m")
                     .props("dense outlined")
                     .classes("w-full")
                 )
-                registered_tokenizer = (
+                initialization_mode = (
                     ui.select(
-                        tokenizer_choices,
-                        value=first_tokenizer_id,
-                        label="Registered tokenizer",
-                    )
-                    .props("dense outlined clearable")
-                    .classes("w-full")
-                )
-                direct_tokenizer_ref = (
-                    ui.input(
-                        "Direct local / Hugging Face tokenizer reference",
-                        placeholder="Optional; overrides the registered tokenizer",
+                        {
+                            "scratch": "Random weights (scratch)",
+                            "checkpoint": "Continue from checkpoint",
+                        },
+                        value="scratch",
+                        label="Initialization",
                     )
                     .props("dense outlined")
                     .classes("w-full")
                 )
-                preview_vocab = (
-                    ui.number(
-                        "Tokenizer vocabulary for planning",
-                        value=first_tokenizer_vocab,
-                        min=1,
-                        max=10_000_000,
-                        precision=0,
+                parent_checkpoint = (
+                    ui.select(
+                        parent_choices,
+                        value=first_parent_id,
+                        label="Parent SPALMER checkpoint",
                     )
                     .props("dense outlined")
                     .classes("w-full")
                 )
-                hint(
-                    "The vocabulary is used only for the construction-free preview. The worker resolves "
-                    "the tokenizer, replans with its actual vocabulary, and rejects a fingerprint mismatch. "
-                    "A registered tokenizer's catalogued vocabulary is authoritative."
+                parent_hint = hint(
+                    "Architecture, expert numerics, and tokenizer are inherited from the parent. "
+                    "Optimizer moments and the learning-rate schedule start fresh."
                 )
-
-                ui.separator().classes("my-3")
-                form_section("2", "Architecture and execution")
-                with field_grid(3):
-                    target_scale = (
+                with ui.column().classes("w-full") as tokenizer_controls:
+                    registered_tokenizer = (
                         ui.select(
-                            {
-                                "10M": "10M total parameters",
-                                "50M": "50M total parameters",
-                                "100M": "100M total parameters",
-                                "custom": "Custom total target",
-                            },
-                            value="10M",
-                            label="Parameter target",
+                            tokenizer_choices,
+                            value=first_tokenizer_id,
+                            label="Registered tokenizer",
+                        )
+                        .props("dense outlined clearable")
+                        .classes("w-full")
+                    )
+                    direct_tokenizer_ref = (
+                        ui.input(
+                            "Direct local / Hugging Face tokenizer reference",
+                            placeholder="Optional; overrides the registered tokenizer",
                         )
                         .props("dense outlined")
                         .classes("w-full")
                     )
-                    custom_target = (
+                    preview_vocab = (
                         ui.number(
-                            "Custom exact parameters",
-                            value=25_000_000,
+                            "Tokenizer vocabulary for planning",
+                            value=first_tokenizer_vocab,
                             min=1,
+                            max=10_000_000,
                             precision=0,
                         )
                         .props("dense outlined")
                         .classes("w-full")
                     )
-                    expert_weight_format = (
-                        ui.select(
-                            {
-                                "mxfp4": "MXFP4 expert weights",
-                                "nvfp4": "NVFP4 expert weights",
-                            },
-                            value="mxfp4",
-                            label="Expert forward weights",
-                        )
-                        .props("dense outlined")
-                        .classes("w-full")
-                    )
-                with field_grid(2):
-                    attention_backend = (
-                        ui.select(
-                            {
-                                "auto": "Auto (FLA on CUDA when available)",
-                                "reference": "PyTorch reference",
-                                "fla": "FLA KDA (strict)",
-                            },
-                            value="auto",
-                            label="KDA attention backend",
-                        )
-                        .props("dense outlined")
-                        .classes("w-full")
-                    )
-                    expert_qat_backend = (
-                        ui.select(
-                            {
-                                "auto": "Auto (reference until native exists)",
-                                "reference": "Pure-Torch Q/DQ reference",
-                                "native": "Native mixed W4A8 (strict)",
-                            },
-                            value="auto",
-                            label="Expert QAT backend",
-                        )
-                        .props("dense outlined")
-                        .classes("w-full")
-                    )
-                attention_status_label = ui.label("").classes(
-                    "text-xs text-gray-400 px-3 py-2 rounded-md w-full"
-                )
-                attention_status_label.style(f"background: {ACCENT}10")
-                qat_status_label = ui.label("").classes(
-                    "text-xs text-gray-400 px-3 py-2 rounded-md w-full"
-                )
-                qat_status_label.style(f"background: {ACCENT}10")
-
-                directional_enabled = ui.switch(
-                    "Directional lateral/silencing branch", value=True
-                )
-                with ui.row().classes("w-full gap-3") as directional_controls:
-                    directional_groups = (
-                        ui.number("Feature groups", value=4, min=2, max=64, precision=0)
-                        .props("dense outlined")
-                        .classes("flex-1")
-                    )
-                    directional_rank = (
-                        ui.number("Lateral rank", value=16, min=1, max=1024, precision=0)
-                        .props("dense outlined")
-                        .classes("flex-1")
-                    )
-                atxy_enabled = ui.switch("Include ATXY module", value=False)
-                with ui.column().classes("w-full gap-2") as atxy_controls:
-                    with field_grid(3):
-                        atxy_value_dim = (
-                            ui.number("ATXY value width", value=64, min=1, precision=0)
-                            .props("dense outlined")
-                            .classes("w-full")
-                        )
-                        atxy_a = (
-                            ui.number("A cardinality", value=256, min=1, precision=0)
-                            .props("dense outlined")
-                            .classes("w-full")
-                        )
-                        atxy_t = (
-                            ui.number("T cardinality", value=256, min=1, precision=0)
-                            .props("dense outlined")
-                            .classes("w-full")
-                        )
-                    with field_grid(3):
-                        atxy_x = (
-                            ui.number("X cardinality", value=256, min=1, precision=0)
-                            .props("dense outlined")
-                            .classes("w-full")
-                        )
-                        atxy_y = (
-                            ui.number("Y cardinality", value=256, min=1, precision=0)
-                            .props("dense outlined")
-                            .classes("w-full")
-                        )
-                        atxy_layer = (
-                            ui.number("Injection layer", value=0, min=0, precision=0)
-                            .props("dense outlined")
-                            .classes("w-full")
-                        )
                     hint(
-                        "This allocates the native ATXY component. Training only exercises it when the "
-                        "worker receives numeric addresses, a mask, and a versioned ATXY store."
+                        "The vocabulary is used only for the construction-free preview. The worker resolves "
+                        "the tokenizer, replans with its actual vocabulary, and rejects a fingerprint mismatch. "
+                        "A registered tokenizer's catalogued vocabulary is authoritative."
                     )
-                ui.label(
-                    "Canonical expert policy: 200 coherent identities · training top-k 2 · "
-                    "request residency 2–20 · grouped execution · BF16 master / "
-                    "CPU-offloaded FP32 moments."
-                ).classes("text-xs text-violet-300")
+
+                ui.separator().classes("my-3")
+                with ui.column().classes("w-full") as architecture_section:
+                    form_section("2", "Architecture and execution")
+                    with field_grid(3):
+                        target_scale = (
+                            ui.select(
+                                {
+                                    "10M": "10M total parameters",
+                                    "50M": "50M total parameters",
+                                    "100M": "100M total parameters",
+                                    "custom": "Custom total target",
+                                },
+                                value="10M",
+                                label="Parameter target",
+                            )
+                            .props("dense outlined")
+                            .classes("w-full")
+                        )
+                        custom_target = (
+                            ui.number(
+                                "Custom exact parameters",
+                                value=25_000_000,
+                                min=1,
+                                precision=0,
+                            )
+                            .props("dense outlined")
+                            .classes("w-full")
+                        )
+                        expert_weight_format = (
+                            ui.select(
+                                {
+                                    "mxfp4": "MXFP4 expert weights",
+                                    "nvfp4": "NVFP4 expert weights",
+                                },
+                                value="mxfp4",
+                                label="Expert forward weights",
+                            )
+                            .props("dense outlined")
+                            .classes("w-full")
+                        )
+                    with field_grid(2):
+                        attention_backend = (
+                            ui.select(
+                                {
+                                    "auto": "Auto (FLA on CUDA when available)",
+                                    "reference": "PyTorch reference",
+                                    "fla": "FLA KDA (strict)",
+                                },
+                                value="auto",
+                                label="KDA attention backend",
+                            )
+                            .props("dense outlined")
+                            .classes("w-full")
+                        )
+                        expert_qat_backend = (
+                            ui.select(
+                                {
+                                    "auto": "Auto (reference until native exists)",
+                                    "reference": "Pure-Torch Q/DQ reference",
+                                    "native": "Native mixed W4A8 (strict)",
+                                },
+                                value="auto",
+                                label="Expert QAT backend",
+                            )
+                            .props("dense outlined")
+                            .classes("w-full")
+                        )
+                    attention_status_label = ui.label("").classes(
+                        "text-xs text-gray-400 px-3 py-2 rounded-md w-full"
+                    )
+                    attention_status_label.style(f"background: {ACCENT}10")
+                    qat_status_label = ui.label("").classes(
+                        "text-xs text-gray-400 px-3 py-2 rounded-md w-full"
+                    )
+                    qat_status_label.style(f"background: {ACCENT}10")
+
+                    directional_enabled = ui.switch(
+                        "Directional lateral/silencing branch", value=True
+                    )
+                    with ui.row().classes("w-full gap-3") as directional_controls:
+                        directional_groups = (
+                            ui.number("Feature groups", value=4, min=2, max=64, precision=0)
+                            .props("dense outlined")
+                            .classes("flex-1")
+                        )
+                        directional_rank = (
+                            ui.number("Lateral rank", value=16, min=1, max=1024, precision=0)
+                            .props("dense outlined")
+                            .classes("flex-1")
+                        )
+                    atxy_enabled = ui.switch("Include ATXY module", value=False)
+                    with ui.column().classes("w-full gap-2") as atxy_controls:
+                        with field_grid(3):
+                            atxy_value_dim = (
+                                ui.number("ATXY value width", value=64, min=1, precision=0)
+                                .props("dense outlined")
+                                .classes("w-full")
+                            )
+                            atxy_a = (
+                                ui.number("A cardinality", value=256, min=1, precision=0)
+                                .props("dense outlined")
+                                .classes("w-full")
+                            )
+                            atxy_t = (
+                                ui.number("T cardinality", value=256, min=1, precision=0)
+                                .props("dense outlined")
+                                .classes("w-full")
+                            )
+                        with field_grid(3):
+                            atxy_x = (
+                                ui.number("X cardinality", value=256, min=1, precision=0)
+                                .props("dense outlined")
+                                .classes("w-full")
+                            )
+                            atxy_y = (
+                                ui.number("Y cardinality", value=256, min=1, precision=0)
+                                .props("dense outlined")
+                                .classes("w-full")
+                            )
+                            atxy_layer = (
+                                ui.number("Injection layer", value=0, min=0, precision=0)
+                                .props("dense outlined")
+                                .classes("w-full")
+                            )
+                        hint(
+                            "This allocates the native ATXY component. Training only exercises it when the "
+                            "worker receives numeric addresses, a mask, and a versioned ATXY store."
+                        )
+                    ui.label(
+                        "Canonical expert policy: 200 coherent identities · training top-k 2 · "
+                        "request residency 2–20 · grouped execution · BF16 master / "
+                        "CPU-offloaded FP32 moments."
+                    ).classes("text-xs text-violet-300")
 
                 ui.separator().classes("my-3")
                 form_section("3", "Training data")
@@ -845,6 +948,12 @@ def train_spalmer_page() -> None:
                     )
                     max_steps = (
                         ui.number("Max steps (0 = use tokens)", value=0, min=0, precision=0)
+                        .props("dense outlined")
+                        .classes("w-full")
+                    )
+                with field_grid(3):
+                    epochs = (
+                        ui.number("Epochs (passes over the data)", value=1, min=1, precision=0)
                         .props("dense outlined")
                         .classes("w-full")
                     )
@@ -996,6 +1105,19 @@ def train_spalmer_page() -> None:
                 return "", "registered", None
             return tokenizer_id, "registered", tokenizer_id
 
+        def continuing() -> bool:
+            return str(initialization_mode.value or "scratch") == "checkpoint"
+
+        def selected_parent() -> dict[str, Any] | None:
+            return parent_rows.get(str(parent_checkpoint.value or ""))
+
+        def update_initialization_controls() -> None:
+            parent_checkpoint.visible = continuing()
+            parent_hint.visible = continuing()
+            tokenizer_controls.visible = not continuing()
+            architecture_section.visible = not continuing()
+            update_plan_preview()
+
         def set_corpora_selection(value: str | Iterable[str] | None) -> None:
             corpora_select.value = _ordered_values(value)
             corpora_select.update()
@@ -1052,6 +1174,26 @@ def train_spalmer_page() -> None:
         def update_plan_preview() -> None:
             plan_preview.clear()
             with plan_preview:
+                if continuing():
+                    parent = selected_parent()
+                    if parent is None:
+                        ui.label("Register a SPALMER checkpoint to continue from.").classes(
+                            "text-sm text-red-300"
+                        )
+                        return
+                    meta = json.loads(parent.get("meta_json") or "{}")
+                    parent_plan = _parent_plan(meta)
+                    parameters = int(round(float(parent.get("params_b") or 0) * 1e9))
+                    ui.label(
+                        f"Inherited from {parent['name']}: {_format_parameters(parameters)} "
+                        f"parameters · d={int(parent.get('hidden_size') or 0):,} · "
+                        f"{int(parent.get('num_layers') or 0)} layers"
+                    ).classes("text-sm text-gray-200")
+                    ui.label(
+                        f"Plan {str(parent_plan.get('fingerprint') or '')[:16]}… · tokenizer and "
+                        "expert numerics come from the bundle."
+                    ).classes("text-[11px] text-gray-500")
+                    return
                 try:
                     plan = plan_spalmer_configuration(
                         target_parameters=requested_target(),
@@ -1174,26 +1316,34 @@ def train_spalmer_page() -> None:
             budget_summary.text = (
                 f"{int(budget['max_steps']):,} optimizer steps × "
                 f"{int(budget['tokens_per_optimizer_step']):,} tokens = "
-                f"{int(budget['scheduled_training_tokens']):,} scheduled tokens."
+                f"{int(budget['scheduled_training_tokens']):,} scheduled tokens; "
+                f"the corpora are re-shuffled and replayed for {int(epochs.value or 1)} "
+                "epoch(s) until the step cap is reached."
             )
 
         def on_start() -> None:
             selected_corpora = _ordered_values(corpora_select.value)
-            tokenizer_ref, tokenizer_source, tokenizer_registry_id = selected_tokenizer()
-            if tokenizer_source == "registered":
-                tokenizer_row = tokenizer_rows.get(str(tokenizer_registry_id or ""))
-                if tokenizer_row is None:
-                    ui.notify("Choose a ready registered tokenizer.", type="negative")
-                    return
-                catalogued_vocab = int(tokenizer_row.get("vocab_size") or 0)
-                if catalogued_vocab and catalogued_vocab != int(preview_vocab.value or 0):
-                    ui.notify(
-                        f"Registered tokenizer vocabulary is {catalogued_vocab:,}; "
-                        "reset the planning vocabulary before starting.",
-                        type="negative",
-                        multi_line=True,
-                    )
-                    return
+            parent = selected_parent() if continuing() else None
+            if continuing() and parent is None:
+                ui.notify("Choose a parent SPALMER checkpoint.", type="negative")
+                return
+            tokenizer_ref, tokenizer_source, tokenizer_registry_id = ("", "checkpoint", None)
+            if not continuing():
+                tokenizer_ref, tokenizer_source, tokenizer_registry_id = selected_tokenizer()
+                if tokenizer_source == "registered":
+                    tokenizer_row = tokenizer_rows.get(str(tokenizer_registry_id or ""))
+                    if tokenizer_row is None:
+                        ui.notify("Choose a ready registered tokenizer.", type="negative")
+                        return
+                    catalogued_vocab = int(tokenizer_row.get("vocab_size") or 0)
+                    if catalogued_vocab and catalogued_vocab != int(preview_vocab.value or 0):
+                        ui.notify(
+                            f"Registered tokenizer vocabulary is {catalogued_vocab:,}; "
+                            "reset the planning vocabulary before starting.",
+                            type="negative",
+                            multi_line=True,
+                        )
+                        return
             selected_domains = _ordered_values(domain_filter.value)
             selected_splits = normalize_source_splits(split_filter.value)
             mix = str(corpus_mix.value or CORPUS_MIX_TOKEN_BALANCED)
@@ -1214,13 +1364,16 @@ def train_spalmer_page() -> None:
                 ui.notify("; ".join(data_check["errors"]), type="negative", multi_line=True)
                 return
             try:
-                plan = plan_spalmer_configuration(
-                    target_parameters=requested_target(),
-                    vocab_size=int(preview_vocab.value or 0),
-                    expert_weight_format=str(expert_weight_format.value or "mxfp4"),
-                    directional=current_directional(),
-                    atxy=current_atxy(),
-                )
+                if continuing():
+                    plan = _parent_plan(json.loads(parent.get("meta_json") or "{}"))
+                else:
+                    plan = plan_spalmer_configuration(
+                        target_parameters=requested_target(),
+                        vocab_size=int(preview_vocab.value or 0),
+                        expert_weight_format=str(expert_weight_format.value or "mxfp4"),
+                        directional=current_directional(),
+                        atxy=current_atxy(),
+                    )
                 checkpoint_id = db.new_id("ckpt")
                 config = build_spalmer_run_config(
                     checkpoint_name=str(checkpoint_name.value or ""),
@@ -1228,8 +1381,8 @@ def train_spalmer_page() -> None:
                     tokenizer_source=tokenizer_source,
                     tokenizer_registry_id=tokenizer_registry_id,
                     tokenizer_preview_vocab_size=int(preview_vocab.value or 0),
-                    target_scale=str(target_scale.value or "10M"),
-                    target_parameters=requested_target(),
+                    target_scale="inherited" if continuing() else str(target_scale.value or "10M"),
+                    target_parameters=0 if continuing() else requested_target(),
                     resolved_plan=plan,
                     corpora=selected_corpora,
                     domains=selected_domains,
@@ -1265,18 +1418,29 @@ def train_spalmer_page() -> None:
                     atxy=current_atxy(),
                     out_checkpoint_id=checkpoint_id,
                     data_preflight_warnings=data_check["warnings"],
+                    initialization_mode="checkpoint" if continuing() else "scratch",
+                    parent_checkpoint_id=str(parent["id"]) if parent else None,
+                    epochs=int(epochs.value or 1),
                 )
             except (RuntimeError, TypeError, ValueError) as exc:
                 ui.notify(str(exc), type="negative", multi_line=True)
                 return
 
-            planned_config = dict(plan["config"])
-            planned_parameters = int(dict(plan["parameters"])["total"])
+            if continuing():
+                planned_config = {
+                    "d_model": int(parent.get("hidden_size") or 0),
+                    "n_layers": int(parent.get("num_layers") or 0),
+                }
+                planned_parameters = int(round(float(parent.get("params_b") or 0) * 1e9))
+            else:
+                planned_config = dict(plan["config"])
+                planned_parameters = int(dict(plan["parameters"])["total"])
             pending_metadata = {
                 "architecture_type": "spalmer_v1",
-                "target_parameters": int(plan["target_parameters"]),
+                "initialization": config["initialization"],
+                "target_parameters": int(plan.get("target_parameters") or planned_parameters),
                 "planned_parameters": planned_parameters,
-                "plan_fingerprint": plan["fingerprint"],
+                "plan_fingerprint": str(plan.get("fingerprint") or ""),
                 "tokenizer": config["tokenizer"],
                 "spalmer": config["spalmer"],
             }
@@ -1360,6 +1524,9 @@ def train_spalmer_page() -> None:
         for element in (sequence_length, token_budget, max_steps, micro_batch, grad_accum):
             element.on_value_change(lambda _: update_budget_summary())
         start_button.on_click(on_start)
+        initialization_mode.on_value_change(lambda _: update_initialization_controls())
+        parent_checkpoint.on_value_change(lambda _: update_plan_preview())
+        epochs.on_value_change(lambda _: update_budget_summary())
 
         update_target_controls()
         update_directional_controls()
@@ -1367,3 +1534,4 @@ def train_spalmer_page() -> None:
         update_backend_status()
         update_mix_controls()
         update_budget_summary()
+        update_initialization_controls()

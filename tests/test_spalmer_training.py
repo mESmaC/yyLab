@@ -492,3 +492,335 @@ def test_run_writes_native_artifact_metadata_without_real_training(tmp_path, mon
     assert manifest["optimizer_state_placement"]["dense"]["devices"] == ["cpu"]
     assert placement_receipt["verified_after_step"] == 1
     assert placement_receipt["optimizer_state_placement"]["dense"]["devices"] == ["cpu"]
+
+
+def _parent_row(bundle: Path, *, family: str = "spalmer") -> dict:
+    return {
+        "id": "ckpt_parent",
+        "name": "spal50m",
+        "kind": "base",
+        "ref": str(bundle),
+        "path": str(bundle.parent),
+        "params_b": 0.05,
+        "hidden_size": 192,
+        "num_layers": 4,
+        "meta_json": json.dumps({"model_family": family, "plan": {"fingerprint": "parent-plan"}}),
+    }
+
+
+def _checkpoint_config(**updates):
+    config = _config(
+        initialization={"mode": "checkpoint", "checkpoint_id": "ckpt_parent"},
+        spalmer={"attention_backend": "reference"},
+    )
+    config.update(updates)
+    return config
+
+
+def test_normalize_spalmer_config_checkpoint_mode_inherits_architecture(tmp_path, monkeypatch):
+    bundle = tmp_path / "parent" / "spalmer.pt"
+    bundle.parent.mkdir()
+    bundle.write_bytes(b"bundle")
+    monkeypatch.setattr(bridge.db, "q1", lambda sql, args=(): _parent_row(bundle))
+
+    normalized = bridge.normalize_spalmer_config(_checkpoint_config(epochs=3), require_runtime=True)
+
+    assert normalized["initialization"] == {
+        "mode": "checkpoint",
+        "checkpoint_id": "ckpt_parent",
+        "checkpoint_ref": str(bundle.resolve()),
+    }
+    assert normalized["tokenizer_ref"] is None
+    assert normalized["spalmer"] == {"attention_backend": "reference", "require_fla": False}
+    assert "target_parameters" not in normalized
+    assert normalized["epochs"] == 3
+
+
+@pytest.mark.parametrize(
+    ("row_factory", "updates", "message"),
+    [
+        (lambda bundle: None, {}, "unknown parent checkpoint"),
+        (lambda bundle: _parent_row(bundle, family="hf"), {}, "not a SPALMER checkpoint"),
+        (
+            lambda bundle: _parent_row(bundle),
+            {"spalmer": {"attention_backend": "reference", "num_experts": 100}},
+            "num_experts",
+        ),
+        (lambda bundle: _parent_row(bundle), {"epochs": 0}, "epochs must be positive"),
+        (
+            lambda bundle: _parent_row(bundle),
+            {"initialization": {"mode": "checkpoint"}},
+            "initialization.checkpoint_id",
+        ),
+    ],
+)
+def test_normalize_spalmer_config_checkpoint_mode_rejections(
+    tmp_path, monkeypatch, row_factory, updates, message
+):
+    bundle = tmp_path / "parent" / "spalmer.pt"
+    bundle.parent.mkdir()
+    bundle.write_bytes(b"bundle")
+    monkeypatch.setattr(bridge.db, "q1", lambda sql, args=(): row_factory(bundle))
+
+    with pytest.raises(ValueError, match=message):
+        bridge.normalize_spalmer_config(_checkpoint_config(**updates))
+
+
+def test_normalize_spalmer_config_checkpoint_mode_requires_bundle_file(tmp_path, monkeypatch):
+    missing = tmp_path / "parent" / "spalmer.pt"
+    monkeypatch.setattr(bridge.db, "q1", lambda sql, args=(): _parent_row(missing))
+
+    with pytest.raises(ValueError, match="bundle is unavailable"):
+        bridge.normalize_spalmer_config(_checkpoint_config())
+
+
+def test_normalize_spalmer_config_rejects_unknown_initialization_mode():
+    with pytest.raises(ValueError, match="initialization mode"):
+        bridge.normalize_spalmer_config(_config(initialization={"mode": "lora"}))
+
+
+def _parent_bundle(path: Path, *, tokenizer_source: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "format": "spalmer.prototype.checkpoint",
+            "format_version": 5,
+            "model_parameter_dtype": "bfloat16",
+            "model_config": {"vocab_size": 32, "d_model": 8, "n_layers": 4},
+            "kda_config": {"hidden_size": 8, "num_heads": 2},
+            "mla_config": {"hidden_size": 8, "num_heads": 2},
+            "experts_config": {"num_experts": 200, "expert_weight_format": "mxfp4"},
+            "directional_config": {"d_model": 8, "enabled": True},
+            "atxy_config": None,
+            "tokenizer_binding": {
+                "kind": "huggingface",
+                "identity": {
+                    "backend": "huggingface",
+                    "source": tokenizer_source,
+                    "artifact_fingerprint": "artifact-expected",
+                    "vocab_size": 32,
+                    "special_tokens": {"bos_id": None, "eos_id": 0, "eod_id": None, "pad_id": 0},
+                    "revision": None,
+                    "fingerprint": "identity-expected",
+                },
+            },
+            "model_state": {"w": torch.zeros(2, dtype=torch.bfloat16)},
+            "metadata": {
+                "run_id": "run_parent",
+                "plan": {
+                    "target_parameters": 50_000_000,
+                    "relative_error": 0.0001,
+                    "fingerprint": "parent-plan",
+                    "config": {
+                        "num_experts": 200,
+                        "expert_weight_format": "mxfp4",
+                        "d_model": 8,
+                        "n_layers": 4,
+                    },
+                    "parameters": {"total": 50_006_136},
+                },
+            },
+        },
+        path,
+    )
+    return path
+
+
+def _checkpoint_api(load_checkpoint, **extra):
+    return SimpleNamespace(
+        load_checkpoint=load_checkpoint,
+        SPALMERConfig=_ConfigObject,
+        KDAConfig=_ConfigObject,
+        MLAConfig=_ConfigObject,
+        MicroExpertsConfig=_ConfigObject,
+        DirectionalConfig=_ConfigObject,
+        ATXYConfig=_ConfigObject,
+        TrainingConfig=lambda **values: SimpleNamespace(**values),
+        fla_available=lambda: True,
+        plan_configuration=lambda *_args, **_kwargs: pytest.fail("plan must not be recomputed"),
+        build_configs=lambda *_args, **_kwargs: pytest.fail("bundle must not be rebuilt"),
+        **extra,
+    )
+
+
+def test_prepare_spalmer_run_continues_from_parent_bundle(tmp_path, monkeypatch):
+    bundle = _parent_bundle(
+        tmp_path / "parent" / "spalmer.pt", tokenizer_source=str(tmp_path / "gone")
+    )
+    monkeypatch.setattr(bridge.db, "q1", lambda sql, args=(): _parent_row(bundle))
+    override = SimpleNamespace(identity=SimpleNamespace(source="relocated"))
+    seen_bindings = []
+    monkeypatch.setattr(
+        "yylab.models.spalmer.relocated_spalmer_tokenizer",
+        lambda binding: seen_bindings.append(binding) or override,
+    )
+    model = _FakeModel()
+    tokenizer = _FakeTokenizer()
+    calls = {}
+
+    def load_checkpoint(path, **kwargs):
+        calls["path"] = Path(path)
+        calls["kwargs"] = kwargs
+        plan = torch.load(path, weights_only=True)["metadata"]["plan"]
+        return model, tokenizer, {"run_id": "run_parent", "plan": plan}
+
+    prepared = bridge.prepare_spalmer_run(_checkpoint_config(), api=_checkpoint_api(load_checkpoint))
+
+    assert prepared.model is model
+    assert prepared.tokenizer is tokenizer
+    assert calls["path"] == bundle.resolve()
+    assert calls["kwargs"] == {"map_location": "cpu", "tokenizer_override": override}
+    assert seen_bindings[0]["kind"] == "huggingface"
+    assert prepared.plan.fingerprint == "parent-plan"
+    assert prepared.plan.config.num_experts == 200
+    assert prepared.plan.parameters.total == 50_006_136
+    assert prepared.plan.to_dict()["target_parameters"] == 50_000_000
+    assert prepared.bundle.kda.hidden_size == 8
+    assert prepared.bundle.model.to_dict()["d_model"] == 8
+    assert prepared.bundle.directional.enabled is True
+    assert prepared.bundle.atxy is None
+    assert prepared.parent == {
+        "checkpoint_id": "ckpt_parent",
+        "checkpoint_path": str(bundle.resolve()),
+        "run_id": "run_parent",
+        "plan_fingerprint": "parent-plan",
+    }
+    assert prepared.training.max_steps == 2
+
+
+def test_prepare_spalmer_run_skips_override_when_tokenizer_path_exists(tmp_path, monkeypatch):
+    present = tmp_path / "tok"
+    present.mkdir()
+    (present / "tokenizer.json").write_text("{}", encoding="utf-8")
+    bundle = _parent_bundle(tmp_path / "parent" / "spalmer.pt", tokenizer_source=str(present))
+    monkeypatch.setattr(bridge.db, "q1", lambda sql, args=(): _parent_row(bundle))
+    monkeypatch.setattr("yylab.models.spalmer.relocated_spalmer_tokenizer", lambda binding: None)
+    calls = {}
+
+    def load_checkpoint(path, **kwargs):
+        calls["kwargs"] = kwargs
+        return (
+            _FakeModel(),
+            _FakeTokenizer(),
+            {"run_id": "run_parent", "plan": {"fingerprint": "parent-plan"}},
+        )
+
+    prepared = bridge.prepare_spalmer_run(_checkpoint_config(), api=_checkpoint_api(load_checkpoint))
+
+    assert calls["kwargs"] == {"map_location": "cpu"}
+    assert prepared.parent["run_id"] == "run_parent"
+
+
+def test_prepare_spalmer_run_requires_parent_plan_metadata(tmp_path, monkeypatch):
+    bundle = _parent_bundle(
+        tmp_path / "parent" / "spalmer.pt", tokenizer_source=str(tmp_path / "gone")
+    )
+    monkeypatch.setattr(bridge.db, "q1", lambda sql, args=(): _parent_row(bundle))
+    monkeypatch.setattr("yylab.models.spalmer.relocated_spalmer_tokenizer", lambda binding: None)
+    api = _checkpoint_api(lambda path, **kwargs: (_FakeModel(), _FakeTokenizer(), {"run_id": "x"}))
+
+    with pytest.raises(ValueError, match="scale plan"):
+        bridge.prepare_spalmer_run(_checkpoint_config(), api=api)
+
+
+class _FakeLoadedModel(_FakeModel):
+    def __init__(self):
+        self.moves = []
+
+    def to(self, *args, **kwargs):
+        self.moves.append((args, kwargs))
+        return self
+
+
+def test_run_uses_loaded_model_and_records_parent(tmp_path, monkeypatch):
+    output = tmp_path / "checkpoint"
+    bundle_path = tmp_path / "parent" / "spalmer.pt"
+    bundle_path.parent.mkdir()
+    bundle_path.write_bytes(b"bundle")
+    batches = _FakeBatches()
+    training = _ConfigObject(
+        max_steps=2,
+        sequence_length=8,
+        seed=0,
+        deterministic_algorithms=False,
+        device="cpu",
+        optimizer_update_chunk_size=1_048_576,
+    )
+    experts = _ConfigObject(
+        expert_activation_format="mxfp8",
+        expert_master_dtype="bfloat16",
+        expert_qat_backend="reference",
+    )
+    bundle = SimpleNamespace(
+        build=lambda: pytest.fail("continued runs must not build a fresh model"),
+        model=_ConfigObject(vocab_size=4096, d_model=64, n_layers=4),
+        kda=_ConfigObject(backend="reference"),
+        mla=_ConfigObject(num_heads=4),
+        experts=experts,
+        directional=None,
+        atxy=None,
+    )
+    loaded = _FakeLoadedModel()
+    parent = {
+        "checkpoint_id": "ckpt_parent",
+        "checkpoint_path": str(bundle_path),
+        "run_id": "run_parent",
+        "plan_fingerprint": "plan-fingerprint",
+    }
+    prepared = bridge.PreparedSpalmerRun(
+        _checkpoint_config(),
+        _FakeTokenizer(),
+        _FakePlan(),
+        bundle,
+        training,
+        model=loaded,
+        parent=parent,
+    )
+    saved = {}
+
+    def save_checkpoint(path, *_args, **kwargs):
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"mock-spalmer-checkpoint")
+        saved[path] = kwargs["metadata"]
+        return path
+
+    api = SimpleNamespace(
+        CausalBatch=_CausalBatch,
+        ExperimentTrainer=_FakeTrainer,
+        assert_accounting_matches_plan=lambda *_args: pytest.fail("accounting is not replanned"),
+        save_checkpoint=save_checkpoint,
+        seed_everything=lambda *_args, **_kwargs: None,
+    )
+    database_calls = []
+    monkeypatch.setattr(bridge, "_load_spalmer_api", lambda: api)
+    monkeypatch.setattr(bridge, "prepare_spalmer_run", lambda *_args, **_kwargs: prepared)
+    monkeypatch.setattr(bridge, "build_spalmer_batch_source", lambda *_args, **_kwargs: batches)
+    monkeypatch.setattr(bridge, "checkpoint_dir", lambda _checkpoint_id: output)
+    monkeypatch.setattr(bridge.db, "q1", lambda sql, args=(): _parent_row(bundle_path))
+    monkeypatch.setattr(
+        bridge,
+        "corpus_training_preflight",
+        lambda *_args, **_kwargs: {
+            "errors": [],
+            "warnings": [],
+            "provenance": {"schema_version": 3, "corpus_ids": ["alpha"]},
+        },
+    )
+    monkeypatch.setattr(
+        bridge.db,
+        "execute",
+        lambda sql, args=(): database_calls.append((sql, args)) or 1,
+    )
+
+    summary = bridge.run_spalmer_base(_checkpoint_config(), tmp_path / "run")
+
+    assert loaded.moves, "loaded model must be moved to the training device"
+    assert saved[output / "spalmer.pt"]["parent_checkpoint"] == parent
+    manifest = json.loads((output / "spalmer_manifest.json").read_text("utf-8"))
+    assert manifest["parent_checkpoint"] == parent
+    assert manifest["data_provenance"]["initialization"] == "checkpoint"
+    registry_meta = json.loads(database_calls[-1][1][6])
+    assert registry_meta["initialization"] == "checkpoint"
+    assert registry_meta["parent_checkpoint_id"] == "ckpt_parent"
+    assert summary["parent_checkpoint"] == parent

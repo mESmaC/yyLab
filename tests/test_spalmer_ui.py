@@ -101,7 +101,7 @@ def test_spalmer_ui_config_preserves_canonical_architecture_and_budget(monkeypat
     normalized = normalize_spalmer_config(config, require_runtime=True)
 
     assert config["architecture_type"] == "spalmer_v1"
-    assert config["recipe_version"] == 2
+    assert config["recipe_version"] == 3
     assert config["model_family"] == "spalmer"
     assert config["initialization"] == {
         "mode": "scratch",
@@ -153,3 +153,116 @@ def test_spalmer_ui_strict_native_qat_fails_closed(monkeypatch) -> None:
 def test_spalmer_ui_rejects_unimplemented_activation_checkpointing(monkeypatch) -> None:
     with pytest.raises(ValueError, match="not implemented"):
         _run_config(monkeypatch, activation_checkpointing=True)
+
+
+def test_spalmer_ui_config_carries_epochs_for_scratch_runs(monkeypatch) -> None:
+    config = _run_config(monkeypatch, epochs=3)
+
+    assert config["recipe_version"] == 3
+    assert config["epochs"] == 3
+    assert config["initialization"] == {"mode": "scratch", "tokenizer_ref": "tok_4096"}
+
+
+def test_spalmer_ui_config_defaults_to_one_epoch(monkeypatch) -> None:
+    assert _run_config(monkeypatch)["epochs"] == 1
+
+
+def test_spalmer_ui_config_rejects_non_positive_epochs(monkeypatch) -> None:
+    with pytest.raises(ValueError, match="epochs"):
+        _run_config(monkeypatch, epochs=0)
+
+
+def test_spalmer_ui_config_continues_from_checkpoint(monkeypatch) -> None:
+    config = _run_config(
+        monkeypatch,
+        initialization_mode="checkpoint",
+        parent_checkpoint_id="ckpt_parent",
+        tokenizer_ref="",
+        tokenizer_source="checkpoint",
+        tokenizer_registry_id=None,
+        resolved_plan={},
+        target_parameters=0,
+        attention_backend="reference",
+        epochs=2,
+    )
+
+    assert config["initialization"] == {"mode": "checkpoint", "checkpoint_id": "ckpt_parent"}
+    assert set(config["spalmer"]) <= {
+        "attention_backend",
+        "require_fla",
+        "allow_reference_attention",
+    }
+    assert config["spalmer"]["attention_backend"] == "reference"
+    assert "architecture" not in config
+    assert "precision" not in config
+    assert config["tokenizer"] == {
+        "source": "checkpoint",
+        "registry_id": None,
+        "ref": "",
+        "preview_vocab_size": None,
+    }
+    assert config["epochs"] == 2
+    assert config["max_steps"] > 0
+
+
+def test_spalmer_ui_checkpoint_mode_requires_parent(monkeypatch) -> None:
+    with pytest.raises(ValueError, match="parent checkpoint"):
+        _run_config(monkeypatch, initialization_mode="checkpoint", parent_checkpoint_id=None)
+
+
+def test_spalmer_ui_checkpoint_mode_normalizes(monkeypatch, tmp_path) -> None:
+    from yylab import db
+    from yylab.train.spalmer import normalize_spalmer_config
+
+    bundle = tmp_path / "parent" / "spalmer.pt"
+    bundle.parent.mkdir()
+    bundle.write_bytes(b"bundle")
+    monkeypatch.setattr(
+        db,
+        "q1",
+        lambda sql, args=(): {
+            "id": "ckpt_parent",
+            "ref": str(bundle),
+            "path": str(bundle.parent),
+            "meta_json": '{"model_family": "spalmer"}',
+        },
+    )
+    config = _run_config(
+        monkeypatch,
+        initialization_mode="checkpoint",
+        parent_checkpoint_id="ckpt_parent",
+        tokenizer_ref="",
+        tokenizer_source="checkpoint",
+        tokenizer_registry_id=None,
+        resolved_plan={},
+        target_parameters=0,
+        attention_backend="reference",
+    )
+
+    normalized = normalize_spalmer_config(config, require_runtime=True)
+
+    assert normalized["initialization"]["checkpoint_ref"] == str(bundle.resolve())
+    assert normalized["spalmer"] == {"attention_backend": "reference", "require_fla": False}
+
+
+def test_spalmer_checkpoint_rows_filter_by_family(monkeypatch) -> None:
+    from yylab import db
+
+    rows = [
+        {"id": "a", "name": "spal", "params_b": 0.05, "meta_json": '{"model_family": "spalmer"}'},
+        {"id": "b", "name": "scan", "params_b": 0.05, "meta_json": '{"family": "spalmer"}'},
+        {"id": "c", "name": "hf", "params_b": 0.5, "meta_json": '{"model_family": "hf"}'},
+        {"id": "d", "name": "broken", "params_b": 0.5, "meta_json": "not json"},
+    ]
+    monkeypatch.setattr(db, "q", lambda sql, args=(): rows)
+
+    assert [row["id"] for row in train_spalmer._spalmer_checkpoint_rows()] == ["a", "b"]
+
+
+def test_parent_plan_reads_nested_and_flat_metadata() -> None:
+    flat = {"plan": {"fingerprint": "f", "config": {"vocab_size": 8192}}}
+    nested = {"metadata": {"plan": {"fingerprint": "n"}}}
+
+    assert train_spalmer._parent_plan(flat)["fingerprint"] == "f"
+    assert train_spalmer._parent_plan(nested)["fingerprint"] == "n"
+    assert train_spalmer._parent_plan({}) == {}

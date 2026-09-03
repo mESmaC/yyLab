@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import sys
 import types
 from pathlib import Path
@@ -9,11 +10,13 @@ import pytest
 import torch
 from torch import nn
 
+from yylab.config import PATHS
 from yylab.models.spalmer import (
     SpalmerCausalLMFacade,
     SpalmerTokenizerFacade,
     is_spalmer_checkpoint,
     load_spalmer_runtime,
+    relocated_spalmer_tokenizer,
     resolve_spalmer_checkpoint,
     scan_spalmer_checkpoint,
 )
@@ -256,7 +259,7 @@ def _fake_spalmer_module(monkeypatch, model, tokenizer, metadata) -> None:
 
 def test_load_spalmer_runtime_is_lazy_and_wraps_a_generic_tokenizer(tmp_path, monkeypatch) -> None:
     checkpoint = tmp_path / "spalmer.pt"
-    checkpoint.write_bytes(b"loader is mocked")
+    _write_checkpoint(checkpoint)
     model = _FakeSpalmerModel()
     tokenizer = _GenericTokenizer()
     tokenizer.identity = SimpleNamespace(backend="spalmer-rpd-v2")
@@ -285,7 +288,7 @@ def test_load_spalmer_runtime_is_lazy_and_wraps_a_generic_tokenizer(tmp_path, mo
 
 def test_load_spalmer_runtime_reads_nested_training_context(tmp_path, monkeypatch) -> None:
     checkpoint = tmp_path / "spalmer.pt"
-    checkpoint.write_bytes(b"loader is mocked")
+    _write_checkpoint(checkpoint)
     model = _FakeSpalmerModel()
     tokenizer = _GenericTokenizer()
     tokenizer.identity = SimpleNamespace(backend="spalmer-rpd-v2")
@@ -306,7 +309,7 @@ def test_load_spalmer_runtime_reads_nested_training_context(tmp_path, monkeypatc
 
 def test_load_spalmer_runtime_unwraps_an_hf_tokenizer_adapter(tmp_path, monkeypatch) -> None:
     checkpoint = tmp_path / "spalmer.pt"
-    checkpoint.write_bytes(b"loader is mocked")
+    _write_checkpoint(checkpoint)
     model = _FakeSpalmerModel()
     hf_tokenizer = SimpleNamespace(eos_token="<eos>", eos_token_id=2, pad_token=None)
     adapter = SimpleNamespace(
@@ -426,7 +429,7 @@ class _PrePagingOffloadedSpalmerModel(_FakeOffloadedSpalmerModel):
 
 def test_default_paging_fails_closed_against_a_pre_paging_core(tmp_path, monkeypatch) -> None:
     checkpoint = tmp_path / "spalmer.pt"
-    checkpoint.write_bytes(b"loader is mocked")
+    _write_checkpoint(checkpoint)
     model = _PrePagingOffloadedSpalmerModel()
     tokenizer = _GenericTokenizer()
     tokenizer.identity = SimpleNamespace(backend="spalmer-rpd-v2")
@@ -444,7 +447,7 @@ def test_explicit_legacy_mode_remains_compatible_with_a_pre_paging_core(
     monkeypatch,
 ) -> None:
     checkpoint = tmp_path / "spalmer.pt"
-    checkpoint.write_bytes(b"loader is mocked")
+    _write_checkpoint(checkpoint)
     model = _PrePagingOffloadedSpalmerModel()
     tokenizer = _GenericTokenizer()
     tokenizer.identity = SimpleNamespace(backend="spalmer-rpd-v2")
@@ -467,7 +470,7 @@ def test_explicit_legacy_mode_remains_compatible_with_a_pre_paging_core(
 
 def test_cuda_load_uses_physical_expert_offload_and_proves_placement(tmp_path, monkeypatch) -> None:
     checkpoint = tmp_path / "spalmer.pt"
-    checkpoint.write_bytes(b"loader is mocked")
+    _write_checkpoint(checkpoint)
     model = _FakeOffloadedSpalmerModel()
     tokenizer = _GenericTokenizer()
     tokenizer.identity = SimpleNamespace(backend="spalmer-rpd-v2")
@@ -509,7 +512,7 @@ def test_cuda_load_fails_closed_when_native_placement_proof_is_incoherent(
     monkeypatch,
 ) -> None:
     checkpoint = tmp_path / "spalmer.pt"
-    checkpoint.write_bytes(b"loader is mocked")
+    _write_checkpoint(checkpoint)
     model = _FakeOffloadedSpalmerModel(coherent=False)
     tokenizer = _GenericTokenizer()
     tokenizer.identity = SimpleNamespace(backend="spalmer-rpd-v2")
@@ -525,7 +528,7 @@ def test_cuda_load_fails_closed_when_native_placement_proof_is_incoherent(
 
 def test_paged_cache_capacity_can_exceed_legacy_resident_cap(tmp_path, monkeypatch) -> None:
     checkpoint = tmp_path / "spalmer.pt"
-    checkpoint.write_bytes(b"loader is mocked")
+    _write_checkpoint(checkpoint)
     model = _FakeOffloadedSpalmerModel()
     tokenizer = _GenericTokenizer()
     tokenizer.identity = SimpleNamespace(backend="spalmer-rpd-v2")
@@ -541,7 +544,7 @@ def test_paged_cache_capacity_can_exceed_legacy_resident_cap(tmp_path, monkeypat
 
 def test_legacy_cache_capacity_still_obeys_request_resident_cap(tmp_path, monkeypatch) -> None:
     checkpoint = tmp_path / "spalmer.pt"
-    checkpoint.write_bytes(b"loader is mocked")
+    _write_checkpoint(checkpoint)
     model = _FakeOffloadedSpalmerModel()
     tokenizer = _GenericTokenizer()
     tokenizer.identity = SimpleNamespace(backend="spalmer-rpd-v2")
@@ -810,3 +813,210 @@ def test_facade_rejects_batch_padding_and_hf_cache_objects_before_forward() -> N
     )
     assert unchanged.tolist() == [[1, 1]]
     assert model.calls == 0
+
+
+def _hf_binding(source: str, *, artifact_fingerprint: str = "artifact-expected") -> dict:
+    return {
+        "kind": "huggingface",
+        "identity": {
+            "backend": "huggingface",
+            "source": source,
+            "artifact_fingerprint": artifact_fingerprint,
+            "vocab_size": 32,
+            "special_tokens": {"bos_id": None, "eos_id": 0, "eod_id": None, "pad_id": 0},
+            "revision": None,
+            "fingerprint": "identity-expected",
+        },
+    }
+
+
+def _write_hf_checkpoint(path: Path, source: str) -> Path:
+    payload = _checkpoint_payload()
+    payload["tokenizer_binding"] = _hf_binding(source)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(payload, path)
+    return path
+
+
+def _tokenizer_artifact(root: Path, name: str) -> Path:
+    artifact = root / name
+    artifact.mkdir(parents=True)
+    (artifact / "tokenizer.json").write_text("{}", encoding="utf-8")
+    return artifact
+
+
+def _fake_spalmer_tokenizer_module(monkeypatch, fingerprints: dict[Path, str]) -> SimpleNamespace:
+    calls = SimpleNamespace(from_pretrained=[], fingerprinted=[])
+
+    class SpecialTokenIds:
+        def __init__(self, **values) -> None:
+            self.values = values
+
+    class HFTokenizerAdapter:
+        @classmethod
+        def from_pretrained(cls, identifier, **kwargs):
+            calls.from_pretrained.append((str(identifier), kwargs))
+            return SimpleNamespace(
+                identity=SimpleNamespace(backend="huggingface", source=str(identifier)),
+                tokenizer=SimpleNamespace(eos_token="<eos>", eos_token_id=0, pad_token=None),
+            )
+
+    def fingerprint_local_artifact(path):
+        resolved = Path(path).resolve()
+        calls.fingerprinted.append(resolved)
+        return fingerprints[resolved]
+
+    module = types.ModuleType("spalmer.tokenizer")
+    module.SpecialTokenIds = SpecialTokenIds
+    module.HFTokenizerAdapter = HFTokenizerAdapter
+    module.fingerprint_local_artifact = fingerprint_local_artifact
+    monkeypatch.setitem(sys.modules, "spalmer.tokenizer", module)
+    return calls
+
+
+def _fake_spalmer_module_with_override(monkeypatch, model) -> dict:
+    received: dict = {}
+
+    def load_checkpoint(path, map_location, tokenizer_override=None):
+        received["override"] = tokenizer_override
+        return model, tokenizer_override, {}
+
+    package = types.ModuleType("spalmer")
+    package.load_checkpoint = load_checkpoint
+    monkeypatch.setitem(sys.modules, "spalmer", package)
+    return received
+
+
+def test_load_spalmer_runtime_relocates_a_moved_hf_tokenizer_artifact(tmp_path, monkeypatch) -> None:
+    stale_source = tmp_path / "other-machine" / "tokenizers" / "tok_moved"
+    checkpoint = _write_hf_checkpoint(tmp_path / "spalmer.pt", str(stale_source))
+    tokenizers_root = tmp_path / "tokenizers"
+    decoy = _tokenizer_artifact(tokenizers_root, "tok_decoy")
+    relocated = _tokenizer_artifact(tokenizers_root, "tok_moved")
+    (tokenizers_root / "not-an-artifact").mkdir()
+    monkeypatch.setattr(PATHS, "tokenizers", tokenizers_root)
+    model = _FakeSpalmerModel()
+    received = _fake_spalmer_module_with_override(monkeypatch, model)
+    calls = _fake_spalmer_tokenizer_module(
+        monkeypatch,
+        {decoy.resolve(): "artifact-decoy", relocated.resolve(): "artifact-expected"},
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    runtime = load_spalmer_runtime(checkpoint)
+
+    assert received["override"] is not None
+    assert runtime.tokenizer is received["override"].tokenizer
+    assert runtime.tokenizer.pad_token == "<eos>"
+    assert len(calls.from_pretrained) == 1
+    identifier, kwargs = calls.from_pretrained[0]
+    assert identifier == str(relocated.resolve())
+    assert kwargs["revision"] is None
+    assert kwargs["local_files_only"] is True
+    assert kwargs["trust_remote_code"] is False
+    assert kwargs["special_tokens"].values == {
+        "bos_id": None,
+        "eos_id": 0,
+        "eod_id": None,
+        "pad_id": 0,
+    }
+    # The same-named artifact is checked first so a match never hashes the rest.
+    assert calls.fingerprinted == [relocated.resolve()]
+    assert any(
+        "relocated" in note and str(stale_source) in note and str(relocated.resolve()) in note
+        for note in runtime.notes
+    )
+    assert model.calls == 0
+
+
+def test_load_spalmer_runtime_explains_a_missing_relocated_tokenizer(tmp_path, monkeypatch) -> None:
+    stale_source = tmp_path / "other-machine" / "tokenizers" / "tok_moved"
+    checkpoint = _write_hf_checkpoint(tmp_path / "spalmer.pt", str(stale_source))
+    tokenizers_root = tmp_path / "tokenizers"
+    decoy = _tokenizer_artifact(tokenizers_root, "tok_decoy")
+    monkeypatch.setattr(PATHS, "tokenizers", tokenizers_root)
+    received = _fake_spalmer_module_with_override(monkeypatch, _FakeSpalmerModel())
+    calls = _fake_spalmer_tokenizer_module(monkeypatch, {decoy.resolve(): "artifact-decoy"})
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    with pytest.raises(FileNotFoundError) as excinfo:
+        load_spalmer_runtime(checkpoint)
+
+    message = str(excinfo.value)
+    assert str(stale_source) in message
+    assert "artifact-expected" in message
+    assert str(tokenizers_root) in message
+    assert calls.from_pretrained == []
+    assert "override" not in received
+
+
+def test_load_spalmer_runtime_keeps_an_existing_hf_tokenizer_source(tmp_path, monkeypatch) -> None:
+    present = _tokenizer_artifact(tmp_path / "local", "tok_present")
+    checkpoint = _write_hf_checkpoint(tmp_path / "spalmer.pt", str(present.resolve()))
+    monkeypatch.setattr(PATHS, "tokenizers", tmp_path / "tokenizers")
+    model = _FakeSpalmerModel()
+    hf_tokenizer = SimpleNamespace(eos_token="<eos>", eos_token_id=0, pad_token=None)
+    adapter = SimpleNamespace(identity=SimpleNamespace(backend="huggingface"), tokenizer=hf_tokenizer)
+    # SPALMER resolves an intact reference itself; the override keyword is never passed.
+    _fake_spalmer_module(monkeypatch, model, adapter, {})
+    calls = _fake_spalmer_tokenizer_module(monkeypatch, {})
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    runtime = load_spalmer_runtime(checkpoint)
+
+    assert runtime.tokenizer is hf_tokenizer
+    assert calls.from_pretrained == []
+    assert calls.fingerprinted == []
+    assert not any("relocated" in note for note in runtime.notes)
+
+
+def test_relocated_spalmer_tokenizer_matches_the_recorded_identity(tmp_path, monkeypatch) -> None:
+    spalmer_tokenizer = pytest.importorskip("spalmer.tokenizer")
+    from yylab.train.compact_tokenizer import CompactTokenizerSpec, train_compact_tokenizer
+
+    original = tmp_path / "original" / "tok_real"
+    train_compact_tokenizer(
+        ["relocation probe"],
+        original,
+        CompactTokenizerSpec(
+            vocab_size=257,
+            min_frequency=1,
+            max_documents=1,
+            special_token_profile="causal",
+        ),
+    )
+    recorded = spalmer_tokenizer.HFTokenizerAdapter.from_pretrained(
+        str(original.resolve()),
+        local_files_only=True,
+        special_tokens=spalmer_tokenizer.SpecialTokenIds(eos_id=0, pad_id=0),
+    )
+    binding = {"kind": "huggingface", "identity": recorded.identity.to_dict()}
+    tokenizers_root = tmp_path / "tokenizers"
+    tokenizers_root.mkdir()
+    shutil.move(str(original), str(tokenizers_root / "tok_real"))
+    monkeypatch.setattr(PATHS, "tokenizers", tokenizers_root)
+
+    override = relocated_spalmer_tokenizer(binding)
+
+    assert override is not None
+    assert override.identity.source == str((tokenizers_root / "tok_real").resolve())
+    assert override.identity.artifact_fingerprint == recorded.identity.artifact_fingerprint
+    assert override.identity.fingerprint == recorded.identity.fingerprint
+    assert relocated_spalmer_tokenizer({"kind": "spalmer_vocab", "vocab_size": 32}) is None
+    assert relocated_spalmer_tokenizer(None) is None
+
+
+def test_load_spalmer_checkpoint_payload_reads_binding_without_building(tmp_path) -> None:
+    from yylab.models.spalmer import load_spalmer_checkpoint_payload
+
+    checkpoint = _write_checkpoint(tmp_path / "run" / "spalmer.pt")
+
+    payload = load_spalmer_checkpoint_payload(tmp_path / "run")
+
+    assert payload["format"] == "spalmer.prototype.checkpoint"
+    assert payload["tokenizer_binding"] == {"kind": "spalmer_vocab", "vocab_size": 32}
+    assert payload["model_config"]["d_model"] == 8
+    assert checkpoint.is_file()
+    (tmp_path / "bad.pt").write_bytes(b"not a checkpoint")
+    with pytest.raises(Exception):
+        load_spalmer_checkpoint_payload(tmp_path / "bad.pt")
