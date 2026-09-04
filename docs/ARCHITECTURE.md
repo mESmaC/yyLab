@@ -687,6 +687,28 @@ through the scanner records the same information as `recurrence_config` and
 `effective_depth`, and readers look for `recurrence`, then `recurrence_config`,
 then `metadata.recurrence`.
 
+### SPALMER PLE backends
+
+`spalmer.ple_backend` in a scratch recipe selects the per-layer embedding
+implementation. It is an architectural choice: the planner counts it, the plan
+fingerprint records it, the bundle stores it (checkpoint format v7), and a
+continued run inherits it from the parent. A recipe without the key resolves
+to `fake_qat`, so every existing run, plan, and fingerprint is unchanged.
+
+- `fake_qat` (default): every physical layer owns one wide
+  `[vocab, lanes × d_model]` table whose forward operands are derived with
+  four-bit stochastic fake quantization.
+- `qr`: physical layer 0 is one exact BF16 `[vocab, d_model]` input table
+  with no lanes; layers 1 and up compose `lanes` quotient/remainder lanes, each
+  a remainder codebook of `m_i` rows and a quotient codebook of
+  `ceil(vocab / m_i)` rows, where the `m_i` are the first `lanes` primes at or
+  above `ceil(sqrt(vocab))` (`spalmer.qr`). Everything stays BF16 and no
+  quantizer runs. The Train · SPALMER preview, the run log,
+  `spalmer_manifest.json`, and the registry `meta_json["ple"]` block report
+  exact-input, QR-refresh, control, and total PLE parameters separately, and
+  the planner redistributes the freed capacity into width, depth, the shared
+  channel, and the expert banks while holding the same total target.
+
 ## Benchmarks
 
 The Benchmarks page uses the same detached worker, SQLite run history, live

@@ -545,6 +545,9 @@ def test_run_writes_native_artifact_metadata_without_real_training(tmp_path, mon
         "expert_activations": "mxfp8",
         "master_weights": "bfloat16",
         "expert_qat_backend": "reference",
+        "ple_backend": "fake_qat",
+        "ple_quant_bits": 4,
+        "ple_stochastic_rounding": True,
         "optimizer_moments": "float32_cpu_offload",
     }
     assert manifest["optimizer_state_placement"]["dense"]["devices"] == ["cpu"]
@@ -642,6 +645,8 @@ def _parent_bundle(
 ) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     model_config = {"vocab_size": 32, "d_model": 8, "n_layers": 4}
+    if format_version >= 7:
+        model_config["ple_backend"] = "qr"
     if recurrence is not None:
         model_config["recurrence"] = recurrence
     torch.save(
@@ -1025,7 +1030,7 @@ def test_training_config_carries_recurrence_fields():
     assert flat.mean_recurrence is None
 
 
-@pytest.mark.parametrize("format_version", [5, 6])
+@pytest.mark.parametrize("format_version", [5, 6, 7])
 def test_prepare_checkpoint_run_accepts_supported_bundle_versions(
     tmp_path, monkeypatch, format_version
 ):
@@ -1053,13 +1058,13 @@ def test_prepare_checkpoint_run_rejects_unsupported_bundle_version(tmp_path, mon
     bundle = _parent_bundle(
         tmp_path / "parent" / "spalmer.pt",
         tokenizer_source=str(tmp_path / "gone"),
-        format_version=7,
+        format_version=8,
     )
     monkeypatch.setattr(bridge.db, "q1", lambda sql, args=(): _parent_row(bundle))
     monkeypatch.setattr("yylab.models.spalmer.relocated_spalmer_tokenizer", lambda binding: None)
     api = _checkpoint_api(lambda path, **kwargs: pytest.fail("must not load"))
 
-    with pytest.raises(ValueError, match="format-version 5 or 6"):
+    with pytest.raises(ValueError, match="format-version 5, 6, or 7"):
         bridge.prepare_spalmer_run(_checkpoint_config(), api=api)
 
 

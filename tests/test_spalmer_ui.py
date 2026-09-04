@@ -101,7 +101,7 @@ def test_spalmer_ui_config_preserves_canonical_architecture_and_budget(monkeypat
     normalized = normalize_spalmer_config(config, require_runtime=True)
 
     assert config["architecture_type"] == "spalmer_v1"
-    assert config["recipe_version"] == 4
+    assert config["recipe_version"] == 5
     assert config["model_family"] == "spalmer"
     assert config["initialization"] == {
         "mode": "scratch",
@@ -158,7 +158,7 @@ def test_spalmer_ui_rejects_unimplemented_activation_checkpointing(monkeypatch) 
 def test_spalmer_ui_config_carries_epochs_for_scratch_runs(monkeypatch) -> None:
     config = _run_config(monkeypatch, epochs=3)
 
-    assert config["recipe_version"] == 4
+    assert config["recipe_version"] == 5
     assert config["epochs"] == 3
     assert config["initialization"] == {"mode": "scratch", "tokenizer_ref": "tok_4096"}
 
@@ -305,7 +305,7 @@ def test_spalmer_ui_config_emits_recurrence_recipe(monkeypatch) -> None:
     config = _recurrent_run_config(monkeypatch)
     normalized = normalize_spalmer_config(config, require_runtime=True)
 
-    assert config["recipe_version"] == 4
+    assert config["recipe_version"] == 5
     assert config["spalmer"]["recurrence"] == {
         "enabled": True,
         "prelude_layers": 1,

@@ -21,6 +21,9 @@ from ..config import PATHS
 
 SPALMER_FORMAT = "spalmer.prototype.checkpoint"
 SPALMER_FILENAME = "spalmer.pt"
+SPALMER_QR_PLE_FORMAT_VERSION = 7
+SPALMER_SUPPORTED_FORMAT_VERSIONS = frozenset(range(1, SPALMER_QR_PLE_FORMAT_VERSION + 1))
+SPALMER_PLE_BACKENDS = frozenset({"fake_qat", "qr"})
 DEFAULT_CONTEXT_LIMIT = 8_192
 ADAPTIVE_EXIT_CRITERIA = ("none", "latent_diff", "kl")
 EXIT_STATE_POLICIES = ("fill", "skip")
@@ -213,6 +216,24 @@ def scan_spalmer_checkpoint(ref: str | Path) -> dict[str, Any]:
         model_config.get("recurrence"), "model_config.recurrence"
     )
     effective_depth = recurrence_effective_depth(num_layers, recurrence_config)
+    # A pre-v7 bundle can omit the key because fake-QAT was then the sole
+    # topology.  Version 7 introduced QR-PLE and made the discriminator
+    # mandatory; failing closed here prevents the registry from laundering a
+    # malformed QR bundle into an apparently loadable legacy checkpoint.
+    format_version = int(payload.get("format_version") or 0)
+    if format_version not in SPALMER_SUPPORTED_FORMAT_VERSIONS:
+        raise ValueError(f"unsupported SPALMER checkpoint format version: {format_version}")
+    raw_ple_backend = model_config.get("ple_backend")
+    if format_version >= SPALMER_QR_PLE_FORMAT_VERSION and raw_ple_backend is None:
+        raise ValueError("SPALMER format-version 7+ checkpoint is missing model_config.ple_backend")
+    ple_backend = str(raw_ple_backend or "fake_qat")
+    if ple_backend not in SPALMER_PLE_BACKENDS:
+        raise ValueError(f"unsupported SPALMER PLE backend: {ple_backend!r}")
+    if format_version < SPALMER_QR_PLE_FORMAT_VERSION and ple_backend != "fake_qat":
+        raise ValueError(
+            f"SPALMER format-version {format_version} predates QR-PLE but declares "
+            f"backend {ple_backend!r}"
+        )
     state_tensor_count = _unique_tensor_numel(model_state.values())
     planned_parameter_count = _metadata_parameter_count(metadata)
     parameter_count = planned_parameter_count or state_tensor_count
@@ -224,6 +245,7 @@ def scan_spalmer_checkpoint(ref: str | Path) -> dict[str, Any]:
         "hidden_size": hidden_size,
         "num_hidden_layers": num_layers,
         "vocab_size": vocab_size,
+        "ple_backend": ple_backend,
         # This is a yyLab safety budget, not a RoPE limit: SPALMER is NoPE.
         "max_position_embeddings": trained_context or DEFAULT_CONTEXT_LIMIT,
         "spalmer_format_version": payload.get("format_version"),
@@ -235,6 +257,7 @@ def scan_spalmer_checkpoint(ref: str | Path) -> dict[str, Any]:
         "spalmer_atxy_config": atxy_config,
         # ``num_hidden_layers`` stays physical; recurrence multiplies the core.
         "spalmer_recurrence_config": recurrence_config,
+        "spalmer_ple_backend": ple_backend,
         "effective_depth": effective_depth,
     }
     return {
@@ -255,6 +278,7 @@ def scan_spalmer_checkpoint(ref: str | Path) -> dict[str, Any]:
         "num_layers": num_layers,
         "vocab_size": vocab_size,
         "recurrence_config": recurrence_config,
+        "ple_backend": ple_backend,
         "effective_depth": effective_depth,
         "parameter_dtype": payload.get("model_parameter_dtype"),
         "trained_context_length": trained_context,

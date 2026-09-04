@@ -85,6 +85,8 @@ def test_spalmer_checkpoint_scan_is_model_free_and_returns_registry_fields(tmp_p
     assert result["params_b"] == 0.00000002
     assert result["hidden_size"] == 8
     assert result["num_layers"] == 4
+    assert result["ple_backend"] == "fake_qat"
+    assert result["base_cfg"]["ple_backend"] == "fake_qat"
     assert result["trained_context_length"] == 2048
     assert result["base_cfg"]["model_type"] == "spalmer"
     assert result["base_cfg"]["max_position_embeddings"] == 2048
@@ -93,6 +95,35 @@ def test_spalmer_checkpoint_scan_is_model_free_and_returns_registry_fields(tmp_p
     assert result["checkpoint_ref"] == str(checkpoint.resolve())
     assert result["path"] == str(checkpoint.resolve().parent)
     assert is_spalmer_checkpoint(checkpoint)
+
+
+def test_spalmer_checkpoint_scan_requires_valid_versioned_ple_backend(tmp_path: Path) -> None:
+    payload = _checkpoint_payload()
+    payload["format_version"] = 7
+    payload["model_config"]["ple_backend"] = "qr"
+    checkpoint = tmp_path / "qr" / "spalmer.pt"
+    checkpoint.parent.mkdir(parents=True)
+    torch.save(payload, checkpoint)
+
+    result = scan_spalmer_checkpoint(checkpoint)
+    assert result["ple_backend"] == "qr"
+    assert result["base_cfg"]["ple_backend"] == "qr"
+
+    del payload["model_config"]["ple_backend"]
+    torch.save(payload, checkpoint)
+    with pytest.raises(ValueError, match="missing model_config.ple_backend"):
+        scan_spalmer_checkpoint(checkpoint)
+
+    payload["model_config"]["ple_backend"] = "unknown"
+    torch.save(payload, checkpoint)
+    with pytest.raises(ValueError, match="unsupported SPALMER PLE backend"):
+        scan_spalmer_checkpoint(checkpoint)
+
+    payload["format_version"] = 8
+    payload["model_config"]["ple_backend"] = "qr"
+    torch.save(payload, checkpoint)
+    with pytest.raises(ValueError, match="unsupported SPALMER checkpoint format version"):
+        scan_spalmer_checkpoint(checkpoint)
 
 
 def test_spalmer_scan_reads_nested_training_context_metadata(tmp_path: Path) -> None:

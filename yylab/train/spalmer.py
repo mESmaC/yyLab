@@ -51,8 +51,14 @@ CHECKPOINT_EXECUTION_KEYS = frozenset(
     {"attention_backend", "require_fla", "allow_reference_attention"}
 )
 # A v5 bundle has no recurrence block at all; a v6 bundle carries one that may
-# still be ``None``.  Both remain loadable starting points for continued runs.
-SUPPORTED_SPALMER_FORMAT_VERSIONS = frozenset({5, 6})
+# still be ``None``; a v7 bundle additionally names its PLE backend.  All three
+# remain loadable starting points for continued runs.
+SUPPORTED_SPALMER_FORMAT_VERSIONS = frozenset({5, 6, 7})
+# Per-layer embedding backends a scratch recipe may request.  A recipe with no
+# ``spalmer.ple_backend`` key resolves to the legacy fake-QAT tables, and a
+# continued run always inherits the parent bundle's backend.
+PLE_BACKENDS = frozenset({"fake_qat", "qr"})
+DEFAULT_PLE_BACKEND = "fake_qat"
 RECURRENCE_SAMPLING_MODES = frozenset({"poisson_lognormal", "uniform", "fixed"})
 DEFAULT_RECURRENCE_SAMPLING = "poisson_lognormal"
 RECURRENCE_TRAINING_KEYS = (
@@ -286,6 +292,37 @@ def _config_value(container: object, name: str, default: Any = None) -> Any:
     return getattr(container, name, default)
 
 
+def _ple_metadata(prepared: PreparedSpalmerRun) -> dict[str, Any]:
+    """Backend-aware PLE ownership recorded beside the plan.
+
+    ``exact_input_parameters`` and ``qr_refresh_parameters`` stay zero for the
+    legacy fake-QAT tables, whose lookup lanes all sit in ``lookup_parameters``.
+    """
+
+    plan = prepared.plan
+    config = _config_value(plan, "config")
+    parameters = _config_value(plan, "parameters")
+    backend = str(
+        _config_value(getattr(prepared.bundle, "model", None), "ple_backend")
+        or _config_value(config, "ple_backend")
+        or DEFAULT_PLE_BACKEND
+    )
+    lookup = int(_config_value(parameters, "ple_lookup", 0) or 0)
+    controls = int(_config_value(parameters, "ple_controls", 0) or 0)
+    recorded = plan.to_dict().get("ple") if callable(getattr(plan, "to_dict", None)) else None
+    recorded = dict(recorded) if isinstance(recorded, Mapping) else {}
+    return {
+        "backend": backend,
+        "lanes": int(_config_value(config, "ple_expansion", 0) or 0),
+        "moduli": [int(value) for value in recorded.get("moduli") or ()],
+        "exact_input_parameters": int(_config_value(parameters, "ple_exact_input", 0) or 0),
+        "qr_refresh_parameters": int(_config_value(parameters, "ple_qr_refresh", 0) or 0),
+        "lookup_parameters": lookup,
+        "control_parameters": controls,
+        "total_parameters": lookup + controls,
+    }
+
+
 def _recurrence_metadata(prepared: PreparedSpalmerRun) -> dict[str, Any] | None:
     """Join the bundle's recurrent geometry with the sampling policy that ran.
 
@@ -488,6 +525,17 @@ def _normalize_recurrence_training(cfg: dict[str, Any], *, mode: str) -> None:
     )
 
 
+def _normalize_ple_backend(value: object) -> str:
+    """Canonicalize the plan-driving PLE backend; a missing key is legacy fake-QAT."""
+
+    backend = str(value or DEFAULT_PLE_BACKEND).strip().casefold()
+    if backend not in PLE_BACKENDS:
+        raise ValueError(
+            "spalmer.ple_backend must be one of " + ", ".join(sorted(PLE_BACKENDS))
+        )
+    return backend
+
+
 def _normalize_scratch_architecture(cfg: dict[str, Any], spalmer: dict[str, Any]) -> None:
     """Validate the plan-driving architecture recipe for scratch initialization."""
 
@@ -570,6 +618,9 @@ def _normalize_scratch_architecture(cfg: dict[str, Any], spalmer: dict[str, Any]
 
     spalmer["recurrence"] = _normalize_recurrence_architecture(
         spalmer.get("recurrence", cfg.get("recurrence"))
+    )
+    spalmer["ple_backend"] = _normalize_ple_backend(
+        spalmer.get("ple_backend", cfg.get("ple_backend"))
     )
 
     expert_plan_evidence = {
@@ -904,6 +955,11 @@ def plan_spalmer_configuration(
         "atxy": atxy,
         "recurrence": recurrence,
     }
+    ple_backend = _normalize_ple_backend(spalmer.get("ple_backend"))
+    if ple_backend != DEFAULT_PLE_BACKEND:
+        # Legacy recipes keep the exact historical planner call (and therefore
+        # their fingerprints); only a QR-PLE recipe names its backend.
+        kwargs["ple_backend"] = ple_backend
     if "num_experts" in spalmer:
         kwargs["search_space"] = symbols.ScaleSearchSpace(
             num_experts=int(spalmer["num_experts"])
@@ -1633,7 +1689,7 @@ def _prepare_checkpoint_run(cfg: dict[str, Any], symbols: SimpleNamespace) -> Pr
     payload = load_spalmer_checkpoint_payload(checkpoint_path)
     if int(payload.get("format_version") or 0) not in SUPPORTED_SPALMER_FORMAT_VERSIONS:
         raise ValueError(
-            "SPALMER continued training requires a format-version 5 or 6 bundle; "
+            "SPALMER continued training requires a format-version 5, 6, or 7 bundle; "
             f"found {payload.get('format_version')!r}"
         )
     binding = payload.get("tokenizer_binding")
@@ -1726,6 +1782,7 @@ def _save_bundle_checkpoint(
         "batch_source": dict(trainer.batches.state_dict()),
         "data_provenance": dict(data_provenance),
         "recurrence": _recurrence_metadata(prepared),
+        "ple": _ple_metadata(prepared),
     }
     if prepared.parent:
         metadata["parent_checkpoint"] = dict(prepared.parent)
@@ -1769,6 +1826,7 @@ def run_spalmer_base(config: Mapping[str, Any], rd: Path) -> dict[str, Any]:
     prepared = prepare_spalmer_run(cfg, api=api)
     plan = prepared.plan
     recurrence_metadata = _recurrence_metadata(prepared)
+    ple_metadata = _ple_metadata(prepared)
     effective_depth = (
         int(plan.config.n_layers)
         if recurrence_metadata is None
@@ -1779,6 +1837,14 @@ def run_spalmer_base(config: Mapping[str, Any], rd: Path) -> dict[str, Any]:
         f"target={int(plan.target_parameters):,}; actual={int(plan.parameters.total):,}; "
         f"error={float(plan.relative_error):+.2%}; vocab={prepared.tokenizer.vocab_size:,}; "
         f"experts={plan.config.num_experts}; format={plan.config.expert_weight_format}",
+        flush=True,
+    )
+    print(
+        "SPALMER PLE: "
+        f"backend={ple_metadata['backend']}; lanes={ple_metadata['lanes']}; "
+        f"exact_input={ple_metadata['exact_input_parameters']:,}; "
+        f"qr_refresh={ple_metadata['qr_refresh_parameters']:,}; "
+        f"total={ple_metadata['total_parameters']:,}",
         flush=True,
     )
     if recurrence_metadata is not None:
@@ -1980,6 +2046,7 @@ def run_spalmer_base(config: Mapping[str, Any], rd: Path) -> dict[str, Any]:
         "optimizer_state_placement": optimizer_placement,
         "parameter_accounting": accounting_payload,
         "data_provenance": data_provenance,
+        "ple": ple_metadata,
         "recurrence": recurrence_metadata,
         "effective_depth": effective_depth,
         "result": result,
@@ -2006,11 +2073,32 @@ def run_spalmer_base(config: Mapping[str, Any], rd: Path) -> dict[str, Any]:
             "expert_activations": prepared.bundle.experts.expert_activation_format,
             "master_weights": prepared.bundle.experts.expert_master_dtype,
             "expert_qat_backend": prepared.bundle.experts.expert_qat_backend,
+            "ple_backend": ple_metadata["backend"],
+            **(
+                {
+                    "ple_parameter_dtype": "bfloat16",
+                    "ple_fake_quantization": False,
+                }
+                if ple_metadata["backend"] == "qr"
+                else {
+                    "ple_quant_bits": int(
+                        _config_value(prepared.bundle.model, "ple_quant_bits", 4)
+                    ),
+                    "ple_stochastic_rounding": bool(
+                        _config_value(
+                            prepared.bundle.model,
+                            "ple_stochastic_rounding",
+                            True,
+                        )
+                    ),
+                }
+            ),
             "optimizer_moments": "float32_cpu_offload",
         },
         "training_sequence_length": int(prepared.training.sequence_length),
         # ``num_layers`` in the registry stays physical; the recurrent depth a
         # forward actually walks lives here.
+        "ple": ple_metadata,
         "recurrence": recurrence_metadata,
         "effective_depth": effective_depth,
         "data_provenance": data_provenance,

@@ -197,59 +197,77 @@ the model, and the predictive fallthrough signal's model interface remain open.
 
 ### C02. Embeddings
 
-**State:** Candidate; early and intentionally adjustable.
+**State:** QR-PLE selected for the next implementation; legacy fake-QAT PLE
+remains a checkpoint-compatibility backend.
 
-Current component idea:
-
-```text
-raw token identity
-    -> wide, low-bit per-layer lookup (PLE)
-    -> learned compression/bottleneck
-    -> dense layer-width embedding
-    -> inject into that layer's hidden state
-```
-
-- **PLE** means per-layer lookup tables: lexical identity can be refreshed at
-  multiple depths instead of appearing only at the input layer.
-- Expand before compression so a low-bit table has redundant coordinates in
-  which to distribute useful signal and stochastic-rounding error.
-- Train the low-bit lookup with stochastic rounding. Deterministic nearest
-  rounding is the simplest inference behavior.
-- Divide the embedding capacity into two parts and alternate which part is
-  active. Fixed alternation is the simplest first version; learned active
-  alternation remains available later.
-- For the fixed version, each layer can own only its assigned phase (`A` for
-  even layers, `B` for odd layers) rather than storing two parts and leaving one
-  unused. Active selection would justify giving a layer access to both later.
-- PLE stochastic-rounding behavior remains separate from C10. Potentiation is
-  now controlled at expert granularity rather than by individual embedding rows
-  or weights.
-
-Two interpretation corrections are recorded without changing the proposal:
-
-- Expansion does not automatically untangle patterns; it supplies an
-  overcomplete low-bit code that training and compression can organize.
-- Stochastic rounding makes rounding error unbiased, but does not guarantee
-  white noise or guarantee that the compressor places all error in its
-  nullspace.
-
-The easiest faithful compressor avoids a full `expand_dim -> d_model` matrix.
-Reshape a `k * d_model` lookup into `k` lanes and learn a small weighted
-reduction:
+Selected component:
 
 ```text
-z_l,t = dequant(PLE_l,active[token_t])       # [k, d_model]
-e_l,t = sum_i alpha_l,i * z_l,t,i            # [d_model]
-h_l,t = h_l,t + gate_l * e_l,t
+token id
+    -> exact BF16 input embedding at layer 0
+    -> per-layer quotient/remainder codebooks at layers 1..L-1
+    -> multiplicative wide-lane composition
+    -> learned scalar lane reduction
+    -> gated lexical refresh into that layer's hidden state
 ```
 
-This keeps expand-before-compress and permits noise averaging while costing
-roughly `k * d_model` operations instead of an additional large matrix multiply
-per layer. A full learned projection remains an optional stronger compressor.
+- **PLE** still means that lexical identity is refreshed at multiple physical
+  depths rather than appearing only once at model input.
+- Layer 0 is the model's sole input embedding and keeps an exact BF16
+  `vocab_size x d_model` table with no expansion lanes. This protects the token
+  identity path while moving the repeated vocabulary cost out of later layers.
+- Every later physical layer owns `k` complementary quotient/remainder
+  codebook pairs. Lane `i` uses a distinct co-prime modulus `m_i` close to
+  `sqrt(vocab_size)`, so the lanes share parameters through different
+  partition topologies rather than merely differing by initialization.
+- For token `t`, `r_i = t mod m_i` and `q_i = floor(t / m_i)`. The pair
+  `(q_i, r_i)` uniquely addresses the token within a lane; this is structural
+  composition rather than lossy hashing or quantization.
+- Compose the two selected rows elementwise. Initialize remainder rows with the
+  ordinary embedding distribution and quotient rows near one with small noise,
+  so the initial product resembles an ordinary compact embedding and the
+  multiplicative interaction can grow during training.
+- Keep the inexpensive learned scalar softmax across lanes and the
+  `1/sqrt(L)` residual gate. Do not add a full lane projection initially.
+- Store and train QR codebooks directly in BF16 with dense gradients. There is
+  no PLE quantize/dequantize pass, fake-quantization STE, stochastic rounding,
+  packed shadow, or sparse-gradient mode in this backend.
+- The earlier A/B phase was metadata only: the implemented forward pass never
+  consumed it. QR-PLE does not preserve a non-operative alternation label.
+- Potentiation remains expert-granular under C10 and does not act on PLE rows.
 
-The remaining intentional ambiguity is what the two parts alternate over:
-layers, tokens, steps, or an active learned gate. That choice can wait until the
-first implementation.
+Reference forward for layers `l > 0`:
+
+```text
+r_l,t,i = R_l,i[token_t mod m_i]                         # [d_model]
+q_l,t,i = Q_l,i[floor(token_t / m_i)]                    # [d_model]
+z_l,t,i = r_l,t,i * q_l,t,i                              # [d_model]
+e_l,t   = sum_i softmax(lane_logits_l)[i] * z_l,t,i       # [d_model]
+h_l,t   = h_l,t + gate_l * e_l,t
+```
+
+The former full-table design allocated `L * V * k * d_model` lookup weights. QR
+reduces each later layer to approximately `2 * k * sqrt(V) * d_model`, while the
+single exact input table costs `V * d_model`. This removes the practical 8K
+vocabulary lock and releases most of the repeated PLE and optimizer-state budget
+for model width, depth, the shared base, or experts. At fixed target parameter
+count, that released budget must be redistributed by the planner rather than
+silently producing a smaller model.
+
+Implementation compatibility:
+
+- Add QR-PLE as a second explicitly selected PLE backend and retain the existing
+  fake-QAT backend only for loading and reproducing old bundles.
+- Introduce it with checkpoint format v7. Existing formats and stored
+  fingerprints keep their original parameter accounting and backend semantics;
+  QR-PLE checkpoints are scratch models rather than continuations of full-table
+  PLE checkpoints.
+- The planner must use backend-specific lookup formulas. Existing golden model
+  counts must remain unchanged for the legacy backend.
+- Before making QR-PLE the user-facing default, compare equal-total-parameter
+  10M configurations through the existing benchmark pipeline: legacy fake-QAT
+  PLE, QR-PLE with its freed budget redistributed, and a plain exact input
+  embedding with no later PLE. Training runs remain user-launched.
 
 ### C03. Position and context control
 
@@ -615,10 +633,11 @@ Interfaces still to specify:
 
 Use a final RMSNorm followed by an untied linear projection from model width to
 the tokenizer vocabulary, then ordinary softmax probabilities and next-token
-cross-entropy. Untied output weights are the simplest fit because C02 does not
-provide one conventional input embedding table to share. Tying or an
-expert-conditioned output head remains a later option rather than a prerequisite
-for the preliminary model.
+cross-entropy. QR-PLE now provides an exact conventional layer-0 input table, so
+weight tying is mechanically possible. Keep the output untied as the first
+experimental default so input identity and output classification capacity are
+not forced to share; tied weights and an expert-conditioned output head remain
+explicit comparison options.
 
 ### C12. Backward pass and optimizer state
 
@@ -874,6 +893,7 @@ composable as more ideas are added.
 | 2026-09-02 | Implemented physical request-level expert residency: full BF16 expert masters remain CPU-backed while coherent bounded expert rows are staged per layer on the accelerator, with transactional expansion/rollback, fixed-route bounds, checkpoint-independent caches, and placement/transfer telemetry. Added the single-device C12 CPU-offloaded FP32 Adam-moment lane with bounded accelerator update chunks. |
 | 2026-09-02 | Model-1 validation separated resident candidates `m` from per-token active experts `k`, restoring `2 <= k <= m` and the trained top-2 route. Cap sweeps through 20%, 30%, and 50% showed that prompt-global residency cannot preserve this checkpoint's diffuse routing; bounded training-time eligibility or token/layer-aware paging is now the required C13 follow-up. |
 | 2026-09-02 | Implemented C13 layer-local expert paging as the default inference policy: the router keeps all trained identities eligible, selected rows are tiled through a bounded CPU-backed accelerator cache, and Model 1 reproduced unrestricted logits, routes, and greedy output exactly with a two-row cache. Prompt-global NLL residency remains an experimental legacy comparison. |
+| 2026-09-03 | Replaced full-table fake-QAT PLE as the forward design with BF16 quotient/remainder PLE at layers 1..L-1, retained an exact BF16 layer-0 input table, removed the non-operative A/B label, and specified backend-aware planning plus an equal-parameter three-way evaluation. |
 
 ## Template for the next idea
 

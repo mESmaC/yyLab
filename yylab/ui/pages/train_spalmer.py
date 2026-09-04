@@ -26,12 +26,31 @@ from ..shell import ACCENT, panel, shell
 from .train_mole import corpus_options
 
 SPALMER_RUN_KIND = "spalmer_base"
-SPALMER_RECIPE_VERSION = 4
+SPALMER_RECIPE_VERSION = 5
 DEFAULT_SOURCE_SPLITS = ("train", "unspecified")
 PARAMETER_TARGETS = {
     "10M": 10_000_000,
     "50M": 50_000_000,
     "100M": 100_000_000,
+}
+# Per-layer embedding backends.  Legacy fake-QAT stays the default so existing
+# recipes, plans, and fingerprints are untouched; QR-PLE is an explicit choice.
+PLE_BACKENDS = {
+    "qr": "QR-PLE (BF16 compositional)",
+    "fake_qat": "Legacy fake-QAT PLE",
+}
+DEFAULT_PLE_BACKEND = "fake_qat"
+_PLE_BACKEND_NOTES = {
+    "qr": (
+        "QR-PLE: layer 0 keeps one exact BF16 input table; every later layer composes "
+        "quotient/remainder lanes in BF16 with no fake quantization. The freed budget goes "
+        "back into width, depth, and experts. QR checkpoints are scratch models (format v7) "
+        "and cannot continue a fake-QAT parent."
+    ),
+    "fake_qat": (
+        "Legacy PLE: every layer owns a wide four-bit fake-QAT lane table. Existing runs, "
+        "plans, and fingerprints are unchanged."
+    ),
 }
 
 
@@ -121,6 +140,45 @@ def _checkpoint_recurrence(row: Mapping[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+def _checkpoint_ple(row: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Read a checkpoint's PLE block from run-produced or scanner metadata.
+
+    Run-produced rows carry ``ple`` at the top of ``meta_json``; a scanned bundle
+    carries ``ple_backend`` there and ``model_config.ple_backend`` in its own
+    metadata. Bundles predating the key are legacy fake-QAT and yield ``None``.
+    """
+
+    meta: Any = row.get("meta_json", row) if isinstance(row, Mapping) else None
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta or "{}")
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(meta, Mapping):
+        return None
+    nested = meta.get("metadata")
+    candidates = (meta.get("ple"), nested.get("ple") if isinstance(nested, Mapping) else None)
+    for block in candidates:
+        if isinstance(block, Mapping) and block.get("backend"):
+            return dict(block)
+    model_config = meta.get("model_config")
+    backend = meta.get("ple_backend") or (
+        model_config.get("ple_backend") if isinstance(model_config, Mapping) else None
+    )
+    if backend:
+        return {"backend": str(backend)}
+    family = str(meta.get("model_family") or meta.get("family") or "").strip().casefold()
+    architecture = str(meta.get("architecture") or "").strip().casefold()
+    checkpoint_format = str(meta.get("checkpoint_format") or "").strip().casefold()
+    if (
+        family == "spalmer"
+        or architecture == "spalmer"
+        or checkpoint_format.startswith("spalmer.prototype.checkpoint")
+    ):
+        return {"backend": DEFAULT_PLE_BACKEND}
+    return None
+
+
 def _resolve_budget(
     *,
     token_budget: int,
@@ -162,6 +220,7 @@ def _cached_plan_json(
     target_parameters: int,
     vocab_size: int,
     expert_weight_format: str,
+    ple_backend: str,
     directional_enabled: bool,
     directional_groups: int,
     directional_rank: int,
@@ -223,6 +282,11 @@ def _cached_plan_json(
         if recurrence_enabled
         else None
     )
+    kwargs: dict[str, Any] = {}
+    if ple_backend != DEFAULT_PLE_BACKEND:
+        # Legacy previews keep the exact historical planner call so their
+        # fingerprints match every stored run; only QR-PLE names its backend.
+        kwargs["ple_backend"] = ple_backend
     plan = plan_configuration(
         target_parameters,
         vocab_size,
@@ -230,6 +294,7 @@ def _cached_plan_json(
         directional=directional,
         atxy=atxy,
         recurrence=recurrence,
+        **kwargs,
     )
     return json.dumps(plan.to_dict(), sort_keys=True, separators=(",", ":"))
 
@@ -242,6 +307,7 @@ def plan_spalmer_configuration(
     directional: dict[str, Any],
     atxy: dict[str, Any],
     recurrence: dict[str, Any] | None = None,
+    ple_backend: str = DEFAULT_PLE_BACKEND,
 ) -> dict[str, Any]:
     """Return a JSON-safe plan without constructing a model or allocating weights."""
 
@@ -253,6 +319,9 @@ def plan_spalmer_configuration(
         raise ValueError("preview vocabulary must be positive")
     if expert_weight_format not in {"mxfp4", "nvfp4"}:
         raise ValueError("expert weights must use MXFP4 or NVFP4")
+    backend = str(ple_backend or DEFAULT_PLE_BACKEND).strip().casefold()
+    if backend not in PLE_BACKENDS:
+        raise ValueError("PLE backend must be QR-PLE or legacy fake-QAT")
     directional_enabled = bool(directional.get("enabled"))
     atxy_enabled = bool(atxy.get("enabled"))
     recurrence_values = dict(recurrence or {})
@@ -261,6 +330,7 @@ def plan_spalmer_configuration(
         target,
         vocabulary,
         expert_weight_format,
+        backend,
         directional_enabled,
         int(directional.get("num_feature_groups") or 0) if directional_enabled else 4,
         int(directional.get("lateral_rank") or 0) if directional_enabled else 16,
@@ -408,6 +478,7 @@ def build_spalmer_run_config(
     backprop_depth: int | None = None,
     recurrence_sigma: float | None = None,
     parent_recurrent: bool = False,
+    ple_backend: str | None = None,
 ) -> dict[str, Any]:
     """Build the durable UI/worker boundary for one SPALMER scratch or continued run."""
 
@@ -418,6 +489,13 @@ def build_spalmer_run_config(
         raise ValueError(f"unsupported initialization mode: {initialization_mode!r}")
     continuing = mode == "checkpoint"
     parent_id = str(parent_checkpoint_id or "").strip()
+    if continuing and ple_backend is not None:
+        raise ValueError(
+            "continued SPALMER training inherits the PLE backend from the parent checkpoint"
+        )
+    resolved_ple_backend = str(ple_backend or DEFAULT_PLE_BACKEND).strip().casefold()
+    if resolved_ple_backend not in PLE_BACKENDS:
+        raise ValueError("PLE backend must be QR-PLE or legacy fake-QAT")
     if not name:
         raise ValueError("checkpoint name is required")
     if continuing and not parent_id:
@@ -445,6 +523,9 @@ def build_spalmer_run_config(
             raise ValueError("resolved SPALMER plan does not match the preview vocabulary")
         if str(planned_config.get("expert_weight_format") or "") != expert_weight_format:
             raise ValueError("resolved SPALMER plan does not match the expert weight format")
+        planned_ple_backend = str(planned_config.get("ple_backend") or DEFAULT_PLE_BACKEND)
+        if planned_ple_backend != resolved_ple_backend:
+            raise ValueError("resolved SPALMER plan does not match the PLE backend")
         fingerprint = str(resolved_plan.get("fingerprint") or "")
         if len(fingerprint) != 64:
             raise ValueError("resolved SPALMER plan is missing its fingerprint")
@@ -595,6 +676,7 @@ def build_spalmer_run_config(
         "require_fla": attention_backend != "reference",
         "allow_reference_attention": attention_backend == "reference",
         "expert_qat_backend": expert_qat_backend,
+        "ple_backend": resolved_ple_backend,
         "directional": dict(directional),
         "atxy": atxy_payload,
         "recurrence": (
@@ -690,8 +772,19 @@ def build_spalmer_run_config(
                 "expert_activation_format": "mxfp8",
                 "expert_master_dtype": "bfloat16",
                 "expert_qat_backend": expert_qat_backend,
-                "ple_quant_bits": 4,
-                "ple_stochastic_rounding": True,
+                **(
+                    {
+                        "ple_backend": "qr",
+                        "ple_parameter_dtype": "bfloat16",
+                        "ple_fake_quantization": False,
+                    }
+                    if resolved_ple_backend == "qr"
+                    else {
+                        "ple_backend": "fake_qat",
+                        "ple_quant_bits": 4,
+                        "ple_stochastic_rounding": True,
+                    }
+                ),
             },
         }
     return {
@@ -912,6 +1005,20 @@ def train_spalmer_page() -> None:
                             .props("dense outlined")
                             .classes("w-full")
                         )
+                    with field_grid(2):
+                        ple_backend_select = (
+                            ui.select(
+                                dict(PLE_BACKENDS),
+                                value=DEFAULT_PLE_BACKEND,
+                                label="PLE backend",
+                            )
+                            .props("dense outlined")
+                            .classes("w-full")
+                        )
+                        ple_backend_note = ui.label("").classes(
+                            "text-xs text-gray-400 px-3 py-2 rounded-md w-full"
+                        )
+                        ple_backend_note.style(f"background: {ACCENT}10")
                     with field_grid(2):
                         attention_backend = (
                             ui.select(
@@ -1280,12 +1387,13 @@ def train_spalmer_page() -> None:
                     ui.label(
                         "Only routed-expert forwards are W4A8: MXFP4 or NVFP4 weights and MXFP8 "
                         "activations. Persistent parameters and gradients are BF16; Adam moments "
-                        "remain FP32. PLE uses four-bit stochastic fake quantization."
+                        "remain FP32. Legacy PLE uses four-bit stochastic fake quantization; "
+                        "QR-PLE keeps its exact input table and codebooks in BF16."
                     ).classes("text-sm text-gray-300")
                     ui.label(
-                        "The current QAT lane is format-faithful fake quantize/dequantize with a BF16 "
-                        "straight-through backward. Native packed mixed W4A8 is shown unavailable until "
-                        "SPALMER actually supplies that kernel."
+                        "The current routed-expert QAT lane is format-faithful fake "
+                        "quantize/dequantize with a BF16 straight-through backward. Native packed "
+                        "mixed W4A8 is shown unavailable until SPALMER supplies that kernel."
                     ).classes("text-xs text-amber-300 mt-2")
 
         def current_directional() -> dict[str, Any]:
@@ -1314,6 +1422,9 @@ def train_spalmer_page() -> None:
                 "default_steps": int(recurrence_default_steps.value or 8),
                 "latent_init_std": 1.0,
             }
+
+        def current_ple_backend() -> str:
+            return str(ple_backend_select.value or DEFAULT_PLE_BACKEND)
 
         def requested_target() -> int:
             return _resolve_target(str(target_scale.value or "10M"), custom_target.value)
@@ -1362,6 +1473,11 @@ def train_spalmer_page() -> None:
 
         def update_target_controls() -> None:
             custom_target.visible = target_scale.value == "custom"
+            update_plan_preview()
+
+        def update_ple_backend_controls() -> None:
+            backend = current_ple_backend()
+            ple_backend_note.text = _PLE_BACKEND_NOTES.get(backend, "")
             update_plan_preview()
 
         def update_directional_controls() -> None:
@@ -1444,6 +1560,18 @@ def train_spalmer_page() -> None:
                         f"parameters · d={int(parent.get('hidden_size') or 0):,} · "
                         f"{int(parent.get('num_layers') or 0)} layers"
                     ).classes("text-sm text-gray-200")
+                    inherited_ple = _checkpoint_ple(parent)
+                    if inherited_ple:
+                        backend = str(inherited_ple.get("backend") or DEFAULT_PLE_BACKEND)
+                        detail = PLE_BACKENDS.get(backend, backend)
+                        if backend == "qr":
+                            exact = int(inherited_ple.get("exact_input_parameters") or 0)
+                            refresh = int(inherited_ple.get("qr_refresh_parameters") or 0)
+                            detail += (
+                                f" · exact input {_format_parameters(exact)}"
+                                f" · QR refresh {_format_parameters(refresh)}"
+                            )
+                        ui.label(f"PLE backend: {detail}").classes("text-sm text-cyan-200")
                     inherited_recurrence = _checkpoint_recurrence(parent)
                     if inherited_recurrence:
                         steps = int(inherited_recurrence.get("default_steps") or 0)
@@ -1468,6 +1596,7 @@ def train_spalmer_page() -> None:
                         directional=current_directional(),
                         atxy=current_atxy(),
                         recurrence=current_recurrence(),
+                        ple_backend=current_ple_backend(),
                     )
                 except (RuntimeError, TypeError, ValueError) as exc:
                     ui.label(str(exc)).classes("text-sm text-red-300")
@@ -1486,12 +1615,29 @@ def train_spalmer_page() -> None:
                     ui.badge(
                         f"error {error:+,} ({relative_error:+.2%})"
                     ).props(f"outline color={error_color}")
+                ple_plan = plan.get("ple") if isinstance(plan.get("ple"), Mapping) else None
+                ple_label = (
+                    f"QR-PLE · {int(config['ple_expansion'])} lanes"
+                    if ple_plan is not None
+                    else f"fake-QAT PLE ×{int(config['ple_expansion'])}"
+                )
                 ui.label(
                     f"d={int(config['d_model']):,} · {int(config['n_layers'])} layers · "
                     f"{int(config['num_heads'])} heads × "
                     f"{int(config['d_model']) // int(config['num_heads'])} · "
-                    f"PLE ×{int(config['ple_expansion'])}"
+                    f"{ple_label}"
                 ).classes("text-sm text-gray-200")
+                if ple_plan is not None:
+                    moduli = ", ".join(str(int(value)) for value in ple_plan.get("moduli") or [])
+                    exact = int(ple_plan.get("exact_input_parameters") or 0)
+                    refresh = int(ple_plan.get("qr_refresh_parameters") or 0)
+                    ple_total = int(ple_plan.get("total_parameters") or 0)
+                    ui.label(
+                        f"QR-PLE: exact BF16 input {_format_parameters(exact)} · refresh "
+                        f"codebooks {_format_parameters(refresh)} on "
+                        f"{max(int(config['n_layers']) - 1, 0)} layers · lane moduli {moduli} · "
+                        f"PLE total {_format_parameters(ple_total)}"
+                    ).classes("text-sm text-cyan-200")
                 ui.label(
                     f"200 experts × width {int(config['expert_width'])} · shared width "
                     f"{int(config['shared_width']):,} · KDA {int(config['n_layers']) * 3 // 4} / "
@@ -1524,9 +1670,19 @@ def train_spalmer_page() -> None:
                     f"BF16-master reference persistent state: "
                     f"{float(memory['reference_training_gib']):.3f} GiB; activations are not included."
                 ).classes("text-xs text-gray-400")
+                ple_rows: list[tuple[str, int]] = [
+                    ("PLE total", int(parameters["ple_lookup"]) + int(parameters["ple_controls"])),
+                ]
+                if ple_plan is not None:
+                    ple_rows.extend(
+                        (
+                            ("PLE exact input", int(ple_plan.get("exact_input_parameters") or 0)),
+                            ("PLE QR refresh", int(ple_plan.get("qr_refresh_parameters") or 0)),
+                        )
+                    )
                 with ui.grid(columns=3).classes("w-full gap-x-4 gap-y-1"):
                     for label, value in (
-                        ("PLE", int(parameters["ple_lookup"]) + int(parameters["ple_controls"])),
+                        *ple_rows,
                         (
                             "Attention",
                             int(parameters["kda_mixers"]) + int(parameters["mla_mixers"]),
@@ -1665,6 +1821,7 @@ def train_spalmer_page() -> None:
                         directional=current_directional(),
                         atxy=current_atxy(),
                         recurrence=current_recurrence(),
+                        ple_backend=current_ple_backend(),
                     )
                 checkpoint_id = db.new_id("ckpt")
                 config = build_spalmer_run_config(
@@ -1726,6 +1883,7 @@ def train_spalmer_page() -> None:
                         float(recurrence_sigma.value or 0) if recurrent_run() else None
                     ),
                     parent_recurrent=bool(inherited_recurrence),
+                    ple_backend=None if continuing() else current_ple_backend(),
                 )
             except (RuntimeError, TypeError, ValueError) as exc:
                 ui.notify(str(exc), type="negative", multi_line=True)
@@ -1812,6 +1970,7 @@ def train_spalmer_page() -> None:
         )
         attention_backend.on_value_change(lambda _: update_backend_status())
         expert_qat_backend.on_value_change(lambda _: update_backend_status())
+        ple_backend_select.on_value_change(lambda _: update_ple_backend_controls())
         directional_enabled.on_value_change(lambda _: update_directional_controls())
         atxy_enabled.on_value_change(lambda _: update_atxy_controls())
         recurrence_enabled.on_value_change(lambda _: update_recurrence_controls())
@@ -1844,6 +2003,7 @@ def train_spalmer_page() -> None:
         epochs.on_value_change(lambda _: update_budget_summary())
 
         update_target_controls()
+        update_ple_backend_controls()
         update_directional_controls()
         update_atxy_controls()
         update_recurrence_controls()
