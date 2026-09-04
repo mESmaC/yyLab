@@ -5,6 +5,7 @@ import importlib.metadata
 import os
 import platform
 import threading
+import weakref
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -45,14 +46,32 @@ _DLL: ctypes.WinDLL | ctypes.CDLL | None = None
 _DLL_DIR_HANDLES: list[object] = []
 _HANDLES: dict[int, _DeviceHandle] = {}
 _EXECUTION_CACHE: dict[tuple[int, int, int, int, int], _ExecutionResources] = {}
+_COMPRESSED_WEIGHT_CACHE: dict[
+    tuple[int, int, int, int, int, int], _CompressedWeight
+] = {}
 _MAX_CACHED_PLANS = 64
-_STATUS_CACHE: tuple[bool, str] | None = None
+_STATUS_CACHE: dict[int, tuple[bool, str]] = {}
+_MXFP8_STATUS_CACHE: dict[int, tuple[bool, str]] = {}
 
 
 def _ceil_multiple(value: int, multiple: int) -> int:
     if value < 1:
         raise ValueError("NVFP4 GEMM dimensions must be positive")
     return ((value + multiple - 1) // multiple) * multiple
+
+
+def _resolved_cuda_index(
+    device: str | torch.device | None = None,
+) -> tuple[int | None, str]:
+    if not torch.cuda.is_available():
+        return None, "CUDA is unavailable"
+    resolved = torch.device(device if device is not None else "cuda")
+    if resolved.type != "cuda":
+        return None, f"sparse NVFP4 requires CUDA, got {resolved}"
+    index = torch.cuda.current_device() if resolved.index is None else int(resolved.index)
+    if index < 0 or index >= torch.cuda.device_count():
+        return None, f"CUDA device index {index} is unavailable"
+    return index, ""
 
 
 @dataclass(frozen=True)
@@ -266,9 +285,7 @@ def _device_handle(device_index: int) -> _DeviceHandle:
         return result
 
 
-def paired_4to8(value: torch.Tensor) -> torch.Tensor:
-    """Apply deterministic two-pair-per-eight magnitude sparsity along K."""
-
+def _paired_4to8_mask(value: torch.Tensor) -> torch.Tensor:
     if value.ndim != 2:
         raise ValueError(f"paired 4:8 weights must be 2-D, got shape {tuple(value.shape)}")
     if value.shape[-1] % 8:
@@ -278,7 +295,13 @@ def paired_4to8(value: torch.Tensor) -> torch.Tensor:
     selected = pair_scores.topk(2, dim=-1, largest=True, sorted=False).indices
     pair_mask = torch.zeros_like(pair_scores, dtype=torch.bool)
     pair_mask.scatter_(1, selected, True)
-    return value * pair_mask.unsqueeze(-1).expand_as(groups).reshape_as(value)
+    return pair_mask.unsqueeze(-1).expand_as(groups).reshape_as(value)
+
+
+def paired_4to8(value: torch.Tensor) -> torch.Tensor:
+    """Apply deterministic two-pair-per-eight magnitude sparsity along K."""
+
+    return value * _paired_4to8_mask(value)
 
 
 def _padded_paired_weight(value: torch.Tensor, padded_k: int) -> torch.Tensor:
@@ -291,6 +314,18 @@ def _padded_paired_weight(value: torch.Tensor, padded_k: int) -> torch.Tensor:
     )
     padded[:, : value.shape[1]] = value
     return paired_4to8(padded)
+
+
+def _effective_weight_and_mask(
+    value: torch.Tensor,
+    padded_k: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    padded = torch.zeros(
+        (value.shape[0], padded_k), device=value.device, dtype=value.dtype
+    )
+    padded[:, : value.shape[1]] = value
+    mask = _paired_4to8_mask(padded)[:, : value.shape[1]]
+    return value * mask, mask
 
 
 def _quantize_group32(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -514,6 +549,54 @@ class _ExecutionResources:
     workspace: torch.Tensor
 
 
+@dataclass
+class _CompressedWeight:
+    """Compressed native payload tied to one immutable parameter version."""
+
+    source: weakref.ReferenceType[torch.Tensor]
+    source_version: int
+    source_data_ptr: int
+    source_shape: tuple[int, ...]
+    source_stride: tuple[int, ...]
+    source_dtype: torch.dtype
+    source_device: torch.device
+    scales: torch.Tensor
+    global_scale: torch.Tensor
+    compressed: torch.Tensor
+
+
+def _compressed_weight_key(
+    source: torch.Tensor,
+    device_index: int,
+    stream_value: int,
+    shape: _PaddedShape,
+) -> tuple[int, int, int, int, int, int]:
+    return (
+        id(source),
+        device_index,
+        stream_value,
+        shape.padded_m,
+        shape.padded_n,
+        shape.padded_k,
+    )
+
+
+def _valid_compressed_weight(
+    cached: _CompressedWeight | None,
+    source: torch.Tensor,
+) -> bool:
+    return bool(
+        cached is not None
+        and cached.source() is source
+        and cached.source_version == int(source._version)
+        and cached.source_data_ptr == source.data_ptr()
+        and cached.source_shape == tuple(source.shape)
+        and cached.source_stride == tuple(source.stride())
+        and cached.source_dtype == source.dtype
+        and cached.source_device == source.device
+    )
+
+
 def _new_execution_resources(
     handle: _DeviceHandle,
     shape: _PaddedShape,
@@ -575,18 +658,25 @@ def _execution_resources(
 
 
 def clear_sparse_nvfp4_cache() -> None:
-    """Synchronize and destroy cached plans, scales, and device work buffers."""
+    """Synchronize and destroy cached plans and compressed weight payloads."""
 
     with _DLL_LOCK:
         devices = {key[0] for key in _EXECUTION_CACHE}
+        devices.update(key[1] for key in _COMPRESSED_WEIGHT_CACHE)
         for device_index in devices:
             torch.cuda.synchronize(device_index)
         for resources in _EXECUTION_CACHE.values():
             resources.plan.close()
         _EXECUTION_CACHE.clear()
+        _COMPRESSED_WEIGHT_CACHE.clear()
 
 
-def sparse_nvfp4_forward(input: torch.Tensor, paired_weight: torch.Tensor) -> torch.Tensor:
+def sparse_nvfp4_forward(
+    input: torch.Tensor,
+    paired_weight: torch.Tensor,
+    *,
+    _weight_source: torch.Tensor | None = None,
+) -> torch.Tensor:
     """Run a compressed paired-4:8 E2M1 forward GEMM and return BF16 output.
 
     ``input`` is ``[M, K]`` and ``paired_weight`` is ``[N, K]``. The weight is
@@ -606,6 +696,13 @@ def sparse_nvfp4_forward(input: torch.Tensor, paired_weight: torch.Tensor) -> to
         raise ValueError("sparse NVFP4 forward requires CUDA tensors")
     if input.device != paired_weight.device:
         raise ValueError("input and weight must be on the same CUDA device")
+    if _weight_source is not None:
+        if (
+            _weight_source.shape != paired_weight.shape
+            or _weight_source.dtype != paired_weight.dtype
+            or _weight_source.device != paired_weight.device
+        ):
+            raise ValueError("compressed-weight cache source must match the effective weight")
     m, k = input.shape
     n = paired_weight.shape[0]
     shape = _padded_shape(m, n, k)
@@ -622,27 +719,51 @@ def sparse_nvfp4_forward(input: torch.Tensor, paired_weight: torch.Tensor) -> to
             (shape.padded_m, shape.padded_k), device=device, dtype=torch.bfloat16
         )
         input_padded[:m, :k] = input
-        paired_rows = _padded_paired_weight(paired_weight, shape.padded_k)
-        weight_padded = torch.zeros(
-            (shape.padded_n, shape.padded_k), device=device, dtype=torch.bfloat16
-        )
-        weight_padded[:n] = paired_rows
-
-        packed_weight, weight_scales, weight_global = _quantize_group32(weight_padded)
         packed_input, input_scales, input_global = _quantize_group32(input_padded)
-        alpha = torch.full(
-            (max(shape.padded_m, shape.padded_n),),
-            1.0,
-            device=device,
-            dtype=torch.float32,
-        ) * (weight_global * input_global)
-        output = torch.zeros(
-            (shape.padded_m, shape.padded_n), device=device, dtype=torch.bfloat16
-        )
         stream_value = int(torch.cuda.current_stream(device).cuda_stream)
         stream = ctypes.c_void_p(stream_value)
         stream_array = (ctypes.c_void_p * 1)(stream)
         handle = _device_handle(device_index)
+
+        weight_cache_key = None
+        cached_weight = None
+        source_version = None
+        execution_key = (
+            device_index,
+            stream_value,
+            shape.padded_m,
+            shape.padded_n,
+            shape.padded_k,
+        )
+        persistent_plan = (
+            execution_key in _EXECUTION_CACHE
+            or len(_EXECUTION_CACHE) < _MAX_CACHED_PLANS
+        )
+        if _weight_source is not None and persistent_plan:
+            source_version = int(_weight_source._version)
+            weight_cache_key = _compressed_weight_key(
+                _weight_source,
+                device_index,
+                stream_value,
+                shape,
+            )
+            candidate = _COMPRESSED_WEIGHT_CACHE.get(weight_cache_key)
+            if _valid_compressed_weight(candidate, _weight_source):
+                cached_weight = candidate
+
+        packed_weight = None
+        if cached_weight is None:
+            paired_rows = _padded_paired_weight(paired_weight, shape.padded_k)
+            weight_padded = torch.zeros(
+                (shape.padded_n, shape.padded_k),
+                device=device,
+                dtype=torch.bfloat16,
+            )
+            weight_padded[:n] = paired_rows
+            packed_weight, weight_scales, weight_global = _quantize_group32(weight_padded)
+        else:
+            weight_scales = cached_weight.scales
+            weight_global = cached_weight.global_scale
 
         resources, ephemeral_resources = _execution_resources(
             handle,
@@ -654,36 +775,79 @@ def sparse_nvfp4_forward(input: torch.Tensor, paired_weight: torch.Tensor) -> to
             device,
         )
         plan = resources.plan
+        compressed_weight = (
+            cached_weight.compressed if cached_weight is not None else resources.compressed
+        )
         try:
             library = plan.library
-            _check(
-                library.cusparseLtSpMMAPrune(
-                    handle.state.ptr,
-                    plan.matmul.ptr,
-                    _pointer(packed_weight),
-                    _pointer(packed_weight),
-                    _CUSPARSELT_PRUNE_SPMMA_STRIP,
-                    stream,
-                ),
-                "cusparseLtSpMMAPrune",
-            )
-            _check(
-                library.cusparseLtSpMMACompress(
-                    handle.state.ptr,
-                    plan.plan.ptr,
-                    _pointer(packed_weight),
-                    _pointer(resources.compressed),
-                    _pointer(resources.compress_buffer),
-                    stream,
-                ),
-                "cusparseLtSpMMACompress",
+            if cached_weight is None:
+                if packed_weight is None:
+                    raise SparseNVFP4Error("missing packed weight on compressed-cache miss")
+                if weight_cache_key is not None:
+                    # Allocate before replacing a stale entry. On a given cache
+                    # key this is the same CUDA stream, so queued use of the old
+                    # payload precedes compression into the new allocation.
+                    compressed_weight = _device_buffer(plan.compressed_size, device)
+                _check(
+                    library.cusparseLtSpMMAPrune(
+                        handle.state.ptr,
+                        plan.matmul.ptr,
+                        _pointer(packed_weight),
+                        _pointer(packed_weight),
+                        _CUSPARSELT_PRUNE_SPMMA_STRIP,
+                        stream,
+                    ),
+                    "cusparseLtSpMMAPrune",
+                )
+                _check(
+                    library.cusparseLtSpMMACompress(
+                        handle.state.ptr,
+                        plan.plan.ptr,
+                        _pointer(packed_weight),
+                        _pointer(compressed_weight),
+                        _pointer(resources.compress_buffer),
+                        stream,
+                    ),
+                    "cusparseLtSpMMACompress",
+                )
+                if weight_cache_key is not None and _weight_source is not None:
+                    if source_version is None:
+                        raise SparseNVFP4Error("missing compressed-weight source version")
+                    _COMPRESSED_WEIGHT_CACHE[weight_cache_key] = _CompressedWeight(
+                        source=weakref.ref(_weight_source),
+                        source_version=source_version,
+                        source_data_ptr=_weight_source.data_ptr(),
+                        source_shape=tuple(_weight_source.shape),
+                        source_stride=tuple(_weight_source.stride()),
+                        source_dtype=_weight_source.dtype,
+                        source_device=_weight_source.device,
+                        scales=weight_scales,
+                        global_scale=weight_global,
+                        compressed=compressed_weight,
+                    )
+                    if int(_weight_source._version) != source_version:
+                        _COMPRESSED_WEIGHT_CACHE.pop(weight_cache_key, None)
+                        raise SparseNVFP4Error(
+                            "weight changed while its compressed NVFP4 payload was being built"
+                        )
+
+            alpha = torch.full(
+                (max(shape.padded_m, shape.padded_n),),
+                1.0,
+                device=device,
+                dtype=torch.float32,
+            ) * (weight_global * input_global)
+            output = torch.zeros(
+                (shape.padded_m, shape.padded_n),
+                device=device,
+                dtype=torch.bfloat16,
             )
             _check(
                 library.cusparseLtMatmul(
                     handle.state.ptr,
                     plan.plan.ptr,
                     _pointer(alpha),
-                    _pointer(resources.compressed),
+                    _pointer(compressed_weight),
                     _pointer(packed_input),
                     ctypes.c_void_p(),
                     _pointer(output),
@@ -714,9 +878,13 @@ class _SparseNVFP4Linear(torch.autograd.Function):
         original_shape = input.shape
         flat_input = input.reshape(-1, input.shape[-1])
         padded_k = _ceil_multiple(weight.shape[1], 64)
-        sparse_weight = _padded_paired_weight(weight, padded_k)[:, : weight.shape[1]]
-        output = sparse_nvfp4_forward(flat_input, sparse_weight)
-        ctx.save_for_backward(flat_input, sparse_weight)
+        sparse_weight, sparse_mask = _effective_weight_and_mask(weight, padded_k)
+        output = sparse_nvfp4_forward(
+            flat_input,
+            sparse_weight,
+            _weight_source=weight,
+        )
+        ctx.save_for_backward(flat_input, sparse_weight, sparse_mask)
         ctx.input_shape = original_shape
         ctx.has_bias = bias is not None
         ctx.backward_precision = backward_precision
@@ -728,7 +896,7 @@ class _SparseNVFP4Linear(torch.autograd.Function):
     @staticmethod
     @torch.amp.custom_bwd(device_type="cuda")
     def backward(ctx: object, grad_output: torch.Tensor):
-        input, sparse_weight = ctx.saved_tensors
+        input, sparse_weight, sparse_mask = ctx.saved_tensors
         grad_flat = grad_output.reshape(-1, grad_output.shape[-1])
         if ctx.backward_precision == "mxfp8":
             from .mxfp8 import mxfp8_linear_backward
@@ -743,6 +911,10 @@ class _SparseNVFP4Linear(torch.autograd.Function):
         else:
             grad_input = grad_flat.mm(sparse_weight).reshape(ctx.input_shape)
             grad_weight = grad_flat.t().mm(input)
+        # The hard 4:8 choice is part of the executed operator.  Pruned
+        # coefficients therefore receive no gradient; returning the dense
+        # wgrad here would silently reintroduce a straight-through mask.
+        grad_weight = grad_weight * sparse_mask
         grad_bias = grad_flat.sum(dim=0) if ctx.has_bias else None
         return grad_input, grad_weight, grad_bias, None, None
 
@@ -753,7 +925,7 @@ def sparse_nvfp4_linear(
     bias: torch.Tensor | None = None,
     *,
     backward_precision: str = "bf16",
-    backward_backend: str = "emulated",
+    backward_backend: str = "none",
 ) -> torch.Tensor:
     """Autograd wrapper around the compressed sparse NVFP4 forward primitive."""
 
@@ -765,6 +937,17 @@ def sparse_nvfp4_linear(
         raise ValueError("sparse NVFP4 linear input and weight K dimensions must match")
     if backward_precision not in {"bf16", "mxfp8"}:
         raise ValueError(f"unknown sparse NVFP4 backward precision: {backward_precision}")
+    if backward_precision == "bf16":
+        if backward_backend != "none":
+            raise ValueError("BF16 backward does not use a low-precision backend")
+    else:
+        from .mxfp8 import NATIVE_MXFP8_BACKEND
+
+        if backward_backend not in {"native", NATIVE_MXFP8_BACKEND}:
+            raise ValueError(
+                f"MXFP8 backward requires {NATIVE_MXFP8_BACKEND!r}, "
+                f"got {backward_backend!r}"
+            )
     if bias is not None:
         if bias.shape != (weight.shape[0],):
             raise ValueError(f"bias must have shape {(weight.shape[0],)}, got {tuple(bias.shape)}")
@@ -779,16 +962,23 @@ def sparse_nvfp4_linear(
     )
 
 
-def sparse_nvfp4_status(*, force_refresh: bool = False) -> tuple[bool, str]:
+def sparse_nvfp4_status(
+    device: str | torch.device | None = None,
+    *,
+    force_refresh: bool = False,
+) -> tuple[bool, str]:
     """Report availability only after a real compressed sparse FP4 smoke GEMM."""
 
-    global _STATUS_CACHE
-    if _STATUS_CACHE is not None and not force_refresh:
-        return _STATUS_CACHE
+    device_index, unavailable = _resolved_cuda_index(device)
+    if device_index is None:
+        return False, unavailable
+    resolved = torch.device("cuda", device_index)
+    if force_refresh:
+        _STATUS_CACHE.pop(device_index, None)
+    if device_index in _STATUS_CACHE:
+        return _STATUS_CACHE[device_index]
     try:
-        if not torch.cuda.is_available():
-            raise SparseNVFP4Error("CUDA is unavailable")
-        capability = torch.cuda.get_device_capability()
+        capability = torch.cuda.get_device_capability(device_index)
         if capability != (12, 0):
             raise SparseNVFP4Error(
                 f"the validated backend requires SM120, found SM{capability[0]}{capability[1]}"
@@ -797,13 +987,25 @@ def sparse_nvfp4_status(*, force_refresh: bool = False) -> tuple[bool, str]:
         generator = torch.Generator(device="cpu").manual_seed(120)
         input_cpu = torch.randn((19, 47), generator=generator, dtype=torch.float32) * 0.25
         weight_cpu = torch.randn((35, 47), generator=generator, dtype=torch.float32) * 0.25
-        input = input_cpu.to(device="cuda", dtype=torch.bfloat16)
-        weight = weight_cpu.to(device="cuda", dtype=torch.bfloat16)
-        sparse_weight = _padded_paired_weight(
-            weight, _ceil_multiple(weight.shape[1], 64)
-        )[:, : weight.shape[1]]
-        with torch.no_grad():
-            output = sparse_nvfp4_forward(input, sparse_weight)
+        grad_cpu = torch.randn((19, 35), generator=generator, dtype=torch.float32) * 0.25
+        with torch.cuda.device(resolved), torch.inference_mode(False), torch.enable_grad():
+            input = input_cpu.to(device=resolved, dtype=torch.bfloat16).requires_grad_(True)
+            weight = weight_cpu.to(device=resolved, dtype=torch.bfloat16).requires_grad_(True)
+            grad_output = grad_cpu.to(device=resolved, dtype=torch.bfloat16)
+            sparse_weight, sparse_mask = _effective_weight_and_mask(
+                weight.detach(), _ceil_multiple(weight.shape[1], 64)
+            )
+            output = sparse_nvfp4_linear(
+                input,
+                weight,
+                backward_precision="bf16",
+                backward_backend="none",
+            )
+            grad_input, grad_weight = torch.autograd.grad(
+                output,
+                (input, weight),
+                grad_outputs=grad_output,
+            )
         torch.cuda.synchronize(input.device)
         if output.dtype != torch.bfloat16 or output.shape != (19, 35):
             raise SparseNVFP4Error(
@@ -811,32 +1013,176 @@ def sparse_nvfp4_status(*, force_refresh: bool = False) -> tuple[bool, str]:
             )
         if not bool(torch.isfinite(output).all()) or not bool(output.abs().max() > 0):
             raise SparseNVFP4Error("smoke GEMM returned zero or non-finite output")
-        reference = input.float().mm(sparse_weight.float().t())
-        error = (output.float() - reference).norm() / reference.norm().clamp_min(1e-12)
+        for label, gradient in (("dgrad", grad_input), ("wgrad", grad_weight)):
+            if not bool(torch.isfinite(gradient).all()) or not bool(gradient.abs().max() > 0):
+                raise SparseNVFP4Error(
+                    f"smoke autograd returned zero or non-finite {label}"
+                )
+        reference = input.detach().float().mm(sparse_weight.float().t())
+        error = (
+            (output.detach().float() - reference).norm()
+            / reference.norm().clamp_min(1e-12)
+        )
+        reference_dgrad = grad_output.float().mm(sparse_weight.float())
+        reference_wgrad = grad_output.float().t().mm(input.detach().float())
+        reference_wgrad.mul_(sparse_mask)
+        dgrad_error = (
+            (grad_input.float() - reference_dgrad).norm()
+            / reference_dgrad.norm().clamp_min(1e-12)
+        )
+        wgrad_error = (
+            (grad_weight.float() - reference_wgrad).norm()
+            / reference_wgrad.norm().clamp_min(1e-12)
+        )
         if not bool(torch.isfinite(error)) or float(error) > 0.55:
             raise SparseNVFP4Error(
                 f"smoke GEMM normalized error is too large ({float(error):.4f})"
             )
-        runtime_version = _device_handle(torch.cuda.current_device()).version
-        _STATUS_CACHE = (
+        if (
+            not bool(torch.isfinite(dgrad_error))
+            or not bool(torch.isfinite(wgrad_error))
+            or float(dgrad_error) > 0.02
+            or float(wgrad_error) > 0.02
+        ):
+            raise SparseNVFP4Error(
+                "BF16 backward normalized error is too large: "
+                f"dgrad={float(dgrad_error):.4f}, wgrad={float(wgrad_error):.4f}"
+            )
+        runtime_version = _device_handle(device_index).version
+        _STATUS_CACHE[device_index] = (
             True,
             f"SM120 compressed paired-4:8 E2M1 via cuSPARSELt {package_version} "
-            f"(runtime {runtime_version}); BF16 output; smoke error={float(error):.4f}",
+            f"(runtime {runtime_version}); native sparse NVFP4 forward + BF16 "
+            f"backward passed (forward/dgrad/wgrad relative error "
+            f"{float(error):.4f}/{float(dgrad_error):.4f}/{float(wgrad_error):.4f})",
         )
     except Exception as exc:
-        _STATUS_CACHE = (False, f"cuSPARSELt sparse NVFP4 smoke failed: {exc}")
-    return _STATUS_CACHE
+        _STATUS_CACHE[device_index] = (
+            False,
+            f"cuSPARSELt sparse NVFP4 smoke failed: {exc}",
+        )
+    return _STATUS_CACHE[device_index]
 
 
-def sparse_nvfp4_capability_status() -> tuple[bool, str]:
+def sparse_nvfp4_mxfp8_status(
+    device: str | torch.device | None = None,
+    *,
+    force_refresh: bool = False,
+) -> tuple[bool, str]:
+    """Validate the exact compressed-NVFP4-forward/MXFP8-backward path."""
+
+    device_index, unavailable = _resolved_cuda_index(device)
+    if device_index is None:
+        return False, unavailable
+    resolved = torch.device("cuda", device_index)
+    if force_refresh:
+        _MXFP8_STATUS_CACHE.pop(device_index, None)
+    if device_index in _MXFP8_STATUS_CACHE:
+        return _MXFP8_STATUS_CACHE[device_index]
+    try:
+        from .mxfp8 import native_mxfp8_status
+
+        mxfp8_available, mxfp8_note = native_mxfp8_status(
+            resolved,
+            force_refresh=force_refresh,
+        )
+        if not mxfp8_available:
+            raise SparseNVFP4Error(mxfp8_note)
+        sparse_available, sparse_note = sparse_nvfp4_status(
+            resolved,
+            force_refresh=force_refresh,
+        )
+        if not sparse_available:
+            raise SparseNVFP4Error(sparse_note)
+
+        generator = torch.Generator(device="cpu").manual_seed(8120)
+        input = (
+            torch.randn((19, 47), generator=generator, dtype=torch.float32)
+            .mul(0.25)
+            .to(device=resolved, dtype=torch.bfloat16)
+            .requires_grad_(True)
+        )
+        weight = (
+            torch.randn((35, 47), generator=generator, dtype=torch.float32)
+            .mul(0.25)
+            .to(device=resolved, dtype=torch.bfloat16)
+            .requires_grad_(True)
+        )
+        grad_output = (
+            torch.randn((19, 35), generator=generator, dtype=torch.float32)
+            .mul(0.25)
+            .to(device=resolved, dtype=torch.bfloat16)
+        )
+        sparse_weight, sparse_mask = _effective_weight_and_mask(weight.detach(), 64)
+        output = sparse_nvfp4_linear(
+            input,
+            weight,
+            backward_precision="mxfp8",
+            backward_backend="native",
+        )
+        grad_input, grad_weight = torch.autograd.grad(
+            output,
+            (input, weight),
+            grad_outputs=grad_output,
+        )
+        torch.cuda.synchronize(input.device)
+
+        reference = input.detach().float().mm(sparse_weight.float().t())
+        reference_dgrad = grad_output.float().mm(sparse_weight.float())
+        reference_wgrad = grad_output.float().t().mm(input.detach().float())
+        reference_wgrad.mul_(sparse_mask)
+        forward_error = (
+            (output.detach().float() - reference).norm()
+            / reference.norm().clamp_min(1e-12)
+        )
+        dgrad_error = (
+            (grad_input.float() - reference_dgrad).norm()
+            / reference_dgrad.norm().clamp_min(1e-12)
+        )
+        wgrad_error = (
+            (grad_weight.float() - reference_wgrad).norm()
+            / reference_wgrad.norm().clamp_min(1e-12)
+        )
+        if (
+            not bool(torch.isfinite(forward_error))
+            or not bool(torch.isfinite(dgrad_error))
+            or not bool(torch.isfinite(wgrad_error))
+            or float(forward_error) > 0.55
+            or float(dgrad_error) > 0.15
+            or float(wgrad_error) > 0.15
+        ):
+            raise SparseNVFP4Error(
+                "combined autograd relative error is too large: "
+                f"forward={float(forward_error):.4f}, "
+                f"dgrad={float(dgrad_error):.4f}, wgrad={float(wgrad_error):.4f}"
+            )
+        _MXFP8_STATUS_CACHE[device_index] = (
+            True,
+            "native compressed sparse NVFP4 forward + MXFP8 dgrad/wgrad passed "
+            "(forward/dgrad/wgrad relative error "
+            f"{float(forward_error):.4f}/{float(dgrad_error):.4f}/"
+            f"{float(wgrad_error):.4f})",
+        )
+    except Exception as exc:
+        _MXFP8_STATUS_CACHE[device_index] = (
+            False,
+            f"combined sparse NVFP4 + MXFP8 autograd smoke failed: {exc}",
+        )
+    return _MXFP8_STATUS_CACHE[device_index]
+
+
+def sparse_nvfp4_capability_status(
+    device: str | torch.device | None = None,
+) -> tuple[bool, str]:
     """Cheap server-side preflight; workers still run the real GEMM smoke."""
 
     try:
         if platform.system() != "Windows":
             raise SparseNVFP4Error("the current ctypes integration targets Windows")
-        if not torch.cuda.is_available():
-            raise SparseNVFP4Error("CUDA is unavailable")
-        capability = torch.cuda.get_device_capability()
+        device_index, unavailable = _resolved_cuda_index(device)
+        if device_index is None:
+            raise SparseNVFP4Error(unavailable)
+        capability = torch.cuda.get_device_capability(device_index)
         if capability != (12, 0):
             raise SparseNVFP4Error(
                 f"the validated backend requires SM120, found SM{capability[0]}{capability[1]}"
@@ -860,6 +1206,7 @@ __all__ = [
     "paired_4to8",
     "sparse_nvfp4_forward",
     "sparse_nvfp4_linear",
+    "sparse_nvfp4_mxfp8_status",
     "sparse_nvfp4_capability_status",
     "sparse_nvfp4_status",
 ]

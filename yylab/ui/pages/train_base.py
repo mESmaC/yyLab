@@ -8,11 +8,20 @@ from nicegui import ui
 
 from ... import db
 from ...ingest.domains import DOMAINS
+from ...models.bitsandbytes_capabilities import (
+    available_bitsandbytes_quantizations,
+    bitsandbytes_compute_precision,
+)
+from ...models.families import hf_compatible_checkpoints
+from ...models.precision_capabilities import (
+    available_dense_precisions,
+    model_execution_device,
+    require_model_precision,
+)
 from ...tokenizer_registry import list_tokenizers
 from ...train.base_config import (
     BASE_RECIPE_VERSION,
     FAMILY_LABELS,
-    MASTER_WEIGHT_LABELS,
     QAT_LABELS,
     SPARSITY_LABELS,
     TRAINING_RECIPE_PRESETS,
@@ -37,13 +46,19 @@ from ...train.data import (
     normalize_training_objective,
     tokenizer_stats_key,
 )
-from ...train.low_precision import native_nvfp4_status, native_sparse_nvfp4_status
-from ...train.mxfp8 import mxfp8_capability_status
+from ...train.loop import optimizer_capability_status
+from ...train.low_precision import (
+    native_nvfp4_status,
+    native_sparse_nvfp4_mxfp8_status,
+    native_sparse_nvfp4_status,
+)
+from ...train.mxfp8 import native_mxfp8_status
 from ...workers.launch import launch_worker
 from ..components import field_grid, form_section, hint
 from ..shell import ACCENT, panel, shell
 from .train_mole import (
     _auto_method_quant,
+    _checkpoint_qat_format,
     _checkpoint_shape,
     _make_plan,
     corpus_options,
@@ -57,6 +72,62 @@ CHAT_SFT_SHUFFLE_BUFFER = 8192
 CHAT_SFT_SHUFFLE_BUFFER_BYTES = 256 * 2**20
 COMPACT_VOCAB_MINIMUM = 257
 COMPACT_CHAT_VOCAB_MINIMUM = 264
+
+_OPTIMIZER_LABELS = {
+    "torch_adamw": "Torch AdamW (parameter-dtype moments)",
+    "fused_adamw": "Fused AdamW (parameter-dtype GPU moments)",
+    "adamw_8bit": "bitsandbytes AdamW8bit (INT8 GPU moments)",
+    "paged_adamw_8bit": "Paged AdamW8bit (INT8; large moments CPU-paged)",
+    "cpu_offload_adamw": "CPU-offload AdamW (FP32 CPU master + moments)",
+}
+
+
+def _available_optimizer_options(
+    status: Mapping[str, tuple[bool, str]],
+) -> dict[str, str]:
+    options = {"auto": "Auto (execution-verified only)"}
+    options.update(
+        {
+            implementation: label
+            for implementation, label in _OPTIMIZER_LABELS.items()
+            if status.get(implementation, (False, ""))[0]
+        }
+    )
+    return options
+
+
+def _validate_family_qat_selection(family: str, qat: str) -> None:
+    if str(family).strip().casefold() == "bitnet" and qat != "none":
+        raise ValueError("BitNet supports dense precision only; clear NVFP4 QAT")
+
+
+def _compatible_optimizer_state_options(
+    implementation: str,
+    status: Mapping[str, tuple[bool, str]],
+    *,
+    cuda_available: bool,
+) -> dict[str, str]:
+    if implementation == "paged_adamw_8bit":
+        return {"cpu_paged": "INT8 state (large buffers CPU-paged)"}
+    if implementation == "cpu_offload_adamw":
+        return {"cpu_offload": "Full FP32 CPU offload"}
+    if implementation in {"torch_adamw", "fused_adamw", "adamw_8bit"}:
+        return (
+            {"gpu": "GPU-resident state"}
+            if cuda_available
+            else {"auto": "CPU-local state"}
+        )
+    options = {"auto": "Auto verified placement"}
+    if cuda_available and any(
+        status.get(candidate, (False, ""))[0]
+        for candidate in ("torch_adamw", "fused_adamw", "adamw_8bit")
+    ):
+        options["gpu"] = "GPU-resident state"
+    if status.get("paged_adamw_8bit", (False, ""))[0]:
+        options["cpu_paged"] = "INT8 state (large buffers CPU-paged)"
+    if status.get("cpu_offload_adamw", (False, ""))[0]:
+        options["cpu_offload"] = "Full FP32 CPU offload"
+    return options
 
 SCRATCH_PRESETS: dict[str, dict[str, int]] = {
     "qwen_1m_compact": {
@@ -307,6 +378,46 @@ def _base_run_config(
 
 @ui.page("/train/base")
 def train_base_page():
+    model_device = model_execution_device()
+    bnb_quantizations = available_bitsandbytes_quantizations(model_device)
+    dense_precisions = available_dense_precisions(model_device)
+    default_parameter_dtype = next(iter(dense_precisions), None)
+    optimizer_status = optimizer_capability_status(
+        cuda=model_device.type == "cuda",
+        device_index=model_device.index if model_device.type == "cuda" else None,
+    )
+    optimizer_options = _available_optimizer_options(optimizer_status)
+    cuda_available = model_device.type == "cuda"
+    default_optimizer_state = (
+        "cpu_offload"
+        if optimizer_status.get("cpu_offload_adamw", (False, ""))[0]
+        else "auto"
+    )
+    bnb_quantization_options = {
+        quantization: (
+            f"{quantization.upper()} ({bitsandbytes_compute_precision(quantization).upper()} compute)"
+        )
+        for quantization in bnb_quantizations
+    }
+    continued_method_options = {"auto": "Auto"}
+    if default_parameter_dtype is not None:
+        continued_method_options.update(
+            {
+                "full": f"Full parameters ({default_parameter_dtype.upper()} default)",
+                "lora": f"LoRA ({default_parameter_dtype.upper()} base default)",
+            }
+        )
+    if bnb_quantizations:
+        continued_method_options["qlora"] = "QLoRA"
+    default_bnb_quantization = bnb_quantizations[0] if bnb_quantizations else None
+    parameter_dtype_options = {
+        precision: (
+            f"{precision.upper()} (recommended)"
+            if precision == default_parameter_dtype
+            else precision.upper()
+        )
+        for precision in dense_precisions
+    }
     with shell("Train · Base", "/train/base"):
         ui.label("Raw or continued base-model training").classes("text-xl font-semibold")
         ui.label(
@@ -315,7 +426,10 @@ def train_base_page():
         ).classes("text-sm text-gray-400 -mt-2")
 
         checkpoint_rows = {
-            row["id"]: row for row in db.q("SELECT * FROM checkpoints WHERE kind!='pending' ORDER BY name")
+            row["id"]: row
+            for row in hf_compatible_checkpoints(
+                db.q("SELECT * FROM checkpoints WHERE kind!='pending' ORDER BY name")
+            )
         }
         checkpoint_options = {
             cid: f"{row['name']} ({row['params_b']:.3f} B)" if row["params_b"] else row["name"]
@@ -332,11 +446,41 @@ def train_base_page():
             for tokenizer_id, row in registered_tokenizer_rows.items()
         }
         corpora = corpus_options()
-        native_nvfp4, native_nvfp4_note = native_nvfp4_status()
+        native_nvfp4, native_nvfp4_note = native_nvfp4_status(model_device)
         native_sparse_nvfp4, native_sparse_nvfp4_note = native_sparse_nvfp4_status(
-            smoke=False
+            model_device
         )
-        native_mxfp8, native_mxfp8_note = mxfp8_capability_status()
+        native_mxfp8, native_mxfp8_note = native_mxfp8_status(model_device)
+        if native_sparse_nvfp4 and native_mxfp8:
+            native_sparse_mxfp8, native_sparse_mxfp8_note = (
+                native_sparse_nvfp4_mxfp8_status(model_device)
+            )
+        else:
+            native_sparse_mxfp8 = False
+            native_sparse_mxfp8_note = "requires both sparse NVFP4 and MXFP8"
+        available_qat_labels = {"none": QAT_LABELS["none"]}
+        if native_nvfp4 and "bf16" in dense_precisions:
+            available_qat_labels["nvfp4"] = QAT_LABELS["nvfp4"]
+        available_sparsity_labels = {"none": SPARSITY_LABELS["none"]}
+        if native_sparse_nvfp4:
+            available_sparsity_labels["paired_4:8"] = SPARSITY_LABELS["paired_4:8"]
+        available_backward_labels = {"bf16": "BF16 dgrad / wgrad"}
+        if native_mxfp8:
+            available_backward_labels["mxfp8"] = "MXFP8 dgrad / wgrad (native Tensor Cores)"
+        available_recipe_labels = {"custom": "Custom native precision recipe"}
+        if native_nvfp4 and native_sparse_nvfp4 and "bf16" in dense_precisions:
+            available_recipe_labels["nvfp4_paired_4to8"] = (
+                "Native NVFP4 + compressed paired 4:8"
+            )
+        if (
+            native_nvfp4
+            and native_sparse_mxfp8
+            and "bf16" in dense_precisions
+            and optimizer_status.get("cpu_offload_adamw", (False, ""))[0]
+        ):
+            available_recipe_labels["nvfp4_sparse_mxfp8_cpu_offload"] = (
+                "Native NVFP4 sparse forward + MXFP8 backward + FP32 CPU offload"
+            )
 
         with ui.row().classes("w-full gap-4 items-start flex-wrap"):
             with panel().classes("shrink-0").style("width: 650px; max-width: 100%"):
@@ -365,12 +509,7 @@ def train_base_page():
                     with field_grid(3):
                         method = (
                             ui.select(
-                                {
-                                    "auto": "Auto",
-                                    "full": "Full parameters",
-                                    "lora": "LoRA",
-                                    "qlora": "QLoRA",
-                                },
+                                continued_method_options,
                                 value="auto",
                                 label="Update method",
                             )
@@ -379,18 +518,24 @@ def train_base_page():
                         )
                         qlora_quant = (
                             ui.select(
-                                {"nf4": "NF4", "int8": "INT8"},
-                                value="nf4",
+                                bnb_quantization_options,
+                                value=default_bnb_quantization,
                                 label="QLoRA storage",
                             )
                             .props("dense outlined")
                             .classes("w-full")
                         )
-                        lora_rank = (
-                            ui.number("LoRA rank", value=32, min=1, max=512, precision=0)
-                            .props("dense outlined")
-                            .classes("w-full")
+                        qlora_quant.enabled = bool(bnb_quantizations)
+                    if not bnb_quantizations:
+                        hint(
+                            "QLoRA is omitted because no bitsandbytes NF4/INT8 CUDA "
+                            "forward/backward path passed its capability probe."
                         )
+                    lora_rank = (
+                        ui.number("LoRA rank", value=32, min=1, max=512, precision=0)
+                        .props("dense outlined")
+                        .classes("w-full")
+                    )
 
                 with ui.column().classes("w-full gap-2") as scratch_source_box:
                     tokenizer_source = (
@@ -765,16 +910,7 @@ def train_base_page():
                 form_section("4", "Parameter state and QAT numerics")
                 training_recipe = (
                     ui.select(
-                        {
-                            "custom": "Custom precision recipe",
-                            "nvfp4_sparse_mxfp8_adaptive": (
-                                "NVFP4 sparse forward + MXFP8 backward + adaptive FP8 state (recommended)"
-                            ),
-                            "nvfp4_paired_4to8": "NVFP4 + paired 4:8 sparsity-aware training (RTX Blackwell)",
-                            "nvfp4_paired_4to8_fp8_master": (
-                                "NVFP4 + paired 4:8 + potentiated FP8 master (experimental)"
-                            ),
-                        },
+                        available_recipe_labels,
                         value="custom",
                         label="Training recipe preset",
                     )
@@ -784,86 +920,37 @@ def train_base_page():
                 with field_grid(3):
                     parameter_dtype = (
                         ui.select(
-                            {"bf16": "BF16 (recommended)", "fp16": "FP16", "fp32": "FP32"},
-                            value="bf16",
+                            parameter_dtype_options,
+                            value=default_parameter_dtype,
                             label="Parameter dtype",
                         )
                         .props("dense outlined")
                         .classes("w-full")
                     )
                     qat_mode = (
-                        ui.select(QAT_LABELS, value="none", label="QAT target")
-                        .props("dense outlined")
-                        .classes("w-full")
-                    )
-                    qat_group = (
-                        ui.select([16, 32, 64, 128], value=32, label="INT4 weight group")
-                        .props("dense outlined")
-                        .classes("w-full")
-                    )
-                activation_qat = (
-                    ui.select(
-                        {"none": "High-precision activations", "int8": "INT8 per-token activation QAT"},
-                        value="none",
-                        label="INT4 activation recipe",
-                    )
-                    .props("dense outlined")
-                    .classes("w-full")
-                )
-                with field_grid(3):
-                    qat_backend = (
                         ui.select(
-                            {
-                                "auto": "Auto (native NVFP4 when supported)",
-                                "native": "Require native NVFP4 forward",
-                                "emulated": "Force fake-quant emulation",
-                            },
-                            value="auto",
-                            label="Low-bit backend",
+                            available_qat_labels,
+                            value="none",
+                            label="Forward compute precision",
                         )
                         .props("dense outlined")
                         .classes("w-full")
                     )
                     sparsity_pattern = (
-                        ui.select(SPARSITY_LABELS, value="none", label="Weight sparsity")
-                        .props("dense outlined")
-                        .classes("w-full")
-                    )
-                    sparsity_backend = (
                         ui.select(
-                            {
-                                "auto": "Auto sparse execution",
-                                "compressed": "Require compressed cuSPARSELt",
-                                "dense_masked": "Dense GEMM with paired mask",
-                            },
-                            value="auto",
-                            label="Sparse execution",
+                            available_sparsity_labels,
+                            value="none",
+                            label="Native weight sparsity",
                         )
                         .props("dense outlined")
                         .classes("w-full")
                     )
-                with field_grid(2):
+                with field_grid(1):
                     backward_precision = (
                         ui.select(
-                            {
-                                "bf16": "BF16 dgrad / wgrad",
-                                "mxfp8": "MXFP8 dgrad / wgrad",
-                            },
+                            available_backward_labels,
                             value="bf16",
                             label="Backward GEMMs",
-                        )
-                        .props("dense outlined")
-                        .classes("w-full")
-                    )
-                    backward_backend = (
-                        ui.select(
-                            {
-                                "auto": "Auto MXFP8 backend",
-                                "native": "Require native MXFP8 Tensor Cores",
-                                "emulated": "MXFP8 format emulation",
-                            },
-                            value="auto",
-                            label="MXFP8 backend",
                         )
                         .props("dense outlined")
                         .classes("w-full")
@@ -881,6 +968,15 @@ def train_base_page():
                     f"Native MXFP8 backward lane: {'available' if native_mxfp8 else 'unavailable'} — "
                     f"{native_mxfp8_note}."
                 ).classes("text-xs text-gray-500")
+                ui.label(
+                    "Sparse NVFP4 + MXFP8 combined lane: "
+                    f"{'available' if native_sparse_mxfp8 else 'unavailable'} — "
+                    f"{native_sparse_mxfp8_note}."
+                ).classes("text-xs text-gray-500")
+                ui.label(
+                    "Unsupported precision modes are omitted. yyLab never substitutes emulated "
+                    "quantization or a dense masked sparse path."
+                ).classes("text-xs text-amber-400")
 
                 ui.separator().classes("my-3")
                 form_section("5", "Optimization")
@@ -892,87 +988,30 @@ def train_base_page():
                     )
                     optimizer_impl = (
                         ui.select(
-                            {
-                                "auto": "Auto implementation",
-                                "torch_adamw": "Torch AdamW",
-                                "fused_adamw": "Fused AdamW",
-                                "adamw_8bit": "bitsandbytes AdamW8bit",
-                                "paged_adamw_8bit": "Paged AdamW8bit",
-                                "cpu_offload_adamw": "CPU-offload AdamW",
-                            },
+                            optimizer_options,
                             value="auto",
-                            label="Optimizer",
+                            label="Optimizer / state precision",
                         )
                         .props("dense outlined")
                         .classes("w-full")
                     )
                     optimizer_state = (
                         ui.select(
-                            {
-                                "auto": "Auto placement",
-                                "gpu": "GPU state",
-                                "cpu_paged": "Paged / CPU-backed",
-                                "cpu_offload": "Full CPU offload",
-                            },
-                            value="cpu_offload",
+                            _compatible_optimizer_state_options(
+                                "auto",
+                                optimizer_status,
+                                cuda_available=cuda_available,
+                            ),
+                            value=default_optimizer_state,
                             label="Optimizer state",
                         )
                         .props("dense outlined")
                         .classes("w-full")
                     )
-                master_weight_storage = (
-                    ui.select(
-                        MASTER_WEIGHT_LABELS,
-                        value="fp32",
-                        label="CPU master-weight storage",
-                    )
-                    .props("dense outlined")
-                    .classes("w-full")
-                )
-                with field_grid(4) as adaptive_controls:
-                    adaptive_max_percent = (
-                        ui.number(
-                            "Max promoted blocks (%)",
-                            value=10.0,
-                            min=0,
-                            max=100,
-                            step=1,
-                        )
-                        .props("dense outlined")
-                        .classes("w-full")
-                    )
-                    adaptive_promote_threshold = (
-                        ui.number(
-                            "Promotion threshold",
-                            value=0.55,
-                            min=0,
-                            step=0.05,
-                        )
-                        .props("dense outlined")
-                        .classes("w-full")
-                    )
-                    adaptive_demote_threshold = (
-                        ui.number(
-                            "Demotion threshold",
-                            value=0.20,
-                            min=0,
-                            step=0.05,
-                        )
-                        .props("dense outlined")
-                        .classes("w-full")
-                    )
-                    adaptive_demote_patience = (
-                        ui.number(
-                            "Stable steps before demotion",
-                            value=2,
-                            min=1,
-                            max=255,
-                            precision=0,
-                        )
-                        .props("dense outlined")
-                        .classes("w-full")
-                    )
-                master_truth = ui.label("").classes("text-xs text-amber-400")
+                ui.label(
+                    "Only implementations that completed a real optimizer update on this system are shown. "
+                    "Full CPU offload uses an FP32 master and FP32 Adam moments."
+                ).classes("text-xs text-amber-400")
                 with field_grid(3):
                     weight_decay = (
                         ui.number("Weight decay", value=0.1, min=0, step=0.01)
@@ -1085,13 +1124,12 @@ def train_base_page():
                         "text-base font-semibold mb-2"
                     )
                     ui.label(
-                        "Parameter dtype controls the saved trainable tensors. QAT controls the forward numerics. "
-                        "Optimizer state controls VRAM/RAM placement. A packed deployment artifact is separate."
+                        "Parameter dtype controls the saved trainable tensors. Native low-precision selection "
+                        "controls Tensor Core forward/backward execution. Optimizer state controls VRAM/RAM placement."
                     ).classes("text-sm text-gray-300")
                     ui.label(
-                        "Compressed NVFP4 and MXFP8 change GEMM execution, while QAT checkpoints retain dense "
-                        "shadow weights. CPU offload plus FP32, legacy potentiated, or adaptive FP8 master "
-                        "storage controls persistent state headroom independently."
+                        "NVFP4, compressed paired 4:8, and MXFP8 are exposed only when this GPU and runtime "
+                        "support their native kernels. Unsupported formats fail closed; no emulation is used."
                     ).classes("text-xs text-amber-400 mt-2")
 
         def selected_checkpoint() -> dict | None:
@@ -1230,34 +1268,35 @@ def train_base_page():
             except ValueError as exc:
                 ui.notify(str(exc), type="warning")
 
+        def update_optimizer_controls() -> None:
+            implementation = str(optimizer_impl.value or "auto")
+            options = _compatible_optimizer_state_options(
+                implementation,
+                optimizer_status,
+                cuda_available=cuda_available,
+            )
+            optimizer_state.options = options
+            if optimizer_state.value not in options:
+                optimizer_state.set_value(next(iter(options)))
+            optimizer_state.update()
+            update_preflight()
+
         def apply_training_recipe() -> None:
             values = TRAINING_RECIPE_PRESETS.get(str(training_recipe.value or "custom"), {})
             if not values:
                 return
             parameter_dtype.set_value(str(values["parameter_dtype"]))
             qat_mode.set_value(str(values["qat"]))
-            qat_backend.set_value(str(values["qat_backend"]))
-            qat_group.set_value(int(values["qat_group_size"]))
-            activation_qat.set_value(str(values["activation_qat"]))
             sparsity_pattern.set_value(str(values["sparsity"]))
-            sparsity_backend.set_value(str(values.get("sparsity_backend", "auto")))
             backward_precision.set_value(str(values.get("backward_precision", "bf16")))
-            backward_backend.set_value(str(values.get("backward_backend", "auto")))
-            optimizer_state.set_value(str(values.get("optimizer_state", "cpu_offload")))
             optimizer_impl.set_value(str(values.get("optimizer_impl", "auto")))
-            master_weight_storage.set_value(str(values.get("master_weight_storage", "fp32")))
-            adaptive_max_percent.set_value(
-                float(values.get("adaptive_max_promoted_fraction", 0.10)) * 100
-            )
-            adaptive_promote_threshold.set_value(
-                float(values.get("adaptive_promote_threshold", 0.55))
-            )
-            adaptive_demote_threshold.set_value(
-                float(values.get("adaptive_demote_threshold", 0.20))
-            )
-            adaptive_demote_patience.set_value(
-                int(values.get("adaptive_demote_patience", 2))
-            )
+            update_optimizer_controls()
+            requested_state = str(values.get("optimizer_state", "cpu_offload"))
+            if requested_state not in optimizer_state.options:
+                raise ValueError(
+                    f"training preset requests unavailable optimizer state {requested_state!r}"
+                )
+            optimizer_state.set_value(requested_state)
             update_qat_controls()
 
         def update_mode() -> None:
@@ -1268,132 +1307,56 @@ def train_base_page():
             if scratch:
                 update_tokenizer_source()
             qat_mode.enabled = scratch
-            qat_group.enabled = scratch
-            activation_qat.enabled = scratch
             training_recipe.enabled = scratch
-            qat_backend.enabled = scratch
             sparsity_pattern.enabled = scratch
-            sparsity_backend.enabled = scratch
             backward_precision.enabled = scratch
-            backward_backend.enabled = scratch
             update_qat_controls()
             update_preflight()
             update_training_budget_summary()
 
         def update_qat_controls() -> None:
             qat = str(qat_mode.value or "none") if init_mode.value == "scratch" else "none"
-            if qat == "ternary" and family.value != "bitnet":
-                family.set_value("bitnet")
-            elif family.value == "bitnet" and qat not in {"none", "ternary"}:
-                qat_mode.set_value("none")
-                qat = "none"
+            bitnet = family.value == "bitnet"
             if qat != "nvfp4" and sparsity_pattern.value != "none":
                 sparsity_pattern.set_value("none")
             if qat != "nvfp4" and backward_precision.value != "bf16":
                 backward_precision.set_value("bf16")
-            qat_group.enabled = qat == "int4" and init_mode.value == "scratch"
-            activation_qat.enabled = qat == "int4" and init_mode.value == "scratch"
-            qat_backend.enabled = qat == "nvfp4" and init_mode.value == "scratch"
-            sparsity_pattern.enabled = qat == "nvfp4" and init_mode.value == "scratch"
-            sparse_enabled = (
+            qat_mode.enabled = init_mode.value == "scratch"
+            parameter_dtype.enabled = True
+            sparsity_pattern.enabled = (
                 qat == "nvfp4"
-                and str(sparsity_pattern.value or "none") != "none"
+                and native_sparse_nvfp4
                 and init_mode.value == "scratch"
             )
-            sparsity_backend.enabled = sparse_enabled
             backward_precision.enabled = qat == "nvfp4" and init_mode.value == "scratch"
-            backward_backend.enabled = (
-                qat == "nvfp4"
-                and backward_precision.value == "mxfp8"
-                and init_mode.value == "scratch"
-            )
-            if qat == "none":
+            if bitnet and qat != "none":
+                qat_truth.text = (
+                    "BitNet supports dense precision only. The current NVFP4 selection is "
+                    "invalid and must be cleared before launch."
+                )
+            elif qat == "none":
                 qat_truth.text = (
                     "Dense forward numerics; parameter and optimizer choices determine state memory."
                 )
-            elif qat == "int4":
-                qat_truth.text = (
-                    "INT4 QAT simulates grouped weight quantization during forward. Shadow weights, gradients, "
-                    "and optimizer state remain dense; the current Windows kernel is emulated."
-                )
             elif qat == "nvfp4":
-                backend = str(qat_backend.value or "auto")
-                native_selected = backend == "native" or (backend == "auto" and native_nvfp4)
-                execution = (
-                    "Native packed E2M1/E4M3 block-scaled FP4 forward GEMMs are enabled; "
-                    if native_selected and native_nvfp4
-                    else "NVFP4 is using dense fake-quant emulation; "
-                )
+                execution = "Native packed E2M1/E4M3 block-scaled FP4 forward GEMMs are enabled; "
                 sparse = str(sparsity_pattern.value or "none")
-                sparse_request = str(sparsity_backend.value or "auto")
-                compressed_selected = sparse != "none" and native_selected and (
-                    sparse_request == "compressed"
-                    or (sparse_request == "auto" and native_sparse_nvfp4)
-                )
-                if compressed_selected and native_sparse_nvfp4:
+                if sparse != "none":
                     sparse_note = (
                         "paired 4:8 weights execute as compressed E2M1 through cuSPARSELt; "
-                    )
-                elif sparse != "none":
-                    sparse_note = (
-                        "paired 4:8 is enforced, but this selection uses a dense masked GEMM; "
                     )
                 else:
                     sparse_note = ""
                 backward_mode = str(backward_precision.value or "bf16")
-                backward_request = str(backward_backend.value or "auto")
-                native_backward_selected = backward_mode == "mxfp8" and (
-                    backward_request == "native"
-                    or (backward_request == "auto" and native_mxfp8)
-                ) and parameter_dtype.value == "bf16"
-                if native_backward_selected and native_mxfp8:
+                if backward_mode == "mxfp8":
                     backward_note = "dgrad and wgrad use native block-32 MXFP8 Tensor Core GEMMs; "
-                elif backward_mode == "mxfp8":
-                    backward_note = "dgrad and wgrad use format-faithful MXFP8 emulation; "
                 else:
                     backward_note = "dgrad and wgrad use BF16 GEMMs; "
-                unavailable = (
-                    f"Requested native mode is unavailable: {native_nvfp4_note}. "
-                    if backend == "native" and not native_nvfp4
-                    else ""
-                )
-                master_note = (
-                    "The CPU master uses E4M3 with a sparse, adaptive potentiation overlay; "
-                    if master_weight_storage.value == "fp8_e4m3_adaptive"
-                    else (
-                        "The CPU master uses legacy E4M3 with a dense potentiation residual; "
-                        if master_weight_storage.value == "fp8_e4m3_potentiated"
-                        else "The optimizer master remains FP32; "
-                    )
-                )
                 qat_truth.text = (
-                    unavailable
-                    + execution
+                    execution
                     + sparse_note
                     + backward_note
-                    + master_note
-                    + "accelerator shadow parameters and Adam moments remain BF16/FP32 respectively."
-                )
-            else:
-                qat_truth.text = (
-                    "Ternary W1.58/A8 QAT is restricted to the BitNet architecture and remains experimental "
-                    "with dense shadow weights."
-                )
-            adaptive_controls.visible = master_weight_storage.value == "fp8_e4m3_adaptive"
-            if master_weight_storage.value == "fp8_e4m3_adaptive":
-                master_truth.text = (
-                    "Adaptive FP8 persistent master: every weight has a real E4M3 byte; only blocks whose "
-                    "reconstruction or lost-update score crosses the promotion threshold receive a sparse "
-                    "packed four-bit residual. Hysteresis demotes stable blocks. Adam moments remain FP32."
-                )
-            elif master_weight_storage.value == "fp8_e4m3_potentiated":
-                master_truth.text = (
-                    "Legacy potentiated FP8 master: persistent CPU state pays for a packed four-bit residual "
-                    "for every weight (~1.625 bytes/parameter). Adam moments remain FP32."
-                )
-            else:
-                master_truth.text = (
-                    "FP32 CPU masters preserve every optimizer update; accelerator parameters may still be BF16."
+                    + "Optimizer state precision and placement follow the verified optimizer selection below."
                 )
             update_preflight()
 
@@ -1529,14 +1492,22 @@ def train_base_page():
         def update_preflight() -> None:
             preflight_box.clear()
             if init_mode.value != "scratch":
+                selected_method = str(method.value or "auto")
+                requested_quant = (
+                    str(qlora_quant.value)
+                    if selected_method in {"auto", "qlora"}
+                    and qlora_quant.value is not None
+                    else str(parameter_dtype.value or "")
+                )
                 render_plan(
                     preflight_box,
                     selected_checkpoint(),
                     int(train_seq_len.value or 2048),
-                    str(method.value or "auto"),
-                    str(qlora_quant.value or "nf4"),
+                    selected_method,
+                    requested_quant,
                     rank=int(lora_rank.value or 32),
                     num_experts=1,
+                    dense_precision=str(parameter_dtype.value or ""),
                     adapter_only=False,
                     isolated_expert_training=False,
                 )
@@ -1548,27 +1519,16 @@ def train_base_page():
                         current_compact_tokenizer_spec().validate()
                     hint_vocab = vocab_hint()
                     qat = str(qat_mode.value or "none")
-                    backend = str(qat_backend.value or "auto")
                     sparsity = str(sparsity_pattern.value or "none")
-                    sparse_backend = str(sparsity_backend.value or "auto")
                     backward_mode = str(backward_precision.value or "bf16")
-                    backward_execution = str(backward_backend.value or "auto")
-                    if qat == "nvfp4" and backend == "native" and not native_nvfp4:
+                    if qat == "nvfp4" and not native_nvfp4:
                         raise ValueError(f"native NVFP4 backend unavailable: {native_nvfp4_note}")
+                    if qat == "nvfp4" and parameter_dtype.value != "bf16":
+                        raise ValueError("native NVFP4 requires BF16 parameter storage")
                     if sparsity != "none" and qat != "nvfp4":
                         raise ValueError("paired 4:8 sparsity requires NVFP4 QAT")
-                    native_forward_selected = backend == "native" or (
-                        backend == "auto" and native_nvfp4
-                    )
                     if (
                         sparsity != "none"
-                        and sparse_backend == "compressed"
-                        and not native_forward_selected
-                    ):
-                        raise ValueError("compressed sparse execution requires native NVFP4")
-                    if (
-                        sparsity != "none"
-                        and sparse_backend == "compressed"
                         and not native_sparse_nvfp4
                     ):
                         raise ValueError(
@@ -1578,16 +1538,23 @@ def train_base_page():
                         raise ValueError("MXFP8 backward requires NVFP4 QAT")
                     if (
                         backward_mode == "mxfp8"
-                        and backward_execution == "native"
                         and not native_mxfp8
                     ):
                         raise ValueError(f"native MXFP8 unavailable: {native_mxfp8_note}")
                     if (
                         backward_mode == "mxfp8"
-                        and backward_execution == "native"
                         and parameter_dtype.value != "bf16"
                     ):
                         raise ValueError("native MXFP8 backward requires BF16 parameters")
+                    if (
+                        sparsity != "none"
+                        and backward_mode == "mxfp8"
+                        and not native_sparse_mxfp8
+                    ):
+                        raise ValueError(
+                            "sparse NVFP4 + MXFP8 combined path unavailable: "
+                            f"{native_sparse_mxfp8_note}"
+                        )
                     if hint_vocab < 1:
                         ui.label(
                             "Tokenizer vocab is unknown; enter model vocab or select a registered "
@@ -1619,13 +1586,8 @@ def train_base_page():
                     parameters = estimate_parameter_count(spec, tokenizer_vocab_size=hint_vocab)
                     gpu_gb, cpu_gb = projected_training_memory_gb(
                         parameters,
-                        parameter_dtype=str(parameter_dtype.value or "bf16"),
+                        parameter_dtype=str(parameter_dtype.value or ""),
                         optimizer_state=str(optimizer_state.value or "gpu"),
-                        master_weight_storage=str(master_weight_storage.value or "fp32"),
-                        adaptive_max_promoted_fraction=float(
-                            adaptive_max_percent.value or 0
-                        )
-                        / 100.0,
                     )
                     with ui.row().classes("w-full items-center gap-2 flex-wrap"):
                         ui.badge(f"{parameters / 1e6:,.3f}M launch-fitted params").props(
@@ -1660,60 +1622,18 @@ def train_base_page():
                         + ". Activations, CUDA workspaces, and allocator reserve are additional."
                     ).classes("text-xs text-gray-400")
                     if qat != "none":
-                        native_forward = qat == "nvfp4" and (
-                            backend == "native" or (backend == "auto" and native_nvfp4)
-                        )
-                        native_backward = backward_mode == "mxfp8" and (
-                            backward_execution == "native"
-                            or (backward_execution == "auto" and native_mxfp8)
-                        ) and parameter_dtype.value == "bf16"
                         ui.label(
-                            f"{qat.upper()} QAT uses "
-                            + ("native FP4 forward GEMMs" if native_forward else "emulated forward numerics")
+                            f"{qat.upper()} uses native FP4 forward GEMMs"
                             + (
                                 " and native MXFP8 backward GEMMs."
-                                if native_backward
-                                else " and BF16/emulated backward GEMMs."
+                                if backward_mode == "mxfp8"
+                                else " and BF16 backward GEMMs."
                             )
                         ).classes("text-xs text-amber-400")
                     if sparsity != "none":
-                        compressed = sparse_backend == "compressed" or (
-                            sparse_backend == "auto" and native_sparse_nvfp4
-                        )
                         ui.label(
-                            "Paired 4:8 SAT gives 50% effective weight density. "
-                            + (
-                                "Forward GEMMs use compressed cuSPARSELt sparse MMA; saved checkpoints "
-                                "still retain BF16 shadow weights for continued training."
-                                if compressed
-                                else "This selection uses a dense masked GEMM."
-                            )
-                        ).classes("text-xs text-amber-400")
-                    master_storage = str(master_weight_storage.value or "fp32")
-                    cpu_offloaded = (
-                        optimizer_state.value == "cpu_offload"
-                        or optimizer_impl.value == "cpu_offload_adamw"
-                    )
-                    if master_storage != "fp32" and not cpu_offloaded:
-                        raise ValueError(
-                            "potentiated FP8 master weights require Full CPU offload or CPU-offload AdamW"
-                        )
-                    if master_storage == "fp8_e4m3_adaptive":
-                        promote = float(adaptive_promote_threshold.value or 0)
-                        demote = float(adaptive_demote_threshold.value or 0)
-                        if demote > promote:
-                            raise ValueError(
-                                "adaptive demotion threshold cannot exceed promotion threshold"
-                            )
-                        ui.label(
-                            f"Adaptive potentiation can promote at most "
-                            f"{float(adaptive_max_percent.value or 0):g}% of blocks; ordinary blocks "
-                            "pay only for E4M3 + a block scale/counter, while Adam moments remain FP32."
-                        ).classes("text-xs text-amber-400")
-                    elif master_storage == "fp8_e4m3_potentiated":
-                        ui.label(
-                            "The FP8 base is not updated directly. Sub-ULP updates are retained on a packed "
-                            "four-bit interpolation grid with stochastic rounding at the finer boundary."
+                            "Paired 4:8 gives 50% effective weight density. Forward GEMMs use compressed "
+                            "cuSPARSELt sparse MMA; saved checkpoints retain BF16 parameters for continued training."
                         ).classes("text-xs text-amber-400")
                 except ValueError as exc:
                     ui.label(str(exc)).classes("text-red-400 text-sm")
@@ -1721,10 +1641,19 @@ def train_base_page():
         def resolve_pretrained_method() -> tuple[str, str, object | None]:
             selected_method = str(method.value or "auto")
             if selected_method != "auto":
-                quant = str(qlora_quant.value or "nf4") if selected_method == "qlora" else "bf16"
+                quant = (
+                    str(qlora_quant.value or "")
+                    if selected_method == "qlora"
+                    else str(parameter_dtype.value or "")
+                )
                 return selected_method, quant, None
+            requested_auto_quant = (
+                str(qlora_quant.value)
+                if qlora_quant.value is not None
+                else str(parameter_dtype.value or "")
+            )
             plan_method, plan_quant = _auto_method_quant(
-                selected_checkpoint(), str(qlora_quant.value or "nf4")
+                selected_checkpoint(), requested_auto_quant
             )
             plan = _make_plan(
                 selected_checkpoint(),
@@ -1733,13 +1662,16 @@ def train_base_page():
                 plan_quant,
                 int(lora_rank.value or 32),
                 1,
+                dense_precision=str(parameter_dtype.value or ""),
                 adapter_only=False,
                 isolated_expert_training=False,
             )
             if plan is not None:
                 return plan.method, plan.quant, plan
             if plan_method == "auto":
-                return "qlora", plan_quant, None
+                if plan_quant in bnb_quantizations:
+                    return "qlora", plan_quant, None
+                return "lora", plan_quant, None
             return plan_method, plan_quant, None
 
         def on_start() -> None:
@@ -1753,6 +1685,8 @@ def train_base_page():
             compact_tokenizer_selected = (
                 scratch and tokenizer_source.value == TOKENIZER_SOURCE_COMPACT
             )
+            if not parameter_dtype.value:
+                problems.append("choose an available parameter dtype")
             if scratch and not compact_tokenizer_selected and not tokenizer_ref:
                 problems.append("choose or enter a tokenizer source")
             if not scratch and not checkpoint:
@@ -1766,6 +1700,7 @@ def train_base_page():
             source_splits = normalize_source_splits(source_split_filter.value)
             architecture: dict | None = None
             auto_plan = None
+            inherited_qat_format = ""
             if scratch:
                 spec = current_spec()
                 try:
@@ -1781,6 +1716,7 @@ def train_base_page():
                             "registered tokenizer so yyLab can fit the requested parameter target"
                         )
                     selected_qat = str(qat_mode.value or "none")
+                    _validate_family_qat_selection(str(family.value or ""), selected_qat)
                     target_parameters = requested_parameter_target()
                     spec = fit_scratch_to_parameter_target(
                         spec,
@@ -1793,28 +1729,17 @@ def train_base_page():
                         train_sequence_length=sequence_length,
                         qat_mode=selected_qat,
                     )
-                    selected_backend = str(qat_backend.value or "auto")
                     selected_sparsity = str(sparsity_pattern.value or "none")
-                    selected_sparse_backend = str(sparsity_backend.value or "auto")
                     selected_backward = str(backward_precision.value or "bf16")
-                    selected_backward_backend = str(backward_backend.value or "auto")
                     if (
                         selected_qat == "nvfp4"
-                        and selected_backend == "native"
-                        and str(parameter_dtype.value or "bf16") != "bf16"
+                        and str(parameter_dtype.value or "") != "bf16"
                     ):
                         raise ValueError("native NVFP4 QAT requires BF16 parameter dtype")
-                    if selected_qat == "nvfp4" and selected_backend == "native" and not native_nvfp4:
+                    if selected_qat == "nvfp4" and not native_nvfp4:
                         raise ValueError(f"native NVFP4 backend unavailable: {native_nvfp4_note}")
                     if (
                         selected_sparsity != "none"
-                        and selected_sparse_backend == "compressed"
-                        and selected_backend == "emulated"
-                    ):
-                        raise ValueError("compressed sparse execution requires native NVFP4")
-                    if (
-                        selected_sparsity != "none"
-                        and selected_sparse_backend == "compressed"
                         and not native_sparse_nvfp4
                     ):
                         raise ValueError(
@@ -1824,37 +1749,29 @@ def train_base_page():
                         raise ValueError("MXFP8 backward requires NVFP4 QAT")
                     if (
                         selected_backward == "mxfp8"
-                        and selected_backward_backend == "native"
                         and not native_mxfp8
                     ):
                         raise ValueError(f"native MXFP8 unavailable: {native_mxfp8_note}")
                     if (
                         selected_backward == "mxfp8"
-                        and selected_backward_backend == "native"
                         and parameter_dtype.value != "bf16"
                     ):
                         raise ValueError("native MXFP8 backward requires BF16 parameters")
-                    selected_master = str(master_weight_storage.value or "fp32")
-                    selected_cpu_offload = (
-                        optimizer_state.value == "cpu_offload"
-                        or optimizer_impl.value == "cpu_offload_adamw"
-                    )
-                    if selected_master != "fp32" and not selected_cpu_offload:
-                        raise ValueError("FP8 persistent masters require CPU-offload AdamW")
                     if (
-                        selected_master == "fp8_e4m3_adaptive"
-                        and float(adaptive_demote_threshold.value or 0)
-                        > float(adaptive_promote_threshold.value or 0)
+                        selected_sparsity != "none"
+                        and selected_backward == "mxfp8"
+                        and not native_sparse_mxfp8
                     ):
                         raise ValueError(
-                            "adaptive demotion threshold cannot exceed promotion threshold"
+                            "sparse NVFP4 + MXFP8 combined path unavailable: "
+                            f"{native_sparse_mxfp8_note}"
                         )
                 except ValueError as exc:
                     ui.notify(str(exc), type="negative", multi_line=True)
                     return
                 architecture = spec.to_dict()
                 resolved_method = "full"
-                resolved_quant = str(parameter_dtype.value or "bf16")
+                resolved_quant = str(parameter_dtype.value or "")
                 initialization = _scratch_initialization(
                     TOKENIZER_SOURCE_COMPACT
                     if compact_tokenizer_selected
@@ -1867,7 +1784,28 @@ def train_base_page():
                     f"{spec.family}-{_parameter_target_slug(requested_parameter_target())}-scratch"
                 )
             else:
-                resolved_method, resolved_quant, auto_plan = resolve_pretrained_method()
+                try:
+                    resolved_method, resolved_quant, auto_plan = resolve_pretrained_method()
+                except ValueError as exc:
+                    ui.notify(str(exc), type="negative", multi_line=True)
+                    return
+                inherited_qat_format = _checkpoint_qat_format(checkpoint)
+                if inherited_qat_format and resolved_method == "qlora":
+                    ui.notify(
+                        f"This base restores {inherited_qat_format} QAT numerics; QLoRA would "
+                        "apply an incompatible second quantizer.",
+                        type="negative",
+                        multi_line=True,
+                    )
+                    return
+                if inherited_qat_format and resolved_quant != "bf16":
+                    ui.notify(
+                        f"Restoring {inherited_qat_format} QAT requires BF16 shadow loading; "
+                        f"{resolved_quant.upper()} was requested.",
+                        type="negative",
+                        multi_line=True,
+                    )
+                    return
                 if auto_plan is not None and not auto_plan.feasible:
                     ui.notify(
                         "The automatic continued-training plan does not pass the VRAM preflight. "
@@ -1895,6 +1833,12 @@ def train_base_page():
                 stats_key = tokenizer_stats_key(_checkpoint_shape(checkpoint).get("model_type"))
                 base_name = (output_name.value or "").strip() or (f"{checkpoint['name']}-{resolved_method}")
 
+            try:
+                require_model_precision(resolved_quant, model_device)
+            except (RuntimeError, ValueError) as exc:
+                ui.notify(str(exc), type="negative", multi_line=True)
+                return
+
             batch = auto_plan.micro_batch if auto_plan is not None else int(micro_batch.value or 1)
             accumulation = auto_plan.grad_accum if auto_plan is not None else int(grad_accum.value or 1)
             epoch_count = int(epochs.value or 1)
@@ -1921,24 +1865,37 @@ def train_base_page():
                 ui.notify(str(exc), type="negative", multi_line=True)
                 return
             max_steps = int(budget["max_steps"])
-            parameter_type = str(parameter_dtype.value or "bf16")
-            if not scratch and resolved_method in {"lora", "qlora"}:
-                parameter_type = "bf16"
+            parameter_type = str(parameter_dtype.value or "")
+            if not scratch and resolved_method == "lora":
+                parameter_type = resolved_quant
+            elif not scratch and resolved_method == "qlora":
+                parameter_type = bitsandbytes_compute_precision(resolved_quant)
             precision = {
                 "parameter_dtype": parameter_type,
                 "qat": str(qat_mode.value or "none") if scratch else "none",
-                "qat_group_size": int(qat_group.value or 32),
-                "activation_qat": str(activation_qat.value or "none"),
-                "qat_backend": str(qat_backend.value or "auto") if scratch else "auto",
+                "inherit_checkpoint_low_precision": bool(inherited_qat_format),
+                "qat_group_size": 16,
+                "activation_qat": (
+                    "nvfp4" if scratch and qat_mode.value == "nvfp4" else "none"
+                ),
+                "qat_backend": (
+                    "native" if scratch and qat_mode.value == "nvfp4" else "auto"
+                ),
                 "sparsity": str(sparsity_pattern.value or "none") if scratch else "none",
                 "sparsity_backend": (
-                    str(sparsity_backend.value or "auto") if scratch else "auto"
+                    "compressed"
+                    if scratch and sparsity_pattern.value != "none"
+                    else "auto"
                 ),
                 "backward_precision": (
-                    str(backward_precision.value or "bf16") if scratch else "bf16"
+                    str(backward_precision.value or "bf16")
+                    if scratch and qat_mode.value == "nvfp4"
+                    else parameter_type
                 ),
                 "backward_backend": (
-                    str(backward_backend.value or "auto") if scratch else "auto"
+                    "native"
+                    if scratch and backward_precision.value == "mxfp8"
+                    else "auto"
                 ),
                 "preset": str(training_recipe.value or "custom") if scratch else "custom",
             }
@@ -1950,14 +1907,6 @@ def train_base_page():
                 "beta1": float(beta1.value or 0.9),
                 "beta2": float(beta2.value or 0.999),
                 "eps": float(adam_eps.value or 1e-8),
-                "master_weight_storage": str(master_weight_storage.value or "fp32"),
-                "adaptive_max_promoted_fraction": float(adaptive_max_percent.value or 0)
-                / 100.0,
-                "adaptive_promote_threshold": float(
-                    adaptive_promote_threshold.value or 0
-                ),
-                "adaptive_demote_threshold": float(adaptive_demote_threshold.value or 0),
-                "adaptive_demote_patience": int(adaptive_demote_patience.value or 1),
             }
             scheduler = {
                 "name": str(scheduler_name.value or "cosine"),
@@ -2095,12 +2044,9 @@ def train_base_page():
         training_recipe.on_value_change(lambda _: apply_training_recipe())
         fit_target.on_click(fit_parameter_target)
         qat_mode.on_value_change(lambda _: update_qat_controls())
-        qat_backend.on_value_change(lambda _: update_qat_controls())
         sparsity_pattern.on_value_change(lambda _: update_qat_controls())
-        sparsity_backend.on_value_change(lambda _: update_qat_controls())
         backward_precision.on_value_change(lambda _: update_qat_controls())
-        backward_backend.on_value_change(lambda _: update_qat_controls())
-        master_weight_storage.on_value_change(lambda _: update_qat_controls())
+        optimizer_impl.on_value_change(lambda _: update_optimizer_controls())
         family.on_value_change(lambda _: update_qat_controls())
         corpora_select.on_value_change(lambda _: update_mix_controls())
         domain_filter.on_value_change(lambda _: update_data_summary())
@@ -2140,20 +2086,10 @@ def train_base_page():
             qlora_quant,
             lora_rank,
             parameter_dtype,
-            qat_group,
-            activation_qat,
-            qat_backend,
             sparsity_pattern,
-            sparsity_backend,
             backward_precision,
-            backward_backend,
             optimizer_state,
             optimizer_impl,
-            master_weight_storage,
-            adaptive_max_percent,
-            adaptive_promote_threshold,
-            adaptive_demote_threshold,
-            adaptive_demote_patience,
         ):
             element.on_value_change(lambda _: update_preflight())
         for element in (
@@ -2170,6 +2106,7 @@ def train_base_page():
             element.on_value_change(lambda _: update_training_budget_summary())
         update_mode()
         update_qat_controls()
+        update_optimizer_controls()
         update_mix_controls()
         update_training_budget_summary()
         update_preflight()

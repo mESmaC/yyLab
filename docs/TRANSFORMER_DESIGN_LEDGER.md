@@ -1,6 +1,6 @@
 # Custom Transformer and LLM Design Ledger
 
-Last updated: 2026-09-02
+Last updated: 2026-09-04
 
 Architecture name: **SPALMER Transformer**
 
@@ -87,17 +87,17 @@ Initial conventional defaults:
 |---|---|---|---|
 | C00 | Model topology | Conventional decoder-only causal LM around the custom KDA/MLA, ATXY, directional-network, and MoE components | Candidate |
 | C01 | Tokenization and input representation | Ranked-Precedence Distributional Tokenizer for English prose and code | Candidate |
-| C02 | Embeddings | Per-layer low-bit lookup, expand-before-compress, and two-part alternation | Candidate |
+| C02 | Embeddings | Exact BF16 input embedding plus compositional BF16 QR-PLE lexical refreshes | Experimental |
 | C03 | Position and context control | KDA carries sequence recency; ATXY can supply a parallel semantic-memory coordinate system | Candidate |
 | C04 | Attention | Kimi Linear hybrid: 3 KDA layers to 1 global MLA, with an optional ATXY exact-memory side path | Candidate |
 | C05 | KV and context memory | Quantized KV in VRAM and quantized CPU offload; context compaction | Captured |
 | C06 | Residuals and normalization | Conventional pre-norm RMSNorm with additive residuals and gated experimental branches | Candidate |
 | C07 | Expert compute | Roughly 200 small experts divide the parameter budget remaining after shared components | Candidate |
 | C08 | Surprise router | Experts compete by predicted surprise/NLL, realized cross-entropy, and predictive entropy | Candidate |
-| C09 | Weight numerics and sparsity | QAT with selectable NVFP4/MXFP4 forward weights, MXFP8 activations, and optional structured 2:4 sparsity | Reference lane implemented |
+| C09 | Weight numerics and sparsity | Capability-selected native NVFP4/NVFP4, MXFP8/MXFP8, or BF16/BF16 expert execution; structured sparsity remains open | Native dense lanes implemented |
 | C10 | Plasticity and potentiation | Expert-by-expert forward-precision promotion using each 0.5% expert group as the control unit | Candidate |
 | C11 | Output projection | Standard untied linear vocabulary head, softmax, and next-token cross-entropy | Candidate |
-| C12 | Backward and optimizer state | FP8/MXFP8 backward, adaptive FP8 persistent state, CPU offload | Partially implemented; CPU FP32-moment offload is operational |
+| C12 | Backward and optimizer state | Native MXFP8 expert backward, BF16 masters/gradients, FP32 CPU-offloaded Adam state; lower-precision persistent state only after a native implementation exists | Partially implemented; native expert backward and CPU FP32-moment offload are operational |
 | C13 | Inference residency controller | Full-pool trained top-k with bounded layer-local paging; retain 2–20 prompt-global adaptive residency as an experiment | Paging implemented and checkpoint-validated; prompt-global policy remains experimental |
 | C14 | Adaptation interfaces | SFT, continued pretraining, RL, LoRA/MoLE, and Soft LoRA experiments | Captured |
 | C15 | Evaluation and observability | Perplexity/NLL, coherence, routing, memory, and benchmark evidence | Captured |
@@ -197,8 +197,8 @@ the model, and the predictive fallthrough signal's model interface remain open.
 
 ### C02. Embeddings
 
-**State:** QR-PLE selected for the next implementation; legacy fake-QAT PLE
-remains a checkpoint-compatibility backend.
+**State:** QR-PLE implemented and selected. The former fake-QAT PLE is a
+metadata-only retired format and cannot execute.
 
 Selected component:
 
@@ -256,18 +256,15 @@ silently producing a smaller model.
 
 Implementation compatibility:
 
-- Add QR-PLE as a second explicitly selected PLE backend and retain the existing
-  fake-QAT backend only for loading and reproducing old bundles.
-- Introduce it with checkpoint format v7. Existing formats and stored
-  fingerprints keep their original parameter accounting and backend semantics;
-  QR-PLE checkpoints are scratch models rather than continuations of full-table
-  PLE checkpoints.
-- The planner must use backend-specific lookup formulas. Existing golden model
-  counts must remain unchanged for the legacy backend.
-- Before making QR-PLE the user-facing default, compare equal-total-parameter
-  10M configurations through the existing benchmark pipeline: legacy fake-QAT
-  PLE, QR-PLE with its freed budget redistributed, and a plain exact input
-  embedding with no later PLE. Training runs remain user-launched.
+- QR-PLE was introduced in checkpoint format v7 and is the only executable
+  backend. New bundles use format v8, where the old fake-PLE control fields no
+  longer exist.
+- A format-v7 QR bundle migrates by discarding those retired fields. Pre-v7
+  full-table fake-QAT bundles remain metadata-scannable for provenance but are
+  rejected before model construction, inference, or continued training.
+- The planner uses only the QR lookup formula and redistributes its released
+  parameter budget. A plain exact-input-only model remains the useful
+  equal-parameter ablation; executing the retired fake-QAT backend is not.
 
 ### C03. Position and context control
 
@@ -526,31 +523,35 @@ Interfaces still to specify:
 
 ### C09. Weight numerics and structured sparsity
 
-**State:** Reference lane implemented; native execution remains pending.
+**State:** Native dense expert lanes implemented; structured sparsity remains
+open.
 
 - Native FP4-family training is a first-class target, including NVFP4 and
   MXFP4 paths.
-- The base-pretraining QAT lane uses selectable NVFP4 or MXFP4 forward weights
-  with MXFP8 activations. NVFP4 is the native Blackwell-oriented path; MXFP4 is
-  retained as the portable Kimi-style alternative.
+- A numerical format becomes selectable only when one provider passes a real
+  forward-and-backward smoke for that exact weight/activation pair on the
+  active device. Known formats are not combined into unverified pairs.
+- The currently integrated expert pairs are native NVFP4/NVFP4 and
+  MXFP8/MXFP8 dense per-expert CUDA execution, plus native grouped BF16/BF16.
+  NVFP4/NVFP4 uses packed E2M1 operands with E4M3 block scales for forward and
+  native MXFP8 dgrad/wgrad. MXFP8/MXFP8 uses native MXFP8 GEMMs throughout.
 - Base pretraining keeps the optimizer's master/shadow weights in BF16 rather
-  than FP32. The FP4 forward representation is derived from those BF16 weights
-  with a straight-through or equivalent QAT gradient path.
+  than FP32. Native low-precision operands are packed from that BF16 payload;
+  backward returns gradients to the BF16 trainable parameters.
 - This borrows Kimi K3's MXFP4-weight/MXFP8-activation numerical split while
   intentionally applying it earlier: Kimi K3 reports enabling QAT from SFT
-  onward, whereas SPALMER will exercise it during base pretraining.
+  onward. MXFP4/MXFP8 remains a design target until an exact provider passes
+  the same capability contract; SPALMER does not simulate it meanwhile.
 - The Kimi-style scope is the routed expert GEMMs. Attention projections,
   routers, shared experts/channel paths, normalization, and latent projections
   stay in BF16 for the first implementation; this avoids quantizing unrelated
   components merely because the expert lane is low precision.
-- ``MXFP4 + MXFP8`` and ``NVFP4 + MXFP8`` are distinct selectable experiments,
-  not a claim that the installed backend accelerates both. A native request
-  must pass a real capability probe; otherwise the QAT lane reports emulated
-  BF16 matmul after format-faithful quantize/dequantize.
-- The first SPALMER reference lane is implemented for routed experts. Its
-  MXFP4, MXFP8, and NVFP4 quantize/dequantize values were checked against the
-  installed TorchAO reference and matched exactly on representative tensors.
-  It establishes training numerics, not native packed-kernel throughput.
+- Dense providers set `expert_execution="loop"`. Grouped dispatch is offered
+  only when the exact provider reports grouped support; SPALMER never routes a
+  low-precision request through the ordinary BF16 grouped `torch.bmm` path.
+- Unsupported pairs fail closed. There is no reference quantize/dequantize
+  backend, fake-quantization STE, independent-format auto pairing, or silent
+  BF16 matmul fallback in an executable checkpoint.
 - Combine FP4 weights with 2:4 structured sparsity where hardware supports it.
 - A duplicate FP32 shadow/master copy is not the preferred SPALMER path.
 - BF16 optimizer-resident master weights are the selected initial compromise.
@@ -561,10 +562,9 @@ Interfaces still to specify:
 
 Interfaces still to specify:
 
-- exact FP4 format and block-scale layout;
 - sparse mask ownership and update schedule;
 - whether sparsity is fixed, learned, or periodically regenerated;
-- accumulator and activation precision;
+- native compressed sparse provider and its exact operand pair;
 - checkpoint representation versus execution representation.
 
 ### C10. Adaptive potentiation and persistent plasticity
@@ -581,13 +581,15 @@ control policy.
   scalar.
 - During base-pretraining QAT, every expert has one BF16 optimizer master and a
   derived execution precision. A normal expert executes through FP4-family
-  quantization; a potentiated expert can execute through MXFP8, adaptive FP8,
-  or BF16 without adding another persistent full-size master copy.
+  hardware packing only when its exact native provider is verified; a
+  potentiated expert can execute through the verified BF16 tier without adding
+  another persistent full-size master copy. Other promoted tiers remain future
+  capability-gated experiments.
 - Deployment may collapse this into one packed canonical expert payload per
   expert. Promotion and demotion then become explicit representation migration.
-- The reference implementation derives temporary quantized operands from the
-  BF16 master during each expert call; it does not retain a second persistent
-  shadow payload.
+- The native implementation derives temporary packed operands from the BF16
+  master during each expert call; it does not retain a second persistent shadow
+  payload or run a fake quantizer.
 - Weight-level stochastic rounding can continue inside an expert, but it no
   longer decides which individual weights receive persistent promotion.
 
@@ -644,7 +646,9 @@ explicit comparison options.
 **State:** Partially implemented.
 
 - Backward should support FP8/MXFP8.
-- Persistent plastic state should support FP8 or adaptive FP8.
+- Persistent plastic state may support FP8 or adaptive FP8 only through a
+  capability-verified native implementation. Software encode/decode simulation
+  is not an executable option.
 - Base pretraining uses BF16 optimizer master/shadow weights; it does not retain
   an FP32 master copy. BF16 updates should use stochastic rounding or a
   compensated update rule so sub-ULP updates do not silently disappear.
@@ -652,9 +656,10 @@ explicit comparison options.
   in BF16, computes bounded update chunks in FP32, stochastically writes back
   to BF16, and retains Adam moments in FP32. The moments are optimizer state,
   not a duplicate weight tensor.
-- The current reference backward is ordinary BF16 autograd through an STE.
-  Explicit FP8/MXFP8 gradient/backward execution remains a separate C12 backend
-  milestone and must not be reported as implemented yet.
+- Native expert backward is implemented for the capability-verified dense
+  lanes. NVFP4/NVFP4 forward uses native MXFP8 dgrad/wgrad, and MXFP8/MXFP8
+  uses native MXFP8 forward, dgrad, and wgrad. BF16/BF16 uses ordinary native
+  PyTorch backward. No STE emulation is executable.
 - Potentiation promotes complete expert groups whose telemetry indicates that
   low-precision execution or updates are limiting them.
 - The implemented CPU-offload lane keeps persistent FP32 Adam moments in host
@@ -758,9 +763,10 @@ Current boundaries:
 - CPU-to-accelerator copies are ordered with execution and the cache retains
   recent rows, but asynchronous predictive prefetch and multi-request cache
   sharing remain later runtime work.
-- Resident caches mirror BF16 masters; MXFP4/NVFP4 execution values and MXFP8 or
-  BF16 potentiated values are derived after staging. Packed low-bit cache storage
-  remains coupled to the future native mixed-W4A8 kernel backend.
+- Resident caches mirror BF16 masters. A verified dense native provider packs
+  its exact low-precision operands after staging; a potentiated expert can use
+  native BF16 directly. Persistently packed cache storage and grouped native
+  low-precision execution remain separate future optimizations.
 
 ### C14. Adaptation interfaces
 
@@ -888,12 +894,14 @@ composable as more ideas are added.
 | 2026-09-01 | Assigned the working academic-style architecture name SPALMER: Surprise-Potentiated Addressed Linear Micro-Expert Routing. |
 | 2026-09-01 | Established mESmaC/spalmer as the canonical public MIT-licensed repository and promoted SPALMER from a working name to the architecture name. |
 | 2026-09-02 | Made duplicate FP32 shadow weights non-target architecture state; selected single-payload expert precision migration and compensated direct low-precision updates as the preferred masterless direction, with BF16 canonical storage as the simplest transitional lane. |
-| 2026-09-02 | Selected the first base-pretraining QAT contract: selectable NVFP4/MXFP4 forward weights, MXFP8 activations, and BF16 optimizer-resident master/shadow weights; masterless FP4 remains a later experiment. This adapts Kimi K3's reported MXFP4/MXFP8 split from post-training to base pretraining. |
-| 2026-09-02 | Implemented the routed-expert reference QAT lane in SPALMER with format-faithful MXFP4/NVFP4 weights, MXFP8 activations, one BF16 parameter/master payload, FP32 Adam moments, stochastic BF16 writeback, strict native-backend failure, and checkpointed precision/tokenizer provenance. Native mixed W4A8 and MXFP8 backward remain explicit later backends. |
+| 2026-09-02 | **Superseded numerical plan.** Selected the first base-pretraining QAT contract: selectable NVFP4/MXFP4 forward weights, MXFP8 activations, and BF16 optimizer-resident master/shadow weights; masterless FP4 remains a later experiment. This adapts Kimi K3's reported MXFP4/MXFP8 split from post-training to base pretraining. |
+| 2026-09-02 | **Retired implementation history; checkpoints requiring it are metadata-only and unloadable.** Implemented a routed-expert reference QAT lane with format-faithful MXFP4/NVFP4 quantize/dequantize, MXFP8 activation emulation, one BF16 parameter/master payload, FP32 Adam moments, and stochastic BF16 optimizer writeback. |
 | 2026-09-02 | Implemented physical request-level expert residency: full BF16 expert masters remain CPU-backed while coherent bounded expert rows are staged per layer on the accelerator, with transactional expansion/rollback, fixed-route bounds, checkpoint-independent caches, and placement/transfer telemetry. Added the single-device C12 CPU-offloaded FP32 Adam-moment lane with bounded accelerator update chunks. |
 | 2026-09-02 | Model-1 validation separated resident candidates `m` from per-token active experts `k`, restoring `2 <= k <= m` and the trained top-2 route. Cap sweeps through 20%, 30%, and 50% showed that prompt-global residency cannot preserve this checkpoint's diffuse routing; bounded training-time eligibility or token/layer-aware paging is now the required C13 follow-up. |
 | 2026-09-02 | Implemented C13 layer-local expert paging as the default inference policy: the router keeps all trained identities eligible, selected rows are tiled through a bounded CPU-backed accelerator cache, and Model 1 reproduced unrestricted logits, routes, and greedy output exactly with a two-row cache. Prompt-global NLL residency remains an experimental legacy comparison. |
 | 2026-09-03 | Replaced full-table fake-QAT PLE as the forward design with BF16 quotient/remainder PLE at layers 1..L-1, retained an exact BF16 layer-0 input table, removed the non-operative A/B label, and specified backend-aware planning plus an equal-parameter three-way evaluation. |
+| 2026-09-04 | Removed executable fake/reference precision. QR-PLE is the sole PLE backend in new format-v8 bundles; format-v7 QR bundles migrate, while fake-PLE bundles are metadata-only. Expert choices now come only from exact capability-verified pairs: native dense NVFP4/NVFP4 and MXFP8/MXFP8, or grouped BF16/BF16. Unsupported pairs fail closed in training and inference. |
+| 2026-09-04 | Applied the same native-only boundary to yyLab: removed software potentiated/adaptive FP8 optimizer masters and retired INT4/ternary fake-QAT controls; explicit precision, cache, and optimizer-placement selections must execute through a verified provider or fail closed. |
 
 ## Template for the next idea
 

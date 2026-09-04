@@ -2117,7 +2117,7 @@ wheels = [
 [[package]]
 name = "spalmer"
 version = "0.1.0"
-source = { git = "https://github.com/mESmaC/spalmer.git?rev=8c3f469#8c3f46997d4b72ac36737b4ca80e15f4b7e432e7" }
+source = { git = "https://github.com/mESmaC/spalmer.git?rev=b8fbe5c#b8fbe5c28f2c74d816eeee7bb69f1903d712790d" }
 dependencies = [
     { name = "torch" },
     { name = "zstandard" },
@@ -2740,7 +2740,7 @@ requires-dist = [
     { name = "safetensors", specifier = ">=0.5" },
     { name = "sentence-transformers", specifier = ">=6.0.0" },
     { name = "sentencepiece", specifier = ">=0.2" },
-    { name = "spalmer", extras = ["hf"], git = "https://github.com/mESmaC/spalmer.git?rev=8c3f469" },
+    { name = "spalmer", extras = ["hf"], git = "https://github.com/mESmaC/spalmer.git?rev=b8fbe5c" },
     { name = "tiktoken", specifier = ">=0.9" },
     { name = "tokenizers", specifier = ">=0.21" },
     { name = "torch", specifier = ">=2.8", index = "https://download.pytorch.org/whl/cu128" },

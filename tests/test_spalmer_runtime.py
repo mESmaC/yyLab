@@ -22,10 +22,10 @@ from yylab.models.spalmer import (
 )
 
 
-def _checkpoint_payload() -> dict:
-    return {
+def _checkpoint_payload(*, legacy: bool = False) -> dict:
+    payload = {
         "format": "spalmer.prototype.checkpoint",
-        "format_version": 5,
+        "format_version": 5 if legacy else 8,
         "model_parameter_dtype": "bfloat16",
         "model_config": {
             "vocab_size": 32,
@@ -33,14 +33,24 @@ def _checkpoint_payload() -> dict:
             "n_layers": 4,
             "tokenizer_version": 1,
             "tokenizer_fingerprint": "fixture",
+            **({} if legacy else {"ple_backend": "qr"}),
         },
         "kda_config": {"hidden_size": 8, "num_heads": 2},
         "mla_config": {"hidden_size": 8, "num_heads": 2},
         "experts_config": {
             "num_experts": 200,
             "active_experts": 2,
-            "expert_weight_format": "mxfp4",
-            "expert_activation_format": "mxfp8",
+            "expert_weight_format": "mxfp4" if legacy else "bfloat16",
+            "expert_activation_format": "mxfp8" if legacy else "bfloat16",
+            **(
+                {}
+                if legacy
+                else {
+                    "expert_master_dtype": "bfloat16",
+                    "expert_qat_backend": "auto",
+                    "expert_execution": "grouped",
+                }
+            ),
         },
         "directional_config": None,
         "atxy_config": None,
@@ -51,11 +61,12 @@ def _checkpoint_payload() -> dict:
         },
         "metadata": {"sequence_length": 2048, "kind": "code"},
     }
+    return payload
 
 
-def _write_checkpoint(path: Path) -> Path:
+def _write_checkpoint(path: Path, *, legacy: bool = False) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(_checkpoint_payload(), path)
+    torch.save(_checkpoint_payload(legacy=legacy), path)
     return path
 
 
@@ -75,7 +86,7 @@ def test_spalmer_checkpoint_resolves_direct_file_or_canonical_directory(tmp_path
 
 
 def test_spalmer_checkpoint_scan_is_model_free_and_returns_registry_fields(tmp_path: Path) -> None:
-    checkpoint = _write_checkpoint(tmp_path / "spalmer.pt")
+    checkpoint = _write_checkpoint(tmp_path / "spalmer.pt", legacy=True)
 
     result = scan_spalmer_checkpoint(checkpoint)
 
@@ -92,15 +103,31 @@ def test_spalmer_checkpoint_scan_is_model_free_and_returns_registry_fields(tmp_p
     assert result["base_cfg"]["max_position_embeddings"] == 2048
     assert result["metadata"] == {"sequence_length": 2048, "kind": "code"}
     assert result["experts_config"]["expert_weight_format"] == "mxfp4"
+    assert result["precision_executable"] is False
+    assert "retired emulated precision" in result["precision_rejection_reason"]
     assert result["checkpoint_ref"] == str(checkpoint.resolve())
     assert result["path"] == str(checkpoint.resolve().parent)
     assert is_spalmer_checkpoint(checkpoint)
 
 
+def test_legacy_emulated_checkpoint_is_scannable_but_never_loaded(
+    tmp_path: Path, monkeypatch
+) -> None:
+    checkpoint = _write_checkpoint(tmp_path / "legacy" / "spalmer.pt", legacy=True)
+    calls: list[Path] = []
+    package = types.ModuleType("spalmer")
+    package.load_checkpoint = lambda path, **kwargs: calls.append(Path(path))
+    monkeypatch.setitem(sys.modules, "spalmer", package)
+
+    with pytest.raises(ValueError, match="metadata-only.*retired emulated precision"):
+        load_spalmer_runtime(checkpoint)
+
+    assert calls == []
+
+
 def test_spalmer_checkpoint_scan_requires_valid_versioned_ple_backend(tmp_path: Path) -> None:
     payload = _checkpoint_payload()
     payload["format_version"] = 7
-    payload["model_config"]["ple_backend"] = "qr"
     checkpoint = tmp_path / "qr" / "spalmer.pt"
     checkpoint.parent.mkdir(parents=True)
     torch.save(payload, checkpoint)
@@ -108,6 +135,9 @@ def test_spalmer_checkpoint_scan_requires_valid_versioned_ple_backend(tmp_path: 
     result = scan_spalmer_checkpoint(checkpoint)
     assert result["ple_backend"] == "qr"
     assert result["base_cfg"]["ple_backend"] == "qr"
+    assert result["precision_executable"] is True
+    assert result["expert_precision"]["weight_format"] == "bfloat16"
+    assert result["expert_precision"]["activation_format"] == "bfloat16"
 
     del payload["model_config"]["ple_backend"]
     torch.save(payload, checkpoint)
@@ -122,8 +152,28 @@ def test_spalmer_checkpoint_scan_requires_valid_versioned_ple_backend(tmp_path: 
     payload["format_version"] = 8
     payload["model_config"]["ple_backend"] = "qr"
     torch.save(payload, checkpoint)
+    assert scan_spalmer_checkpoint(checkpoint)["format_version"] == 8
+
+    payload["format_version"] = 9
+    payload["model_config"]["ple_backend"] = "qr"
+    torch.save(payload, checkpoint)
     with pytest.raises(ValueError, match="unsupported SPALMER checkpoint format version"):
         scan_spalmer_checkpoint(checkpoint)
+
+
+def test_spalmer_scan_rejects_unknown_precision_pair_as_metadata_only(tmp_path: Path) -> None:
+    payload = _checkpoint_payload()
+    payload["experts_config"]["expert_weight_format"] = "imaginary_fp4"
+    payload["experts_config"]["expert_activation_format"] = "imaginary_fp8"
+    checkpoint = tmp_path / "unknown-precision" / "spalmer.pt"
+    checkpoint.parent.mkdir(parents=True)
+    torch.save(payload, checkpoint)
+
+    result = scan_spalmer_checkpoint(checkpoint)
+
+    assert result["precision_executable"] is False
+    assert "unsupported expert precision pair" in result["precision_rejection_reason"]
+    assert is_spalmer_checkpoint(checkpoint)
 
 
 def test_spalmer_scan_reads_nested_training_context_metadata(tmp_path: Path) -> None:
@@ -203,9 +253,14 @@ def test_generic_tokenizer_facade_supplies_the_hf_subset() -> None:
 
 
 class _FakeSpalmerModel(nn.Module):
-    def __init__(self, next_tokens: list[int] | None = None) -> None:
+    def __init__(
+        self,
+        next_tokens: list[int] | None = None,
+        *,
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> None:
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(1, dtype=torch.bfloat16))
+        self.weight = nn.Parameter(torch.ones(1, dtype=dtype))
         self.config = SimpleNamespace(vocab_size=8, d_model=4, n_layers=4)
         self.next_tokens = list(next_tokens or [2])
         self.calls = 0
@@ -367,6 +422,15 @@ def _fake_spalmer_module(monkeypatch, model, tokenizer, metadata) -> None:
     package = types.ModuleType("spalmer")
     package.load_checkpoint = lambda path, map_location: (model, tokenizer, metadata)
     monkeypatch.setitem(sys.modules, "spalmer", package)
+    monkeypatch.setattr(
+        "yylab.models.spalmer._require_native_precision_capability",
+        lambda scanned, device: {
+            "provider_id": "bf16_torch",
+            "weight_format": "bfloat16",
+            "activation_format": "bfloat16",
+            "grouped_available": True,
+        },
+    )
 
 
 def test_load_spalmer_runtime_is_lazy_and_wraps_a_generic_tokenizer(tmp_path, monkeypatch) -> None:
@@ -389,13 +453,48 @@ def test_load_spalmer_runtime_is_lazy_and_wraps_a_generic_tokenizer(tmp_path, mo
     assert isinstance(runtime.tokenizer, SpalmerTokenizerFacade)
     assert runtime.tokenizer.default_kind == "code"
     assert runtime.device.type == "cpu"
-    assert next(runtime.model.parameters()).dtype == torch.float32
+    assert next(runtime.model.parameters()).dtype == torch.bfloat16
     assert runtime.config.max_position_embeddings == 3072
     assert runtime.dynamic_residency is False
     assert runtime.expert_paging is False
     assert runtime.full_pool_routing is True
     assert any("NoPE" in note for note in runtime.notes)
     assert model.calls == 0
+
+
+def test_load_spalmer_runtime_preserves_validated_fp32_checkpoint_dtype(
+    tmp_path, monkeypatch
+) -> None:
+    checkpoint = tmp_path / "spalmer-fp32.pt"
+    payload = _checkpoint_payload()
+    payload["model_parameter_dtype"] = "float32"
+    payload["experts_config"].update(
+        expert_weight_format="float32",
+        expert_activation_format="float32",
+        expert_master_dtype="float32",
+    )
+    payload["model_state"] = {
+        name: value.float() for name, value in payload["model_state"].items()
+    }
+    torch.save(payload, checkpoint)
+    model = _FakeSpalmerModel(dtype=torch.float32)
+    tokenizer = _GenericTokenizer()
+    tokenizer.identity = SimpleNamespace(backend="spalmer-rpd-v2")
+    _fake_spalmer_module(monkeypatch, model, tokenizer, {})
+    monkeypatch.setattr(
+        "yylab.models.spalmer._require_native_precision_capability",
+        lambda scanned, device: {
+            "provider_id": "fp32_torch_cpu",
+            "weight_format": "float32",
+            "activation_format": "float32",
+            "grouped_available": True,
+        },
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    runtime = load_spalmer_runtime(checkpoint)
+
+    assert next(runtime.model.parameters()).dtype == torch.float32
 
 
 def test_load_spalmer_runtime_reads_nested_training_context(tmp_path, monkeypatch) -> None:
@@ -996,6 +1095,15 @@ def _fake_spalmer_module_with_override(monkeypatch, model) -> dict:
     package = types.ModuleType("spalmer")
     package.load_checkpoint = load_checkpoint
     monkeypatch.setitem(sys.modules, "spalmer", package)
+    monkeypatch.setattr(
+        "yylab.models.spalmer._require_native_precision_capability",
+        lambda scanned, device: {
+            "provider_id": "bf16_torch",
+            "weight_format": "bfloat16",
+            "activation_format": "bfloat16",
+            "grouped_available": True,
+        },
+    )
     return received
 
 
@@ -1389,7 +1497,7 @@ def test_dynamic_generation_passes_recurrence_steps_to_residency_controller(monk
 
 
 def test_scan_reports_recurrence_config_and_effective_depth(tmp_path: Path) -> None:
-    payload = _checkpoint_payload()
+    payload = _checkpoint_payload(legacy=True)
     payload["format_version"] = 6
     payload["model_config"]["recurrence"] = {
         "prelude_layers": 1,

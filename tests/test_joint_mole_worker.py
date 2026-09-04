@@ -83,7 +83,7 @@ def test_joint_per_token_worker_trains_and_saves_complete_bank(tmp_path, monkeyp
         "checkpoint_id": "checkpoint",
         "checkpoint_ref": "tiny-base",
         "adapter_id": "adapter",
-        "quant": "bf16",
+        "quant": "fp32",
         "num_experts": 3,
         "rank": 2,
         "alpha": 4.0,
@@ -111,7 +111,7 @@ def test_joint_per_token_worker_trains_and_saves_complete_bank(tmp_path, monkeyp
     assert summary["steps"] == 1
     assert summary["docs_seen"] == FixedBatches.docs_seen
     assert batch_configs == [{"cfg": cfg, "max_steps": 1, "kwargs": {}}]
-    assert lock_events == [("check", "checkpoint", "bf16"), ("commit", "checkpoint", "bf16")]
+    assert lock_events == [("check", "checkpoint", "fp32"), ("commit", "checkpoint", "fp32")]
 
     saved = load_mole_config(adapter_path, expected_base_ref="tiny-base")
     assert saved["config"]["router_type"] == "per_token"

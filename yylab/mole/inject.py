@@ -121,6 +121,8 @@ def attach_token_routers(
     model: nn.Module,
     cfg: MoLEConfig,
     projections: list[tuple[str, nn.Linear]],
+    *,
+    router_dtype: torch.dtype | None = None,
 ) -> dict[str, SharedTokenRouter]:
     """Register one learned per-token route on every adapted decoder block."""
 
@@ -140,6 +142,11 @@ def attach_token_routers(
         existing = getattr(block, TOKEN_ROUTER_MODULE, None)
         if isinstance(existing, SharedTokenRouter):
             router = existing
+            if router_dtype is not None and router.gate.weight.dtype != router_dtype:
+                raise RuntimeError(
+                    "existing shared token router dtype does not match the verified "
+                    "base compute dtype"
+                )
         else:
             hidden_size = configured_hidden or min(p.in_features for p in block_projections)
             reference = min(block_projections, key=lambda projection: projection.in_features)
@@ -147,6 +154,7 @@ def attach_token_routers(
                 hidden_size=hidden_size,
                 num_experts=cfg.num_experts,
                 top_k=cfg.top_k,
+                dtype=router_dtype,
                 device=reference.weight.device,
                 adaptive=cfg.adaptive.enabled,
                 identity_expert=cfg.identity_expert,
@@ -168,7 +176,11 @@ def attach_token_routers(
 
 
 def attach_shared_router(
-    model: nn.Module, cfg: MoLEConfig, *, install_hooks: bool = True
+    model: nn.Module,
+    cfg: MoLEConfig,
+    *,
+    install_hooks: bool = True,
+    router_dtype: torch.dtype | None = None,
 ) -> SharedPromptRouter:
     """Register one prompt router, optionally wiring it to input embeddings."""
 
@@ -176,6 +188,13 @@ def attach_shared_router(
         raise ValueError("a shared router requires router_type='shared_prompt'")
     existing = shared_router(model)
     if existing is not None:
+        if router_dtype is not None:
+            existing_dtype = next(existing.parameters()).dtype
+            if existing_dtype != router_dtype:
+                raise RuntimeError(
+                    "existing shared prompt router dtype does not match the verified "
+                    "base compute dtype"
+                )
         return existing
     get_embeddings = getattr(model, "get_input_embeddings", None)
     if not callable(get_embeddings):
@@ -190,6 +209,7 @@ def attach_shared_router(
         top_k=cfg.top_k,
         hidden_width=cfg.router_hidden_size,
         max_prompt_tokens=cfg.router_max_tokens,
+        dtype=router_dtype,
         device=weight.device,
         identity_expert=cfg.identity_expert,
     )
@@ -242,14 +262,45 @@ def inject_mole(
 ) -> list[tuple[str, MoLELinear]]:
     if cfg.router_type not in {"per_layer", "per_token", "shared_prompt"}:
         raise ValueError(f"unknown router type: {cfg.router_type}")
-    prompt_router = attach_shared_router(model, cfg) if cfg.router_type == "shared_prompt" else None
     targets = set(cfg.target_modules)
     projections = [
         (name, module)
         for name, module in list(model.named_modules())
         if isinstance(module, nn.Linear) and name.split(".")[-1] in targets
     ]
-    block_routers = attach_token_routers(model, cfg, projections) if cfg.router_type == "per_token" else {}
+    if not projections:
+        return []
+    projection_dtypes = {module.weight.dtype for _, module in projections}
+    if expert_dtype is None:
+        if len(projection_dtypes) != 1:
+            raise ValueError(
+                "mixed target projection dtypes require an explicit, verified MoLE compute dtype"
+            )
+        (expert_dtype,) = projection_dtypes
+    if expert_dtype not in {torch.float16, torch.bfloat16, torch.float32}:
+        raise ValueError(
+            "MoLE compute dtype must be one of FP16, BF16, or FP32; quantized bases "
+            "must pass their verified activation compute dtype explicitly"
+        )
+    floating_projection_dtypes = {
+        dtype
+        for dtype in projection_dtypes
+        if dtype in {torch.float16, torch.bfloat16, torch.float32}
+    }
+    if floating_projection_dtypes and floating_projection_dtypes != {expert_dtype}:
+        raise ValueError(
+            "MoLE compute dtype does not match the dense base projection dtype"
+        )
+    prompt_router = (
+        attach_shared_router(model, cfg, router_dtype=expert_dtype)
+        if cfg.router_type == "shared_prompt"
+        else None
+    )
+    block_routers = (
+        attach_token_routers(model, cfg, projections, router_dtype=expert_dtype)
+        if cfg.router_type == "per_token"
+        else {}
+    )
     replaced: list[tuple[str, MoLELinear]] = []
     for name, module in projections:
         parent, attr = _parent_and_attr(model, name)

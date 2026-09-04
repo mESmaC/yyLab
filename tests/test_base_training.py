@@ -20,22 +20,20 @@ from yylab.train.base_config import (
     fit_layers_to_parameter_target,
     fit_scratch_to_parameter_target,
     normalize_training_token_budget,
+    projected_training_memory_gb,
     resolve_training_token_budget,
     tokenizer_embedding_parameter_floor,
 )
 from yylab.train.low_precision import (
-    EMULATED_QAT_BACKEND,
     LOW_PRECISION_METADATA_KEY,
     NATIVE_NVFP4_BACKEND,
     QATLinear,
     apply_qat,
     apply_saved_qat,
-    fake_quant_nvfp4,
-    fake_structured_sparsity,
     native_nvfp4_status,
     qat_metadata,
-    structured_sparsity_mask,
 )
+from yylab.train.mxfp8 import NATIVE_MXFP8_BACKEND
 
 
 def _tokenizer_dir(tmp_path: Path) -> Path:
@@ -83,13 +81,14 @@ def test_nvfp4_sparse_training_preset_resolves_concrete_axes():
         "qat": "nvfp4",
         "qat_backend": "native",
         "qat_group_size": 16,
-        "activation_qat": "none",
+        "activation_qat": "nvfp4",
         "sparsity": "paired_4:8",
+        "sparsity_backend": "compressed",
     }
 
 
-def test_sparse_mxfp8_adaptive_preset_is_an_explicit_hardware_contract():
-    preset = TRAINING_RECIPE_PRESETS["nvfp4_sparse_mxfp8_adaptive"]
+def test_sparse_mxfp8_cpu_offload_preset_is_an_explicit_hardware_contract():
+    preset = TRAINING_RECIPE_PRESETS["nvfp4_sparse_mxfp8_cpu_offload"]
 
     assert preset["qat"] == "nvfp4"
     assert preset["qat_backend"] == "native"
@@ -97,8 +96,21 @@ def test_sparse_mxfp8_adaptive_preset_is_an_explicit_hardware_contract():
     assert preset["sparsity_backend"] == "compressed"
     assert preset["backward_precision"] == "mxfp8"
     assert preset["backward_backend"] == "native"
-    assert preset["master_weight_storage"] == "fp8_e4m3_adaptive"
-    assert preset["adaptive_max_promoted_fraction"] == 0.10
+    assert preset["optimizer_state"] == "cpu_offload"
+    assert preset["optimizer_impl"] == "cpu_offload_adamw"
+    assert "master_weight_storage" not in preset
+
+
+def test_cpu_offload_projection_counts_fp32_master_and_moments():
+    parameters = 1024
+    gpu_gb, cpu_gb = projected_training_memory_gb(
+        parameters,
+        parameter_dtype="bf16",
+        optimizer_state="cpu_offload",
+    )
+
+    assert gpu_gb * 2**30 == parameters * 4
+    assert cpu_gb * 2**30 == parameters * 12
 
 
 @pytest.mark.parametrize("family", ["qwen3", "llama", "bitnet"])
@@ -250,101 +262,338 @@ def test_scratch_validation_separates_native_and_training_context():
     spec = _tiny_spec()
     with pytest.raises(ValueError, match="exceeds native model context"):
         spec.validate(tokenizer_vocab_size=64, train_sequence_length=256)
-    with pytest.raises(ValueError, match="requires the BitNet"):
+    with pytest.raises(ValueError, match="unsupported QAT target"):
         spec.validate(tokenizer_vocab_size=64, qat_mode="ternary")
-    replace(spec, family="bitnet").validate(tokenizer_vocab_size=64, qat_mode="ternary")
+    with pytest.raises(ValueError, match="dense training only"):
+        replace(spec, family="bitnet").validate(tokenizer_vocab_size=64, qat_mode="nvfp4")
 
 
-@pytest.mark.parametrize(
-    ("family", "qat_format", "activation"),
-    [
-        ("llama", "int4", "int8"),
-        ("llama", "nvfp4", "nvfp4"),
-        ("bitnet", "ternary", "int8"),
-    ],
-)
-def test_qat_formats_propagate_gradients(family, qat_format, activation):
-    class TokenizerStub:
-        pad_token_id = 0
-        bos_token_id = 1
-        eos_token_id = 2
-
-        def __len__(self):
-            return 64
-
-    model = AutoModelForCausalLM.from_config(build_hf_config(_tiny_spec(family), TokenizerStub()))
-    metadata = qat_metadata(qat_format, group_size=16, activation=activation)
-    count = apply_qat(model, metadata)
-    ids = torch.randint(0, 64, (1, 8))
-    model(input_ids=ids, labels=ids).loss.backward()
-    assert count > 0
-    assert any(isinstance(module, QATLinear) for module in model.modules())
-    assert any(parameter.grad is not None for parameter in model.parameters())
-    assert metadata["training_state_is_low_bit"] is False
+@pytest.mark.parametrize("qat_format", ["int4", "ternary"])
+def test_low_precision_formats_without_native_kernels_are_rejected(qat_format):
+    with pytest.raises(ValueError, match="no native training backend"):
+        qat_metadata(qat_format)
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_nvfp4_emulation_matches_torchao_two_level_format(dtype):
-    from torchao.prototype.mx_formats.nvfp4_tensor import (
-        NVFP4Tensor,
-        per_tensor_amax_to_scale,
-    )
-
-    torch.manual_seed(19)
-    value = (torch.randn(19, 128, dtype=dtype) * 0.03).requires_grad_()
-    expected_scale = per_tensor_amax_to_scale(value.detach().abs().amax())
-    expected = NVFP4Tensor.to_nvfp4(
-        value.detach().contiguous(),
-        per_tensor_scale=expected_scale,
-    ).dequantize(dtype)
-
-    actual = fake_quant_nvfp4(value)
-    assert torch.equal(actual.detach(), expected)
-    actual.float().sum().backward()
-    assert torch.equal(value.grad, torch.ones_like(value))
-
-
-def test_nvfp4_emulation_preserves_exact_zero_and_requires_native_group_size():
-    value = torch.zeros(3, 32, dtype=torch.bfloat16, requires_grad=True)
-    quantized = fake_quant_nvfp4(value)
-
-    assert torch.equal(quantized, value)
-    assert torch.isfinite(quantized).all()
-    with pytest.raises(ValueError, match="group size of 16"):
-        fake_quant_nvfp4(value, group_size=32)
+def test_emulated_backend_requests_are_rejected_before_model_mutation():
+    with pytest.raises(ValueError, match="native execution only"):
+        qat_metadata("nvfp4", backend="emulated")
+    with pytest.raises(ValueError, match="MXFP8 backward backend"):
+        qat_metadata("nvfp4", backward_backend="emulated")
+    with pytest.raises(ValueError, match="structured-sparsity backend"):
+        qat_metadata("nvfp4", sparsity_backend="dense_masked")
+    with pytest.raises(ValueError, match="requires activation='nvfp4'"):
+        qat_metadata("nvfp4", activation="int8")
+    with pytest.raises(ValueError, match="requires activation='nvfp4'"):
+        qat_metadata("nvfp4", activation="none")
+    with pytest.raises(ValueError, match="activation quantization requires"):
+        qat_metadata("none", activation="nvfp4")
+    with pytest.raises(ValueError, match="compressed sparsity backend requires"):
+        qat_metadata("none", sparsity_backend="compressed")
+    with pytest.raises(ValueError, match="native backward backend requires"):
+        qat_metadata("none", backward_backend="native")
+    with pytest.raises(ValueError, match="exact block size of 16"):
+        qat_metadata("nvfp4", group_size=32)
 
 
-def test_saved_native_qat_recipe_falls_back_without_rewriting_recipe(monkeypatch):
+def test_auto_backend_never_falls_back_when_native_nvfp4_is_unavailable(monkeypatch):
     from yylab.train import low_precision
 
-    metadata = qat_metadata("nvfp4", backend="emulated")
-    assert metadata is not None
-    metadata["backend"] = NATIVE_NVFP4_BACKEND
-    metadata["backend_request"] = "native"
-    metadata["native_low_bit_gemm"] = True
-    model = torch.nn.Sequential(torch.nn.Linear(128, 128, bias=False))
-    model.config = SimpleNamespace(**{LOW_PRECISION_METADATA_KEY: dict(metadata)})
     monkeypatch.setattr(
         low_precision,
         "native_nvfp4_status",
-        lambda: (True, "native backend available in test"),
+        lambda _device=None: (False, "test native gap"),
+    )
+    with pytest.raises(RuntimeError, match="test native gap"):
+        qat_metadata("nvfp4", backend="auto")
+
+
+def test_runtime_mxfp8_resolution_keeps_exact_native_provider(monkeypatch):
+    from yylab.train import low_precision, mxfp8
+
+    target = SimpleNamespace(
+        weight=SimpleNamespace(
+            is_cuda=True,
+            dtype=torch.bfloat16,
+            device=torch.device("cuda:3"),
+        )
+    )
+    monkeypatch.setattr(
+        mxfp8,
+        "native_mxfp8_status",
+        lambda _device=None: (True, "native provider smoke passed"),
     )
 
-    count, runtime = apply_saved_qat(model)
+    backend, note = low_precision._resolve_backward_runtime_backend(
+        [("projection", target)],
+        precision="mxfp8",
+        recipe_backend=NATIVE_MXFP8_BACKEND,
+    )
 
-    assert count == 1
-    assert runtime is not None
-    assert runtime["backend"] == NATIVE_NVFP4_BACKEND
-    assert runtime["runtime_backend"] == EMULATED_QAT_BACKEND
-    assert runtime["native_low_bit_gemm"] is False
-    assert model.config.yylab_low_precision["backend"] == NATIVE_NVFP4_BACKEND
-    assert model[0].qat_recipe_backend == NATIVE_NVFP4_BACKEND
-    assert model[0].qat_backend == EMULATED_QAT_BACKEND
-    assert torch.isfinite(model(torch.randn(3, 128))).all()
+    assert backend == NATIVE_MXFP8_BACKEND
+    assert note == "native provider smoke passed"
+
+
+def _native_qat_metadata_for_worker(**overrides):
+    metadata = {
+        "version": 4,
+        "format": "nvfp4",
+        "backend": NATIVE_NVFP4_BACKEND,
+        "backend_request": "native",
+        "group_size": 16,
+        "activation": "nvfp4",
+        "parameter_dtype": "bf16",
+        "native_low_bit_gemm": True,
+        "backward_precision": "bf16",
+        "backward_backend": "none",
+        "backward_backend_request": "auto",
+        "native_low_bit_backward": False,
+        "sparsity": "none",
+        "sparsity_backend": "none",
+        "sparsity_backend_request": "auto",
+        "native_sparse_gemm": False,
+    }
+    metadata.update(overrides)
+    return metadata
+
+
+def test_continued_base_applies_requested_verified_qat_and_records_resolution(
+    monkeypatch,
+):
+    from yylab.workers import train as worker
+
+    model = torch.nn.Sequential(torch.nn.Linear(4, 4, bias=False))
+    model.config = SimpleNamespace()
+    metadata = _native_qat_metadata_for_worker()
+    applied: list[tuple[object, dict]] = []
+    monkeypatch.setattr(
+        worker,
+        "_requested_qat_metadata",
+        lambda *_args, **_kwargs: dict(metadata),
+    )
+
+    def apply(model_arg, metadata_arg):
+        applied.append((model_arg, metadata_arg))
+        setattr(model_arg.config, LOW_PRECISION_METADATA_KEY, dict(metadata_arg))
+        return 1
+
+    monkeypatch.setattr(worker, "apply_qat", apply)
+
+    effective, note = worker._configure_continued_low_precision(
+        model,
+        {"parameter_dtype": "bf16", "qat": "nvfp4"},
+        parameter_dtype="bf16",
+        inherit_checkpoint_low_precision=False,
+    )
+
+    assert applied == [(model, metadata)]
+    assert effective["qat"] == "nvfp4"
+    assert effective["resolved_low_precision"] == metadata
+    assert effective["inherit_checkpoint_low_precision"] is False
+    assert "applied requested verified native nvfp4" in str(note)
+
+
+def test_continued_base_rejects_conflicting_requested_and_inherited_qat(monkeypatch):
+    from yylab.workers import train as worker
+
+    inherited = _native_qat_metadata_for_worker()
+    requested = _native_qat_metadata_for_worker(
+        backward_precision="mxfp8",
+        backward_backend=NATIVE_MXFP8_BACKEND,
+        backward_backend_request="native",
+        native_low_bit_backward=True,
+    )
+    model = torch.nn.Sequential(torch.nn.Linear(2, 2))
+    model.config = SimpleNamespace(**{LOW_PRECISION_METADATA_KEY: inherited})
+    monkeypatch.setattr(
+        worker,
+        "_requested_qat_metadata",
+        lambda *_args, **_kwargs: requested,
+    )
+
+    with pytest.raises(ValueError, match="conflicts.*backward_precision"):
+        worker._configure_continued_low_precision(
+            model,
+            {"parameter_dtype": "bf16", "qat": "nvfp4"},
+            parameter_dtype="bf16",
+            inherit_checkpoint_low_precision=True,
+        )
+
+
+def test_continued_base_inheritance_records_the_effective_checkpoint_recipe(
+    monkeypatch,
+):
+    from yylab.workers import train as worker
+
+    inherited = _native_qat_metadata_for_worker()
+    model = torch.nn.Sequential(torch.nn.Linear(2, 2))
+    model.config = SimpleNamespace(**{LOW_PRECISION_METADATA_KEY: inherited})
+    monkeypatch.setattr(
+        worker,
+        "_requested_qat_metadata",
+        lambda *_args, **_kwargs: None,
+    )
+
+    effective, note = worker._configure_continued_low_precision(
+        model,
+        {"parameter_dtype": "bf16", "qat": "none"},
+        parameter_dtype="bf16",
+        inherit_checkpoint_low_precision=True,
+    )
+
+    assert effective["qat"] == "nvfp4"
+    assert effective["resolved_low_precision"] == inherited
+    assert effective["inherit_checkpoint_low_precision"] is True
+    assert "retained" in str(note)
+
+
+def test_continued_base_rejects_missing_inherited_qat_recipe(monkeypatch):
+    from yylab.workers import train as worker
+
+    model = torch.nn.Sequential(torch.nn.Linear(2, 2))
+    model.config = SimpleNamespace()
+    monkeypatch.setattr(
+        worker,
+        "_requested_qat_metadata",
+        lambda *_args, **_kwargs: None,
+    )
+
+    with pytest.raises(ValueError, match="has no native low-precision recipe"):
+        worker._configure_continued_low_precision(
+            model,
+            {"parameter_dtype": "bf16", "qat": "none"},
+            parameter_dtype="bf16",
+            inherit_checkpoint_low_precision=True,
+        )
+
+
+def test_saved_emulated_qat_recipe_fails_closed(monkeypatch):
+    model = torch.nn.Sequential(torch.nn.Linear(128, 128, bias=False))
+    model.config = SimpleNamespace(
+        **{
+            LOW_PRECISION_METADATA_KEY: {
+                "version": 3,
+                "format": "nvfp4",
+                "backend": "yylab_ste_emulation",
+                "sparsity": "none",
+                "sparsity_backend": "none",
+                "backward_precision": "bf16",
+                "backward_backend": "none",
+            }
+        }
+    )
+    from yylab.train import low_precision
+
+    monkeypatch.setattr(
+        low_precision,
+        "native_nvfp4_status",
+        lambda _device=None: (True, "native backend available in test"),
+    )
+
+    with pytest.raises(RuntimeError, match="is not native"):
+        apply_saved_qat(model)
+    assert type(model[0]) is torch.nn.Linear
+
+
+def test_base_loader_never_substitutes_dense_cpu_for_requested_quantization(monkeypatch):
+    import transformers
+
+    from yylab.models import loading
+
+    tokenizer = SimpleNamespace(pad_token="<pad>", eos_token="<eos>")
+    loaded: dict = {}
+
+    def load_model(*_args, **kwargs):
+        loaded.update(kwargs)
+        return SimpleNamespace(config=SimpleNamespace(use_cache=False))
+
+    monkeypatch.setattr(
+        transformers.AutoTokenizer,
+        "from_pretrained",
+        lambda *_args, **_kwargs: tokenizer,
+    )
+    monkeypatch.setattr(
+        transformers.AutoConfig,
+        "from_pretrained",
+        lambda *_args, **_kwargs: SimpleNamespace(),
+    )
+    monkeypatch.setattr(transformers.AutoModelForCausalLM, "from_pretrained", load_model)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    with pytest.raises(RuntimeError, match="NF4 bitsandbytes loading is unavailable.*CUDA is unavailable"):
+        loading.load_base("unused", "nf4")
+    with pytest.raises(RuntimeError, match="FP16 dense model execution is unavailable.*CPU"):
+        loading.load_base("unused", "fp16")
+    with pytest.raises(RuntimeError, match="BF16 dense model execution is unavailable.*CPU"):
+        loading.load_base("unused", "bf16")
+    with pytest.raises(ValueError, match="unsupported base precision"):
+        loading.load_base("unused", "made-up-precision")
+
+    loading.load_base("unused", "fp32")
+    assert loaded["dtype"] is torch.float32
+
+    loaded.clear()
+    legacy_recipe = {
+        "format": "nvfp4",
+        "backend": "yylab_ste_emulation",
+        "sparsity": "none",
+        "sparsity_backend": "none",
+        "backward_precision": "bf16",
+        "backward_backend": "none",
+    }
+    monkeypatch.setattr(
+        transformers.AutoConfig,
+        "from_pretrained",
+        lambda *_args, **_kwargs: SimpleNamespace(yylab_low_precision=legacy_recipe),
+    )
+    from yylab.models import precision_capabilities
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        precision_capabilities,
+        "require_model_precision",
+        lambda *_args, **_kwargs: None,
+    )
+    with pytest.raises(RuntimeError, match="is not native"):
+        loading.load_base("unused", "bf16")
+    assert not loaded
+
+    monkeypatch.setattr(
+        transformers.AutoConfig,
+        "from_pretrained",
+        lambda *_args, **_kwargs: SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        transformers,
+        "BitsAndBytesConfig",
+        lambda **kwargs: SimpleNamespace(**kwargs),
+    )
+    loading.load_base("unused", "int8")
+    assert loaded["dtype"] is torch.float16
+    assert loaded["device_map"] == {"": 0}
+
+
+@pytest.mark.parametrize(
+    "quantization_config",
+    [
+        {"quant_method": "bitnet", "linear_class": "autobitlinear"},
+        {"quant_method": "gptq"},
+    ],
+)
+def test_checkpoint_embedded_quantization_must_use_a_verified_yylab_provider(
+    quantization_config,
+):
+    from yylab.models.loading import reject_unverified_checkpoint_quantization
+
+    with pytest.raises(ValueError, match="checkpoint-embedded quantization"):
+        reject_unverified_checkpoint_quantization(
+            SimpleNamespace(quantization_config=quantization_config)
+        )
+
+    reject_unverified_checkpoint_quantization(SimpleNamespace())
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
-def test_saved_native_qat_recipe_falls_back_for_non_bf16_cuda(dtype):
+def test_saved_native_qat_recipe_fails_for_non_bf16_cuda(dtype):
     native, reason = native_nvfp4_status()
     if not native:
         pytest.skip(reason)
@@ -355,31 +604,32 @@ def test_saved_native_qat_recipe_falls_back_for_non_bf16_cuda(dtype):
     model.config = SimpleNamespace(**{LOW_PRECISION_METADATA_KEY: dict(metadata)})
     model = model.to(device="cuda", dtype=dtype)
 
-    count, runtime = apply_saved_qat(model)
-
-    assert count == 1
-    assert runtime is not None
-    assert runtime["runtime_backend"] == EMULATED_QAT_BACKEND
-    assert model[0].qat_recipe_backend == NATIVE_NVFP4_BACKEND
-    assert model[0].qat_backend == EMULATED_QAT_BACKEND
-    value = torch.randn(3, 128, device="cuda", dtype=dtype)
-    assert torch.isfinite(model(value)).all()
+    with pytest.raises(RuntimeError, match="not BF16"):
+        apply_saved_qat(model)
+    assert type(model[0]) is torch.nn.Linear
 
 
 def test_direct_native_qat_application_remains_strict(monkeypatch):
     from yylab.train import low_precision
 
-    metadata = qat_metadata("nvfp4", backend="emulated")
-    assert metadata is not None
-    metadata["backend"] = NATIVE_NVFP4_BACKEND
-    metadata["backend_request"] = "native"
-    metadata["native_low_bit_gemm"] = True
+    metadata = {
+        "version": 4,
+        "format": "nvfp4",
+        "backend": NATIVE_NVFP4_BACKEND,
+        "group_size": 16,
+        "activation": "nvfp4",
+        "parameter_dtype": "bf16",
+        "sparsity": "none",
+        "sparsity_backend": "none",
+        "backward_precision": "bf16",
+        "backward_backend": "none",
+    }
     model = torch.nn.Sequential(torch.nn.Linear(128, 128, bias=False))
     model.config = SimpleNamespace()
     monkeypatch.setattr(
         low_precision,
         "native_nvfp4_status",
-        lambda: (False, "native backend unavailable in test"),
+        lambda _device=None: (False, "native backend unavailable in test"),
     )
 
     with pytest.raises(RuntimeError, match="native NVFP4 QAT runtime is unavailable"):
@@ -387,53 +637,41 @@ def test_direct_native_qat_application_remains_strict(monkeypatch):
     assert type(model[0]) is torch.nn.Linear
 
 
-def test_paired_4_8_mask_is_deterministic_and_keeps_exactly_two_pairs():
-    value = torch.arange(1, 33, dtype=torch.float32).reshape(2, 16)
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("activation", "none"),
+        ("group_size", 32),
+        ("parameter_dtype", "fp16"),
+    ],
+)
+def test_saved_native_qat_requires_exact_w4a4_metadata(monkeypatch, field, value):
+    from yylab.train import low_precision
 
-    mask = structured_sparsity_mask(value, "paired_4:8")
-    repeated = structured_sparsity_mask(value, "paired_4:8")
-
-    assert torch.equal(mask, repeated)
-    assert mask.shape == value.shape
-    blocks = mask.to(torch.bool).reshape(-1, 8)
-    pairs = blocks.reshape(-1, 4, 2)
-    assert torch.equal(pairs[..., 0], pairs[..., 1])
-    assert torch.all(pairs[..., 0].sum(dim=-1) == 2)
-    assert mask.count_nonzero().item() * 2 == mask.numel()
-
-
-def test_paired_4_8_fake_sparsity_uses_straight_through_gradients():
-    value = torch.arange(1, 17, dtype=torch.float32).reshape(2, 8).requires_grad_()
-    gradient = torch.linspace(0.25, 4.0, value.numel()).reshape_as(value)
-
-    sparse = fake_structured_sparsity(value, "paired_4:8")
-    (sparse * gradient).sum().backward()
-
-    assert value.grad is not None
-    assert torch.equal(value.grad, gradient)
-    assert sparse.count_nonzero().item() * 2 == sparse.numel()
-
-
-def test_nvfp4_paired_4_8_metadata_and_modules_preserve_sparsity_contract():
-    metadata = qat_metadata(
-        "nvfp4",
-        sparsity="paired_4:8",
-        backend="emulated",
+    metadata = {
+        "version": 4,
+        "format": "nvfp4",
+        "backend": NATIVE_NVFP4_BACKEND,
+        "group_size": 16,
+        "activation": "nvfp4",
+        "parameter_dtype": "bf16",
+        "sparsity": "none",
+        "sparsity_backend": "none",
+        "backward_precision": "bf16",
+        "backward_backend": "none",
+    }
+    metadata[field] = value
+    model = torch.nn.Sequential(torch.nn.Linear(128, 128, bias=False))
+    model.config = SimpleNamespace()
+    monkeypatch.setattr(
+        low_precision,
+        "native_nvfp4_status",
+        lambda _device=None: (True, "native backend available in test"),
     )
 
-    assert metadata is not None
-    assert metadata["sparsity"] == "paired_4:8"
-    assert metadata["sparsity_density"] == 0.5
-    assert metadata["native_sparse_gemm"] is False
-    assert metadata["compressed_sparse_checkpoint"] is False
-    assert metadata["backend"] == "yylab_ste_emulation"
-
-    model = torch.nn.Sequential(torch.nn.Linear(16, 16, bias=False))
-    model.config = SimpleNamespace()
-    assert apply_qat(model, metadata) == 1
-    qat_modules = [module for module in model.modules() if isinstance(module, QATLinear)]
-    assert qat_modules
-    assert all(module.qat_sparsity == "paired_4:8" for module in qat_modules)
+    with pytest.raises(RuntimeError, match="exact native W4A4 contract"):
+        apply_qat(model, metadata)
+    assert type(model[0]) is torch.nn.Linear
 
 
 def test_native_nvfp4_paired_4_8_forward_backward_when_available():
@@ -496,7 +734,7 @@ def test_compressed_nvfp4_forward_native_mxfp8_backward_when_available():
     model = model.to(device="cuda", dtype=torch.bfloat16)
     assert apply_qat(model, metadata) == 1
     assert model[0].qat_sparsity_backend == "cusparselt_compressed_nvfp4"
-    assert model[0].qat_backward_backend == "native"
+    assert model[0].qat_backward_backend == NATIVE_MXFP8_BACKEND
 
     value = torch.randn(
         3,
@@ -523,7 +761,6 @@ def test_recommended_low_precision_recipe_completes_real_qwen_optimizer_step():
     from yylab.train.loop import CPUOffloadAdamW
     from yylab.train.low_precision import native_sparse_nvfp4_status
     from yylab.train.mxfp8 import native_mxfp8_status
-    from yylab.train.potentiated import FP8_ADAPTIVE_MASTER
 
     sparse, sparse_reason = native_sparse_nvfp4_status()
     mxfp8, mxfp8_reason = native_mxfp8_status()
@@ -556,8 +793,6 @@ def test_recommended_low_precision_recipe_completes_real_qwen_optimizer_step():
     optimizer = CPUOffloadAdamW(
         model.parameters(),
         lr=1e-3,
-        master_weight_storage=FP8_ADAPTIVE_MASTER,
-        adaptive_max_promoted_fraction=0.10,
     )
     input_ids = torch.randint(0, config.vocab_size, (1, 16), device="cuda")
 
@@ -568,9 +803,9 @@ def test_recommended_low_precision_recipe_completes_real_qwen_optimizer_step():
     summary = optimizer.master_state_summary()
 
     assert torch.isfinite(loss)
-    assert summary["format"] == FP8_ADAPTIVE_MASTER
+    assert summary["format"] == "fp32"
     assert summary["moment_format"] == "fp32"
-    assert float(summary["promoted_fraction"]) <= 0.10
+    assert float(summary["promoted_fraction"]) == 0.0
     assert all(torch.isfinite(parameter.float()).all() for parameter in model.parameters())
 
 
@@ -643,13 +878,11 @@ def test_run_base_scratch_end_to_end_and_reload(tmp_path, monkeypatch):
         "architecture": _tiny_spec().to_dict(),
         "precision": {
             "parameter_dtype": "fp32",
-            "qat": "int4",
-            "qat_group_size": 16,
-            "activation_qat": "int8",
+            "qat": "none",
         },
         "optimizer": {
             "implementation": "torch_adamw",
-            "state": "gpu",
+            "state": "auto",
             "lr": 1e-3,
             "weight_decay": 0.01,
             "beta1": 0.8,
@@ -680,7 +913,7 @@ def test_run_base_scratch_end_to_end_and_reload(tmp_path, monkeypatch):
     summary = worker.run_base(config, tmp_path / "run")
     out = checkpoint_dir(out_id)
     assert summary["initialization"] == "scratch"
-    assert summary["qat"] == "int4"
+    assert summary["qat"] == "none"
     assert summary["result"]["steps"] == 1
     assert (out / "model.safetensors").is_file()
     assert (out / "yylab_recipe.json").is_file()
@@ -691,17 +924,16 @@ def test_run_base_scratch_end_to_end_and_reload(tmp_path, monkeypatch):
     assert all(tokenized_view["reconciliation"].values())
     assert summary["data_provenance"]["training"] == tokenized_view
     saved_config = json.loads((out / "config.json").read_text("utf-8"))
-    assert saved_config["yylab_low_precision"]["format"] == "int4"
+    assert "yylab_low_precision" not in saved_config
     assert saved_config["max_position_embeddings"] == 128
     assert saved_config["yylab_training_recipe"]["objective"] == "causal_lm"
-    assert saved_config["yylab_training_recipe"]["precision"]["qat"] == "int4"
+    assert saved_config["yylab_training_recipe"]["precision"]["qat"] == "none"
 
     model, tokenizer, cuda, quant, notes = loading.load_base(str(out), "fp32")
     assert not cuda
     assert quant == "fp32"
     assert len(tokenizer) > 0
-    assert any(isinstance(module, QATLinear) for module in model.modules())
-    assert any("restored int4 QAT" in note for note in notes)
+    assert not any(isinstance(module, QATLinear) for module in model.modules())
 
     dense_model, _, _, _, dense_notes = loading.load_base(
         str(out),
@@ -710,12 +942,12 @@ def test_run_base_scratch_end_to_end_and_reload(tmp_path, monkeypatch):
     )
     assert not any(isinstance(module, QATLinear) for module in dense_model.modules())
     assert not hasattr(dense_model.config, "yylab_low_precision")
-    assert any("without restoring inherited QAT" in note for note in dense_notes)
+    assert not any("without restoring inherited QAT" in note for note in dense_notes)
     row = db.q1("SELECT * FROM checkpoints WHERE id=?", (out_id,))
     metadata = json.loads(row["meta_json"])
     assert row["kind"] == "base"
     assert metadata["initialization"] == "scratch"
-    assert metadata["precision"]["qat"] == "int4"
+    assert metadata["precision"]["qat"] == "none"
 
 
 def test_failed_base_cleanup_removes_only_pending_output():
@@ -752,6 +984,66 @@ def test_cpu_offload_optimizer_honors_all_numerical_controls():
     assert optimizer.param_groups[0]["weight_decay"] == 0.1
     assert optimizer.param_groups[0]["betas"] == (0.8, 0.95)
     assert optimizer.param_groups[0]["eps"] == 1e-6
+    for parameter in model.parameters():
+        parameter.grad = torch.ones_like(parameter)
+    optimizer.step()
+    assert all(
+        state["master_param"].device.type == "cpu"
+        and state["master_param"].dtype == torch.float32
+        for state in optimizer.state.values()
+    )
+    assert optimizer.master_state_summary()["format"] == "fp32"
+
+
+@pytest.mark.parametrize(
+    "optimizer",
+    [
+        {"master_weight_storage": "fp8_e4m3_potentiated"},
+        {"master_weight_storage": "fp8_e4m3_adaptive"},
+        {"adaptive_max_promoted_fraction": 0.1},
+    ],
+)
+def test_base_worker_rejects_retired_optimizer_master_settings(optimizer):
+    from yylab.workers.train import _make_base_optimizer
+
+    with pytest.raises(ValueError, match="not executable"):
+        _make_base_optimizer(torch.nn.Linear(2, 2), {"optimizer": optimizer}, cuda=False)
+
+
+def test_fp32_cpu_offload_optimizer_state_resumes_exactly_on_cpu():
+    from yylab.train.loop import CPUOffloadAdamW
+
+    first_parameter = torch.nn.Parameter(torch.tensor([1.0, -2.0]))
+    first = CPUOffloadAdamW([first_parameter], lr=1e-3)
+    first_parameter.grad = torch.tensor([0.25, -0.5])
+    first.step()
+
+    second_parameter = torch.nn.Parameter(first_parameter.detach().clone())
+    second = CPUOffloadAdamW([second_parameter], lr=1e-3)
+    second.load_state_dict(first.state_dict())
+    assert all(
+        tensor.device.type == "cpu" and tensor.dtype == torch.float32
+        for state in second.state.values()
+        for tensor in state.values()
+        if isinstance(tensor, torch.Tensor)
+    )
+
+    gradient = torch.tensor([-0.125, 0.75])
+    first_parameter.grad = gradient.clone()
+    second_parameter.grad = gradient.clone()
+    first.step()
+    second.step()
+    assert torch.equal(first_parameter, second_parameter)
+
+
+def test_cpu_offload_optimizer_rejects_legacy_fp8_state():
+    from yylab.train.loop import CPUOffloadAdamW
+
+    optimizer = CPUOffloadAdamW([torch.nn.Parameter(torch.ones(2))])
+    state = optimizer.state_dict()
+    state["param_groups"][0]["master_weight_storage"] = "fp8_e4m3_adaptive"
+    with pytest.raises(ValueError, match="not executable"):
+        optimizer.load_state_dict(state)
 
 
 def test_qat_base_auto_selects_high_precision_lora_instead_of_qlora():
@@ -762,6 +1054,17 @@ def test_qat_base_auto_selects_high_precision_lora_instead_of_qlora():
     assert _auto_method_quant(checkpoint, "nf4") == ("lora", "bf16")
 
 
+def test_qat_base_auto_rejects_incoherent_dense_lock():
+    from yylab.ui.pages.train_mole import _auto_method_quant
+
+    checkpoint = {
+        "meta_json": json.dumps({"precision": {"qat": "nvfp4"}}),
+        "quant_locked": "fp32",
+    }
+    with pytest.raises(ValueError, match="saved native QAT requires BF16"):
+        _auto_method_quant(checkpoint, "bf16")
+
+
 def test_base_ui_recipe_builder_keeps_independent_training_axes():
     from yylab.ui.pages.train_base import _base_run_config
 
@@ -769,7 +1072,7 @@ def test_base_ui_recipe_builder_keeps_independent_training_axes():
         initialization={"mode": "scratch", "tokenizer_ref": "tokenizer"},
         method="full",
         architecture=_tiny_spec().to_dict(),
-        precision={"parameter_dtype": "bf16", "qat": "ternary"},
+        precision={"parameter_dtype": "bf16", "qat": "nvfp4"},
         optimizer={"implementation": "cpu_offload_adamw", "state": "cpu_offload", "lr": 3e-4},
         scheduler={"name": "cosine", "warmup_ratio": 0.03},
         corpora=["corpus-z", "corpus-a"],
@@ -792,7 +1095,7 @@ def test_base_ui_recipe_builder_keeps_independent_training_axes():
     assert config["initialization"]["mode"] == "scratch"
     assert config["objective"] == "chat_sft"
     assert config["architecture"]["max_position_embeddings"] == 128
-    assert config["precision"]["qat"] == "ternary"
+    assert config["precision"]["qat"] == "nvfp4"
     assert config["optimizer"]["state"] == "cpu_offload"
     assert config["scheduler"]["warmup_ratio"] == 0.03
     assert config["corpora"] == ["corpus-z", "corpus-a"]

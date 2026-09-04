@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import torch
 from transformers import LlamaConfig, LlamaForCausalLM
 
 from yylab.infer.engine import (
@@ -11,6 +12,9 @@ from yylab.infer.engine import (
     LoadSpec,
     _adaptive_kv_reserve_bytes,
     _cache_kwargs,
+    _validate_cache_selection,
+    available_cache_implementations,
+    available_kv_precisions,
     format_messages,
 )
 from yylab.infer.quantized_offload_cache import QuantizedOffloadedCache
@@ -106,7 +110,7 @@ def _tiny_llama_dir(tmp_path: Path) -> Path:
     return out
 
 
-def _fake_loader(tmp_path: Path, monkeypatch):
+def _fake_loader(tmp_path: Path, monkeypatch, *, cuda: bool = False):
     from transformers import AutoModelForCausalLM
 
     import yylab.infer.engine as engine_mod
@@ -121,10 +125,14 @@ def _fake_loader(tmp_path: Path, monkeypatch):
         max_position_embeddings=None,
     ):
         m = AutoModelForCausalLM.from_pretrained(ref)
+        if cuda:
+            import torch
+
+            m.to(dtype=torch.bfloat16)
         if max_position_embeddings is not None:
             m.config.max_position_embeddings = max_position_embeddings
         m.config.use_cache = True
-        return m, FakeTok(), False, quant, []
+        return m, FakeTok(), cuda, quant, []
 
     monkeypatch.setattr(engine_mod, "load_base", fake_load, raising=False)
     import yylab.models.loading as loading_mod
@@ -182,9 +190,72 @@ def test_resident_quantized_cache_is_explicitly_quanto_int4() -> None:
     assert kwargs["cache_config"]["backend"] == "quanto"
     assert kwargs["cache_config"]["nbits"] == 4
     assert any("Optimum Quanto" in note for note in notes)
-    with pytest.raises(ValueError, match="supports int4, not int8"):
+    with pytest.raises(ValueError, match="requires one of.*int4"):
         _cache_kwargs(
             {"cache_implementation": "quantized", "kv_quant": "int8"},
+            cuda=True,
+        )
+
+
+def test_cache_selection_is_hardware_gated_and_fail_closed(monkeypatch) -> None:
+    assert available_cache_implementations(False) == {"dynamic": "Dynamic (default)"}
+    with pytest.raises(RuntimeError, match="requires CUDA.*will not substitute"):
+        _cache_kwargs(
+            {"cache_implementation": "static", "kv_quant": "none"},
+            cuda=False,
+        )
+    with pytest.raises(ValueError, match="unknown KV cache implementation"):
+        _cache_kwargs(
+            {"cache_implementation": "imaginary", "kv_quant": "none"},
+            cuda=True,
+        )
+
+    import yylab.infer.engine as engine_module
+
+    monkeypatch.setattr(engine_module, "_upstream_cache_implementations", lambda: {"dynamic"})
+    with pytest.raises(RuntimeError, match="unavailable in the installed runtime"):
+        _validate_cache_selection(
+            {"cache_implementation": "static", "kv_quant": "none"},
+            cuda=True,
+        )
+
+
+def test_engine_rejects_cache_before_unloading_or_loading_model(monkeypatch) -> None:
+    import yylab.models.loading as loading_module
+
+    sentinel = object()
+    engine = Engine()
+    engine.model = sentinel
+    load_called = False
+
+    def fail_load(*_args, **_kwargs):
+        nonlocal load_called
+        load_called = True
+        raise AssertionError("base loading must not start")
+
+    monkeypatch.setattr(loading_module, "load_base", fail_load)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    with pytest.raises(RuntimeError, match="requires CUDA.*will not substitute"):
+        engine.load(
+            LoadSpec(
+                ref="unused",
+                quant="fp32",
+                settings={"cache_implementation": "static", "kv_quant": "none"},
+            )
+        )
+
+    assert engine.model is sentinel
+    assert load_called is False
+
+
+def test_kv_precision_choices_match_real_cache_storage() -> None:
+    assert tuple(available_kv_precisions("quantized")) == ("int4",)
+    assert tuple(available_kv_precisions("quantized_offloaded")) == ("int4", "int8")
+    assert tuple(available_kv_precisions("dynamic")) == ("none",)
+    with pytest.raises(ValueError, match="not an alias for INT8"):
+        _cache_kwargs(
+            {"cache_implementation": "quantized_offloaded", "kv_quant": "fp8"},
             cuda=True,
         )
 
@@ -216,6 +287,7 @@ def test_engine_builds_packed_quantized_offload_cache() -> None:
             "kv_offload_pin_memory": False,
         },
     )
+    engine.cuda = True
 
     kwargs = engine._generate_kwargs(
         torch.ones((1, 4), dtype=torch.long),
@@ -240,6 +312,7 @@ def test_adaptive_reserve_for_quantized_offload_covers_active_layer_and_residual
     )
     settings = {
         "cache_implementation": "quantized_offloaded",
+        "kv_quant": "int4",
         "kv_offload_residual_length": 2,
     }
 
@@ -443,7 +516,7 @@ def test_raw_context_plan_rejects_multi_turn_payload():
 def test_engine_with_mole_adapter(tmp_path, monkeypatch):
     from transformers import AutoModelForCausalLM
 
-    model_dir = _fake_loader(tmp_path, monkeypatch)
+    model_dir = _fake_loader(tmp_path, monkeypatch, cuda=True)
 
     base = AutoModelForCausalLM.from_pretrained(model_dir)
     mole_cfg = MoLEConfig(num_experts=2, rank=4, alpha=8.0, top_k=2, target_modules=("q_proj", "v_proj"))
@@ -462,10 +535,37 @@ def test_engine_with_mole_adapter(tmp_path, monkeypatch):
     assert isinstance("".join(chunks), str)
 
 
-def test_engine_with_native_per_token_mole_adapter(tmp_path, monkeypatch):
+def test_engine_rejects_mole_cpu_widening(tmp_path, monkeypatch):
     from transformers import AutoModelForCausalLM
 
     model_dir = _fake_loader(tmp_path, monkeypatch)
+    base = AutoModelForCausalLM.from_pretrained(model_dir)
+    mole_cfg = MoLEConfig(
+        num_experts=2,
+        rank=2,
+        alpha=4.0,
+        top_k=1,
+        target_modules=("q_proj",),
+    )
+    inject_mole(base, mole_cfg)
+    adapter_dir = tmp_path / "cpu-adapter"
+    save_mole(adapter_dir, base, mole_cfg, base_ref=str(model_dir))
+
+    with pytest.raises(RuntimeError, match="requires CUDA.*will not substitute"):
+        Engine().load(
+            LoadSpec(
+                ref=str(model_dir),
+                quant="bf16",
+                adapter_path=str(adapter_dir),
+                adapter_arch="mole",
+            )
+        )
+
+
+def test_engine_with_native_per_token_mole_adapter(tmp_path, monkeypatch):
+    from transformers import AutoModelForCausalLM
+
+    model_dir = _fake_loader(tmp_path, monkeypatch, cuda=True)
     base = AutoModelForCausalLM.from_pretrained(model_dir)
     mole_cfg = MoLEConfig(
         num_experts=3,

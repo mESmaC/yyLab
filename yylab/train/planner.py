@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-QUANT_BYTES = {"bf16": 2.0, "fp16": 2.0, "fp8": 1.0, "int8": 1.1, "nf4": 0.6}
+QUANT_BYTES = {"bf16": 2.0, "fp16": 2.0, "fp32": 4.0, "int8": 1.1, "nf4": 0.6}
 OPTIMIZER_BYTES_PER_PARAM = 16.0
 ADAPTER_TRAINING_BYTES_PER_PARAM = 6.0
 JOINT_ADAPTER_TRAINING_BYTES_PER_PARAM = 8.0
@@ -156,12 +156,18 @@ def _fits(vram_gb: float, peak: float) -> bool:
 
 
 def plan_training(inp: PlanInput) -> TrainPlan:
+    requested_quant = str(inp.quant or "").strip().casefold()
+    if requested_quant not in QUANT_BYTES:
+        raise ValueError(
+            f"unsupported training precision {requested_quant or '<empty>'!r}; "
+            "the planner never estimates an unimplemented or emulated format"
+        )
     notes: list[str] = []
     p = inp.params_b
     seq = inp.seq_len
 
     def base_gb(quant: str) -> float:
-        return p * QUANT_BYTES.get(quant, 2.0) * 1.12
+        return p * QUANT_BYTES[quant] * 1.12
 
     def adapter_gb() -> float:
         active = 1 if inp.isolated_expert_training else inp.num_experts
@@ -225,7 +231,7 @@ def plan_training(inp: PlanInput) -> TrainPlan:
         candidates += [("lora", "bf16", True, False, mb) for mb in adapter_batches]
     if inp.method in {"auto", "qlora"}:
         for mb in adapter_batches:
-            candidates.append(("qlora", inp.quant, True, False, mb))
+            candidates.append(("qlora", requested_quant, True, False, mb))
 
     best: TrainPlan | None = None
     for method, quant, gc, off, mb in candidates:
@@ -236,7 +242,7 @@ def plan_training(inp: PlanInput) -> TrainPlan:
         if best is None or plan.est_peak_gb < best.est_peak_gb:
             best = plan
 
-    plan = best or build("qlora", inp.quant, True, True, 1)
+    plan = best or build("qlora", requested_quant, True, True, 1)
     if not plan.feasible:
         plan.notes.append("Model is too large for the implemented training path at this sequence length.")
         if seq > 512:

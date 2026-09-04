@@ -17,16 +17,36 @@ from ..mole.store import apply_mole_weights, load_mole_config, load_mole_weights
 
 def load_base_full(ref: str, dtype=None):
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
+    from ..models.loading import reject_unverified_checkpoint_quantization
+    from ..models.precision_capabilities import require_dense_precision
     from ..train.low_precision import apply_saved_qat
 
-    dtype = dtype or torch.bfloat16
+    # Export is deliberately CPU-resident.  Defaulting this path to BF16 used
+    # to bypass yyLab's device capability contract and could select emulated
+    # CPU arithmetic.  Preserve an explicit supported request, otherwise use
+    # universally native CPU FP32.
+    dtype = dtype or torch.float32
+    dtype_name = {
+        torch.bfloat16: "bf16",
+        torch.float16: "fp16",
+        torch.float32: "fp32",
+    }.get(dtype)
+    if dtype_name is None:
+        raise ValueError(f"unsupported export dtype: {dtype}")
+    require_dense_precision(dtype_name, "cpu")
     tokenizer = AutoTokenizer.from_pretrained(ref)
     if tokenizer.pad_token is None and tokenizer.eos_token is not None:
         tokenizer.pad_token = tokenizer.eos_token
+    base_cfg = AutoConfig.from_pretrained(ref)
+    reject_unverified_checkpoint_quantization(base_cfg)
     model = AutoModelForCausalLM.from_pretrained(
-        ref, dtype=dtype, device_map="cpu", attn_implementation="sdpa"
+        ref,
+        config=base_cfg,
+        dtype=dtype,
+        device_map="cpu",
+        attn_implementation="sdpa",
     )
     apply_saved_qat(model)
     model.config.use_cache = True
@@ -53,7 +73,11 @@ def merge_lora(ref: str, adapter_path: str, out_dir: Path, dtype=None) -> Path:
                 "merging it into a tied-embedding base would double-apply its update"
             )
     model, tokenizer = load_base_full(ref, dtype)
-    model = PeftModel.from_pretrained(model, adapter_path)
+    model = PeftModel.from_pretrained(
+        model,
+        adapter_path,
+        autocast_adapter_dtype=False,
+    )
     model = model.merge_and_unload()
     return _save(model, tokenizer, out_dir)
 
@@ -178,8 +202,6 @@ def merge_mole(
     calib_ids: list[list[int]] | None = None,
     dtype=None,
 ) -> Path:
-    import torch
-
     adapter_cfg = load_mole_config(adapter_path, expected_base_ref=ref)
     cfg = load_mole_config(router_path, expected_base_ref=ref) if router_path else adapter_cfg
     if cfg.get("layers") != adapter_cfg.get("layers"):
@@ -196,7 +218,8 @@ def merge_mole(
             "a static merge cannot preserve dynamic token routing"
         )
     model, tokenizer = load_base_full(ref, dtype)
-    inject_mole(model, mole_cfg, expert_dtype=torch.bfloat16 if dtype is None else dtype)
+    expert_dtype = next(model.parameters()).dtype
+    inject_mole(model, mole_cfg, expert_dtype=expert_dtype)
     apply_mole_weights(model, load_mole_weights(router_path or adapter_path))
     weights = expert_usage_weights(model, calib_ids) if calib_ids else None
     if mole_cfg.router_type == "per_token":

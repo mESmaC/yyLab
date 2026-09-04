@@ -47,18 +47,25 @@ MANIFEST_SCHEMA_VERSION = 1
 TOKENIZER_CONTRACT_VERSION = 1
 INITIALIZATION_SCRATCH = "scratch"
 INITIALIZATION_CHECKPOINT = "checkpoint"
-CHECKPOINT_EXECUTION_KEYS = frozenset(
-    {"attention_backend", "require_fla", "allow_reference_attention"}
+CHECKPOINT_EXECUTION_KEYS = frozenset({"attention_backend", "require_fla"})
+# Version 7 is the one migratable QR-PLE predecessor; version 8 is the first
+# format with the retired fake-PLE knobs physically absent.  Older bundles are
+# metadata-only because executing them would require emulation.
+SUPPORTED_SPALMER_FORMAT_VERSIONS = frozenset({7, 8})
+# New scratch runs use QR-PLE.  Legacy fake-QAT bundles can be scanned for
+# identification, but yyLab never loads, infers from, or continues them.
+PLE_BACKENDS = frozenset({"qr"})
+DEFAULT_PLE_BACKEND = "qr"
+EXPERT_PRECISION_PAIRS = frozenset(
+    {
+        ("mxfp4", "mxfp8"),
+        ("nvfp4", "nvfp4"),
+        ("mxfp6", "mxfp8"),
+        ("mxfp8", "mxfp8"),
+        ("nvfp4", "mxfp8"),
+        ("bfloat16", "bfloat16"),
+    }
 )
-# A v5 bundle has no recurrence block at all; a v6 bundle carries one that may
-# still be ``None``; a v7 bundle additionally names its PLE backend.  All three
-# remain loadable starting points for continued runs.
-SUPPORTED_SPALMER_FORMAT_VERSIONS = frozenset({5, 6, 7})
-# Per-layer embedding backends a scratch recipe may request.  A recipe with no
-# ``spalmer.ple_backend`` key resolves to the legacy fake-QAT tables, and a
-# continued run always inherits the parent bundle's backend.
-PLE_BACKENDS = frozenset({"fake_qat", "qr"})
-DEFAULT_PLE_BACKEND = "fake_qat"
 RECURRENCE_SAMPLING_MODES = frozenset({"poisson_lognormal", "uniform", "fixed"})
 DEFAULT_RECURRENCE_SAMPLING = "poisson_lognormal"
 RECURRENCE_TRAINING_KEYS = (
@@ -81,10 +88,10 @@ _RECURRENCE_ARCHITECTURE_KEYS = frozenset(
 _EXPERT_RUNTIME_FIELDS = frozenset(
     {
         "expert_execution",
+        "expert_activation_format",
+        "expert_master_dtype",
         "expert_qat_backend",
         "expert_promotion_format",
-        "expert_fake_quantization",
-        "expert_stochastic_rounding",
         "potentiation_budget",
         "potentiation_ema_decay",
         "potentiation_warmup_steps",
@@ -106,12 +113,26 @@ _EXPERT_PLAN_EVIDENCE_FIELDS = frozenset(
         "max_resident_experts",
     }
 )
+# These values are validated while normalizing the yyLab request, but the
+# authoritative ScalePlan already owns them.  Passing them back through
+# ``experts_overrides`` makes SPALMER correctly reject the bundle as an attempt
+# to mutate its plan, even when the submitted values are identical.
+_EXPERT_PLAN_OWNED_RUNTIME_FIELDS = frozenset(
+    {
+        "expert_activation_format",
+        "expert_master_dtype",
+    }
+)
+_RETIRED_EXPERT_EMULATION_FIELDS = frozenset(
+    {
+        "expert_quant_bits",
+        "expert_fake_quantization",
+        "expert_stochastic_rounding",
+    }
+)
 _MODEL_RUNTIME_FIELDS = frozenset(
     {
-        "ple_stochastic_rounding",
-        "ple_sparse_gradients",
         "ple_gate_init",
-        "ple_reference_max_numel",
         "norm_eps",
         "initializer_range",
         "surprise_ema_decay",
@@ -155,6 +176,7 @@ def _load_spalmer_api() -> SimpleNamespace:
         )
         from spalmer.experts import MicroExpertsConfig
         from spalmer.memory import ATXYConfig
+        from spalmer.precision import detect_precision_capabilities
         from spalmer.presets import assert_accounting_matches_plan, build_configs
         from spalmer.tokenizer import HFTokenizerAdapter
         from spalmer.training import (
@@ -174,6 +196,7 @@ def _load_spalmer_api() -> SimpleNamespace:
         CausalBatch=CausalBatch,
         DirectionalConfig=DirectionalConfig,
         DirectionalScaleConfig=DirectionalScaleConfig,
+        detect_precision_capabilities=detect_precision_capabilities,
         ExperimentTrainer=ExperimentTrainer,
         FORMAT_VERSION=FORMAT_VERSION,
         HFTokenizerAdapter=HFTokenizerAdapter,
@@ -293,24 +316,25 @@ def _config_value(container: object, name: str, default: Any = None) -> Any:
 
 
 def _ple_metadata(prepared: PreparedSpalmerRun) -> dict[str, Any]:
-    """Backend-aware PLE ownership recorded beside the plan.
-
-    ``exact_input_parameters`` and ``qr_refresh_parameters`` stay zero for the
-    legacy fake-QAT tables, whose lookup lanes all sit in ``lookup_parameters``.
-    """
+    """Record the QR-PLE ownership split for an executable training run."""
 
     plan = prepared.plan
     config = _config_value(plan, "config")
     parameters = _config_value(plan, "parameters")
-    backend = str(
-        _config_value(getattr(prepared.bundle, "model", None), "ple_backend")
-        or _config_value(config, "ple_backend")
-        or DEFAULT_PLE_BACKEND
-    )
     lookup = int(_config_value(parameters, "ple_lookup", 0) or 0)
     controls = int(_config_value(parameters, "ple_controls", 0) or 0)
     recorded = plan.to_dict().get("ple") if callable(getattr(plan, "to_dict", None)) else None
     recorded = dict(recorded) if isinstance(recorded, Mapping) else {}
+    backend = str(
+        _config_value(getattr(prepared.bundle, "model", None), "ple_backend")
+        or _config_value(config, "ple_backend")
+        or recorded.get("backend")
+        or ""
+    )
+    if backend != "qr":
+        raise RuntimeError(
+            "SPALMER training refuses legacy fake-QAT PLE checkpoints"
+        )
     return {
         "backend": backend,
         "lanes": int(_config_value(config, "ple_expansion", 0) or 0),
@@ -405,17 +429,12 @@ def _normalize_checkpoint_execution(spalmer: Mapping[str, Any]) -> dict[str, Any
             "SPALMER continued training inherits its architecture from the parent "
             "checkpoint; remove " + ", ".join(forbidden)
         )
-    attention_backend = str(spalmer.get("attention_backend") or "auto").strip().casefold()
-    if attention_backend not in {"auto", "fla", "reference"}:
-        raise ValueError("attention_backend must be 'auto', 'fla', or 'reference'")
-    require_fla = _bool(
-        spalmer.get("require_fla"),
-        default=(
-            attention_backend != "reference"
-            and not _bool(spalmer.get("allow_reference_attention"), default=False)
-        ),
-    )
-    return {"attention_backend": attention_backend, "require_fla": require_fla}
+    attention_backend = str(spalmer.get("attention_backend") or "fla").strip().casefold()
+    if attention_backend not in {"auto", "fla"}:
+        raise ValueError("SPALMER training requires native FLA attention")
+    if not _bool(spalmer.get("require_fla"), default=True):
+        raise ValueError("SPALMER training cannot disable the native FLA requirement")
+    return {"attention_backend": attention_backend, "require_fla": True}
 
 
 def _normalize_recurrence_architecture(value: object) -> dict[str, Any]:
@@ -526,12 +545,12 @@ def _normalize_recurrence_training(cfg: dict[str, Any], *, mode: str) -> None:
 
 
 def _normalize_ple_backend(value: object) -> str:
-    """Canonicalize the plan-driving PLE backend; a missing key is legacy fake-QAT."""
+    """Canonicalize the native training PLE backend."""
 
     backend = str(value or DEFAULT_PLE_BACKEND).strip().casefold()
     if backend not in PLE_BACKENDS:
         raise ValueError(
-            "spalmer.ple_backend must be one of " + ", ".join(sorted(PLE_BACKENDS))
+            "new SPALMER training requires ple_backend='qr'; fake-QAT is legacy-load-only"
         )
     return backend
 
@@ -557,25 +576,56 @@ def _normalize_scratch_architecture(cfg: dict[str, Any], spalmer: dict[str, Any]
         spalmer["num_experts"] = expert_count
 
     precision = _mapping(cfg.get("precision"), "precision")
+    recorded_ple = str(precision.get("ple_backend") or "qr").strip().casefold()
+    if recorded_ple != "qr" or _bool(
+        precision.get("ple_fake_quantization"), default=False
+    ):
+        raise ValueError("SPALMER training refuses precision metadata that requests fake-QAT PLE")
+    recorded_backend = str(
+        precision.get("expert_qat_backend") or "auto"
+    ).strip().casefold()
+    if recorded_backend not in {"auto", "native"}:
+        raise ValueError("SPALMER training refuses reference or emulated expert precision metadata")
+    if _bool(precision.get("expert_fake_quantization"), default=False) or _bool(
+        precision.get("expert_stochastic_rounding"), default=False
+    ):
+        raise ValueError("SPALMER training refuses emulated expert precision metadata")
+    recorded_master = str(
+        precision.get("expert_master_dtype")
+        or precision.get("master_weights")
+        or "bfloat16"
+    ).strip().casefold()
+    if recorded_master != "bfloat16":
+        raise ValueError("SPALMER training requires BF16 expert master weights")
     weight_format = str(
         spalmer.get("expert_weight_format")
         or precision.get("expert_weight_format")
         or cfg.get("expert_weight_format")
-        or "mxfp4"
+        or "bfloat16"
     ).strip().casefold()
-    if weight_format not in {"mxfp4", "nvfp4"}:
-        raise ValueError("expert_weight_format must be 'mxfp4' or 'nvfp4'")
+    activation_format = str(
+        spalmer.get("expert_activation_format")
+        or precision.get("expert_activation_format")
+        or cfg.get("expert_activation_format")
+        or raw_experts.get("expert_activation_format")
+        or ("bfloat16" if weight_format == "bfloat16" else "")
+    ).strip().casefold()
+    if (weight_format, activation_format) not in EXPERT_PRECISION_PAIRS:
+        raise ValueError(
+            "unsupported SPALMER expert precision pair: "
+            f"{weight_format or 'missing'}/{activation_format or 'missing'}"
+        )
     spalmer["expert_weight_format"] = weight_format
+    spalmer["expert_activation_format"] = activation_format
     attention_backend = str(
-        spalmer.get("attention_backend") or cfg.get("attention_backend") or "auto"
+        spalmer.get("attention_backend") or cfg.get("attention_backend") or "fla"
     ).strip().casefold()
-    if attention_backend not in {"auto", "fla", "reference"}:
-        raise ValueError("attention_backend must be 'auto', 'fla', or 'reference'")
+    if attention_backend not in {"auto", "fla"}:
+        raise ValueError("SPALMER training requires native FLA attention")
     spalmer["attention_backend"] = attention_backend
-    spalmer["require_fla"] = _bool(
-        spalmer.get("require_fla"),
-        default=not _bool(spalmer.get("allow_reference_attention"), default=False),
-    )
+    if not _bool(spalmer.get("require_fla"), default=True):
+        raise ValueError("SPALMER training cannot disable the native FLA requirement")
+    spalmer["require_fla"] = True
 
     directional = _normalize_optional_component(
         spalmer.get("directional", cfg.get("directional")),
@@ -622,12 +672,38 @@ def _normalize_scratch_architecture(cfg: dict[str, Any], spalmer: dict[str, Any]
     spalmer["ple_backend"] = _normalize_ple_backend(
         spalmer.get("ple_backend", cfg.get("ple_backend"))
     )
+    legacy_ple_fields = sorted(
+        field
+        for field in (
+            "ple_quant_bits",
+            "ple_stochastic_rounding",
+            "ple_sparse_gradients",
+            "ple_alternation_policy",
+            "ple_reference_max_numel",
+        )
+        if field in spalmer
+        or field in _mapping(spalmer.get("model"), "spalmer.model")
+    )
+    if legacy_ple_fields:
+        raise ValueError(
+            "QR-PLE has no fake/reference quantization controls; remove "
+            + ", ".join(legacy_ple_fields)
+        )
 
     expert_plan_evidence = {
         field: raw_experts[field]
         for field in _EXPERT_PLAN_EVIDENCE_FIELDS
         if field in raw_experts
     }
+    for source in (raw_experts, spalmer, cfg):
+        for field in _RETIRED_EXPERT_EMULATION_FIELDS:
+            if field not in source:
+                continue
+            if field == "expert_quant_bits" or _bool(source[field], default=False):
+                raise ValueError(
+                    "SPALMER training does not accept retired expert emulation control "
+                    f"{field}"
+                )
     experts = {
         field: raw_experts[field]
         for field in _EXPERT_RUNTIME_FIELDS
@@ -644,11 +720,36 @@ def _normalize_scratch_architecture(cfg: dict[str, Any], spalmer: dict[str, Any]
         or cfg.get("expert_qat_backend")
         or "auto"
     ).strip().casefold()
-    if qat_backend not in {"auto", "reference", "native"}:
-        raise ValueError("expert_qat_backend must be 'auto', 'reference', or 'native'")
+    if qat_backend not in {"auto", "native"}:
+        raise ValueError("expert_qat_backend must be native or native-only auto")
     experts["expert_qat_backend"] = qat_backend
+    experts["expert_activation_format"] = activation_format
+    master_dtype = str(experts.get("expert_master_dtype") or "bfloat16").strip().casefold()
+    if master_dtype != "bfloat16":
+        raise ValueError("SPALMER training requires BF16 expert master weights")
+    experts["expert_master_dtype"] = master_dtype
+    promotion_format = str(experts.get("expert_promotion_format") or "bfloat16").strip().casefold()
+    if promotion_format != "bfloat16":
+        raise ValueError(
+            "SPALMER training only permits BF16 expert promotion until a native promoted "
+            "precision provider is capability-verified"
+        )
+    experts["expert_promotion_format"] = promotion_format
+    default_potentiation_budget = 0 if weight_format == "bfloat16" else 2
+    potentiation_budget = int(
+        experts.get("potentiation_budget", default_potentiation_budget)
+        or 0
+    )
+    if potentiation_budget < 0:
+        raise ValueError("potentiation_budget cannot be negative")
+    if weight_format == "bfloat16" and potentiation_budget:
+        raise ValueError("BF16 experts have no higher native potentiation tier")
+    experts["potentiation_budget"] = potentiation_budget
     unknown_experts = sorted(
-        set(raw_experts) - _EXPERT_RUNTIME_FIELDS - _EXPERT_PLAN_EVIDENCE_FIELDS
+        set(raw_experts)
+        - _EXPERT_RUNTIME_FIELDS
+        - _EXPERT_PLAN_EVIDENCE_FIELDS
+        - _RETIRED_EXPERT_EMULATION_FIELDS
     )
     if unknown_experts:
         raise ValueError("unsupported SPALMER expert overrides: " + ", ".join(unknown_experts))
@@ -951,15 +1052,12 @@ def plan_spalmer_configuration(
     directional, atxy, recurrence = _scale_components(cfg, symbols)
     kwargs: dict[str, Any] = {
         "expert_weight_format": spalmer["expert_weight_format"],
+        "expert_activation_format": spalmer["expert_activation_format"],
         "directional": directional,
         "atxy": atxy,
         "recurrence": recurrence,
     }
-    ple_backend = _normalize_ple_backend(spalmer.get("ple_backend"))
-    if ple_backend != DEFAULT_PLE_BACKEND:
-        # Legacy recipes keep the exact historical planner call (and therefore
-        # their fingerprints); only a QR-PLE recipe names its backend.
-        kwargs["ple_backend"] = ple_backend
+    kwargs["ple_backend"] = _normalize_ple_backend(spalmer.get("ple_backend"))
     if "num_experts" in spalmer:
         kwargs["search_space"] = symbols.ScaleSearchSpace(
             num_experts=int(spalmer["num_experts"])
@@ -991,12 +1089,17 @@ def build_spalmer_bundle(
     cfg = normalize_spalmer_config(config)
     spalmer = cfg["spalmer"]
     identity = tokenizer.identity
+    expert_overrides = {
+        key: value
+        for key, value in dict(spalmer.get("experts") or {}).items()
+        if key not in _EXPERT_PLAN_OWNED_RUNTIME_FIELDS
+    }
     return symbols.build_configs(
         plan,
         tokenizer_version=TOKENIZER_CONTRACT_VERSION,
         tokenizer_fingerprint=str(identity.fingerprint),
         attention_backend=str(spalmer["attention_backend"]),
-        experts_overrides=dict(spalmer.get("experts") or {}),
+        experts_overrides=expert_overrides,
         model_overrides=dict(spalmer.get("model") or {}),
     )
 
@@ -1647,15 +1750,102 @@ def _validate_fast_attention(config: Mapping[str, Any], api: SimpleNamespace) ->
     backend = str(cfg.get("attention_backend") or "auto")
     require_cuda = _bool(config.get("require_cuda"), default=True)
     require_fla = _bool(cfg.get("require_fla"), default=True)
-    if backend == "reference" or not require_cuda or not require_fla:
-        return
+    if backend not in {"auto", "fla"} or not require_cuda or not require_fla:
+        raise RuntimeError("SPALMER training requires CUDA with native FLA attention")
     available = getattr(api, "fla_available", None)
     if not callable(available) or not bool(available()):
         raise RuntimeError(
             "SPALMER GPU pretraining requires the optimized FLA KDA backend; "
-            "install a compatible fla-core build (>=0.4), or explicitly select "
-            "reference attention and allow_reference_attention for correctness-only runs"
+            "install a compatible fla-core build (>=0.4); reference attention is disabled"
         )
+
+
+def _capability_payload(value: object) -> dict[str, Any]:
+    if isinstance(value, Mapping):
+        return dict(value)
+    converter = getattr(value, "to_dict", None)
+    if callable(converter):
+        converted = converter()
+        if isinstance(converted, Mapping):
+            return dict(converted)
+    converted = _jsonable(value)
+    return dict(converted) if isinstance(converted, Mapping) else {}
+
+
+def _validate_native_expert_precision(
+    experts: object,
+    api: SimpleNamespace,
+    *,
+    device: str | None = None,
+) -> dict[str, Any]:
+    """Fail closed unless the exact expert pair has a verified native autograd path."""
+
+    weight = str(_config_value(experts, "expert_weight_format") or "").strip().casefold()
+    activation = str(
+        _config_value(experts, "expert_activation_format") or ""
+    ).strip().casefold()
+    backend = str(_config_value(experts, "expert_qat_backend") or "auto").strip().casefold()
+    execution = str(_config_value(experts, "expert_execution") or "grouped").strip().casefold()
+    if bool(_config_value(experts, "expert_fake_quantization", False)):
+        raise RuntimeError("SPALMER training refuses expert fake quantization")
+    if bool(_config_value(experts, "expert_stochastic_rounding", False)):
+        raise RuntimeError("SPALMER training refuses emulated expert stochastic quantization")
+    if backend not in {"auto", "native"}:
+        raise RuntimeError("SPALMER training refuses reference or emulated expert backends")
+    detector = getattr(api, "detect_precision_capabilities", None)
+    if not callable(detector):
+        raise RuntimeError("SPALMER native precision capability detection is unavailable")
+    report = _capability_payload(detector(device))
+    unavailable_detail = ""
+    for raw in report.get("expert_precisions") or []:
+        if not isinstance(raw, Mapping):
+            continue
+        if (
+            str(raw.get("weight_format") or "").strip().casefold() != weight
+            or str(raw.get("activation_format") or "").strip().casefold() != activation
+        ):
+            continue
+        selectable = bool(
+            raw.get("verified")
+            and raw.get("selectable")
+            and raw.get("forward_available")
+            and raw.get("backward_available")
+        )
+        if not selectable:
+            unavailable_detail = unavailable_detail or str(raw.get("detail") or "")
+            continue
+        if execution == "grouped" and not bool(raw.get("grouped_available")):
+            raise RuntimeError(
+                f"native {weight}/{activation} is available only as dense per-expert "
+                "execution; grouped execution would fall back to BF16"
+            )
+        selected = dict(raw)
+        potentiation_budget = int(_config_value(experts, "potentiation_budget", 0) or 0)
+        promotion_format = str(
+            _config_value(experts, "expert_promotion_format") or "bfloat16"
+        ).strip().casefold()
+        if potentiation_budget and promotion_format == "bfloat16":
+            bf16_available = any(
+                isinstance(candidate, Mapping)
+                and str(candidate.get("weight_format") or "").casefold() == "bfloat16"
+                and str(candidate.get("activation_format") or "").casefold() == "bfloat16"
+                and bool(candidate.get("verified"))
+                and bool(candidate.get("selectable"))
+                and bool(candidate.get("forward_available"))
+                and bool(candidate.get("backward_available"))
+                for candidate in report.get("expert_precisions") or []
+            )
+            if not bf16_available:
+                raise RuntimeError(
+                    "expert potentiation requests BF16 promotion, but no verified native "
+                    "BF16/BF16 provider is available"
+                )
+        return selected
+    raise RuntimeError(
+        unavailable_detail
+        or str(report.get("detail") or "")
+        or f"no verified native {weight}/{activation} expert provider is installed"
+    )
 
 
 class ParentPlan:
@@ -1682,14 +1872,23 @@ def _optional_config(factory: Callable[..., Any], value: object, name: str) -> A
 def _prepare_checkpoint_run(cfg: dict[str, Any], symbols: SimpleNamespace) -> PreparedSpalmerRun:
     """Load a parent bundle as the starting point of a new full-parameter run."""
 
-    from ..models.spalmer import load_spalmer_checkpoint_payload, relocated_spalmer_tokenizer
+    from ..models.spalmer import (
+        load_spalmer_checkpoint_payload,
+        relocated_spalmer_tokenizer,
+        require_executable_spalmer_checkpoint,
+    )
 
     initialization = _mapping(cfg.get("initialization"), "initialization")
     checkpoint_path = Path(str(initialization["checkpoint_ref"]))
     payload = load_spalmer_checkpoint_payload(checkpoint_path)
-    if int(payload.get("format_version") or 0) not in SUPPORTED_SPALMER_FORMAT_VERSIONS:
+    try:
+        scanned = require_executable_spalmer_checkpoint(checkpoint_path)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+    if int(scanned.get("format_version") or 0) not in SUPPORTED_SPALMER_FORMAT_VERSIONS:
         raise ValueError(
-            "SPALMER continued training requires a format-version 5, 6, or 7 bundle; "
+            "SPALMER continued training requires an executable QR-PLE "
+            "format-version 7 or 8 bundle; "
             f"found {payload.get('format_version')!r}"
         )
     binding = payload.get("tokenizer_binding")
@@ -1714,9 +1913,24 @@ def _prepare_checkpoint_run(cfg: dict[str, Any], symbols: SimpleNamespace) -> Pr
     if not isinstance(plan_payload, Mapping) or not plan_payload:
         raise ValueError("parent checkpoint metadata does not record a SPALMER scale plan")
     plan = ParentPlan(plan_payload)
+    loaded_model_config = getattr(model, "config", None)
+    if loaded_model_config is None:
+        raw_model_config = _mapping(payload.get("model_config"), "model_config")
+        # Native SPALMER performs the same v7 migration.  This fallback exists
+        # only for thin integration doubles that do not expose ``model.config``.
+        if int(payload.get("format_version") or 0) == 7:
+            for field in (
+                "ple_quant_bits",
+                "ple_stochastic_rounding",
+                "ple_sparse_gradients",
+                "ple_alternation_policy",
+                "ple_reference_max_numel",
+            ):
+                raw_model_config.pop(field, None)
+        loaded_model_config = symbols.SPALMERConfig(**raw_model_config)
     bundle = SimpleNamespace(
         plan=plan,
-        model=symbols.SPALMERConfig(**_mapping(payload.get("model_config"), "model_config")),
+        model=loaded_model_config,
         kda=symbols.KDAConfig(**_mapping(payload.get("kda_config"), "kda_config")),
         mla=symbols.MLAConfig(**_mapping(payload.get("mla_config"), "mla_config")),
         experts=symbols.MicroExpertsConfig(
@@ -1726,6 +1940,15 @@ def _prepare_checkpoint_run(cfg: dict[str, Any], symbols: SimpleNamespace) -> Pr
             symbols.DirectionalConfig, payload.get("directional_config"), "directional_config"
         ),
         atxy=_optional_config(symbols.ATXYConfig, payload.get("atxy_config"), "atxy_config"),
+    )
+    if str(_config_value(bundle.model, "ple_backend") or "").strip().casefold() != "qr":
+        raise RuntimeError(
+            "continued SPALMER training refuses legacy fake-QAT PLE checkpoints"
+        )
+    _validate_native_expert_precision(
+        bundle.experts,
+        symbols,
+        device=str(cfg.get("device") or "cuda"),
     )
     training = build_spalmer_training_config(cfg, api=symbols)
     _validate_fast_attention(cfg, symbols)
@@ -1752,6 +1975,11 @@ def prepare_spalmer_run(
     tokenizer = resolve_spalmer_tokenizer(cfg, api=symbols)
     plan = plan_spalmer_configuration(cfg, int(tokenizer.vocab_size), api=symbols)
     bundle = build_spalmer_bundle(cfg, tokenizer, plan, api=symbols)
+    _validate_native_expert_precision(
+        bundle.experts,
+        symbols,
+        device=str(cfg.get("device") or "cuda"),
+    )
     training = build_spalmer_training_config(cfg, api=symbols)
     _validate_fast_attention(cfg, symbols)
     return PreparedSpalmerRun(cfg, tokenizer, plan, bundle, training)
@@ -1839,12 +2067,16 @@ def run_spalmer_base(config: Mapping[str, Any], rd: Path) -> dict[str, Any]:
         f"experts={plan.config.num_experts}; format={plan.config.expert_weight_format}",
         flush=True,
     )
+    ple_split = (
+        f"exact_input={ple_metadata['exact_input_parameters']:,}; "
+        f"qr_refresh={ple_metadata['qr_refresh_parameters']:,}; "
+        if ple_metadata["backend"] == "qr"
+        else ""
+    )
     print(
         "SPALMER PLE: "
         f"backend={ple_metadata['backend']}; lanes={ple_metadata['lanes']}; "
-        f"exact_input={ple_metadata['exact_input_parameters']:,}; "
-        f"qr_refresh={ple_metadata['qr_refresh_parameters']:,}; "
-        f"total={ple_metadata['total_parameters']:,}",
+        f"{ple_split}total={ple_metadata['total_parameters']:,}",
         flush=True,
     )
     if recurrence_metadata is not None:
@@ -2073,26 +2305,9 @@ def run_spalmer_base(config: Mapping[str, Any], rd: Path) -> dict[str, Any]:
             "expert_activations": prepared.bundle.experts.expert_activation_format,
             "master_weights": prepared.bundle.experts.expert_master_dtype,
             "expert_qat_backend": prepared.bundle.experts.expert_qat_backend,
+            "expert_execution": prepared.bundle.experts.expert_execution,
             "ple_backend": ple_metadata["backend"],
-            **(
-                {
-                    "ple_parameter_dtype": "bfloat16",
-                    "ple_fake_quantization": False,
-                }
-                if ple_metadata["backend"] == "qr"
-                else {
-                    "ple_quant_bits": int(
-                        _config_value(prepared.bundle.model, "ple_quant_bits", 4)
-                    ),
-                    "ple_stochastic_rounding": bool(
-                        _config_value(
-                            prepared.bundle.model,
-                            "ple_stochastic_rounding",
-                            True,
-                        )
-                    ),
-                }
-            ),
+            "ple_parameter_dtype": "bfloat16",
             "optimizer_moments": "float32_cpu_offload",
         },
         "training_sequence_length": int(prepared.training.sequence_length),

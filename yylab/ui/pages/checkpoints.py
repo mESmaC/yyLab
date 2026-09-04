@@ -10,6 +10,7 @@ from ... import db
 from ...artifacts import checkpoint_dir, read_json
 from ...models.families import checkpoint_family
 from ...models.loading import scan_checkpoint as scan_local_checkpoint
+from ...models.spalmer import require_spalmer_precision_capability
 from ...workers.launch import launch_worker
 from ..components import dir_browser, empty_state
 from ..shell import panel, shell
@@ -79,7 +80,7 @@ def _spalmer_effective_depth(metadata: dict) -> int | None:
 def _spalmer_base_recipe(metadata: dict) -> str:
     """Describe either a yyLab registry receipt or a directly scanned bundle."""
 
-    precision = metadata.get("precision")
+    precision = metadata.get("expert_precision") or metadata.get("precision")
     precision = precision if isinstance(precision, dict) else {}
     native_metadata = metadata.get("metadata")
     native_metadata = native_metadata if isinstance(native_metadata, dict) else {}
@@ -91,6 +92,7 @@ def _spalmer_base_recipe(metadata: dict) -> str:
     weight_format = (
         precision.get("expert_weights")
         or precision.get("expert_weight_format")
+        or precision.get("weight_format")
         or native_precision.get("expert_weights")
         or native_precision.get("expert_weight_format")
         or experts.get("expert_weight_format")
@@ -99,6 +101,7 @@ def _spalmer_base_recipe(metadata: dict) -> str:
     activation_format = (
         precision.get("expert_activations")
         or precision.get("expert_activation_format")
+        or precision.get("activation_format")
         or native_precision.get("expert_activations")
         or native_precision.get("expert_activation_format")
         or experts.get("expert_activation_format")
@@ -106,15 +109,19 @@ def _spalmer_base_recipe(metadata: dict) -> str:
     master_dtype = (
         precision.get("master_weights")
         or precision.get("expert_master_dtype")
+        or precision.get("master_dtype")
         or native_precision.get("master_weights")
         or native_precision.get("expert_master_dtype")
         or experts.get("expert_master_dtype")
     )
     recipe = (
-        f"SPALMER · {_precision_label(weight_format, 'fp4')}/"
-        f"{_precision_label(activation_format, 'mxfp8')} · "
-        f"{_precision_label(master_dtype, 'bfloat16')} master"
+        f"SPALMER · {_precision_label(weight_format, 'unknown')}/"
+        f"{_precision_label(activation_format, 'unknown')} · "
+        f"{_precision_label(master_dtype, 'unknown')} master"
     )
+    executable = metadata.get("precision_executable", precision.get("executable"))
+    if executable is False:
+        recipe += " · metadata-only (blocked legacy precision)"
     recurrence = _spalmer_recurrence(metadata)
     if recurrence is not None:
         recipe += (
@@ -313,10 +320,32 @@ def checkpoints_page():
                 ui.label(f'source: {c["source"]} → {c["ref"]}')
                 ui.label(f"base recipe: {base_recipe(c)}").classes("text-sm text-gray-400")
                 if checkpoint_family(c) == "spalmer":
-                    ui.label(
-                        "Native recurrent KDA/NoPE MLA with its checkpointed micro-expert "
-                        "routing and precision recipe. yyLab PEFT adapters do not apply."
-                    ).classes("text-cyan-300 text-sm")
+                    precision_executable = detail_metadata.get("precision_executable")
+                    if precision_executable is False:
+                        reason = str(
+                            detail_metadata.get("precision_rejection_reason")
+                            or "the bundle requires a retired emulated precision path"
+                        )
+                        ui.label(
+                            "Metadata-only SPALMER checkpoint: loading, inference, and continued "
+                            f"training are blocked because {reason}."
+                        ).classes("text-red-300 text-sm")
+                    else:
+                        try:
+                            capability = require_spalmer_precision_capability(c["ref"])
+                        except (ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:
+                            ui.label(
+                                "SPALMER precision is unavailable on this runtime: "
+                                f"{str(exc).splitlines()[0][:240]}"
+                            ).classes("text-red-300 text-sm")
+                        else:
+                            ui.label(
+                                "Native recurrent KDA/NoPE MLA with its checkpointed micro-expert "
+                                "routing and exact-device verified "
+                                f"{str(capability['weight_format']).upper()}/"
+                                f"{str(capability['activation_format']).upper()} precision via "
+                                f"{capability['provider_id']}. yyLab PEFT adapters do not apply."
+                            ).classes("text-cyan-300 text-sm")
                 elif c["quant_locked"]:
                     ui.label(
                         f'Quantization locked to {c["quant_locked"]} for all adapters on this checkpoint.'

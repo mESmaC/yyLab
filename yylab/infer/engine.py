@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import math
 import threading
@@ -195,14 +196,114 @@ def _context_mode_settings(ref: str, settings: dict) -> tuple[dict, int | None]:
     return resolved, target_context
 
 
+_CACHE_IMPLEMENTATION_LABELS = {
+    "dynamic": "Dynamic (default)",
+    "offloaded": "Offloaded to CPU RAM (dynamic)",
+    "offloaded_static": "Offloaded to CPU RAM (static, chunked prefill)",
+    "quantized": "Quantized KV cache (Quanto INT4 in VRAM)",
+    "quantized_offloaded": "Quantized KV offload (packed CPU INT4/INT8)",
+    "static": "Static (pre-allocated, in VRAM)",
+    "sliding_window": "Sliding window (deprecated upstream)",
+}
+
+
+def _upstream_cache_implementations() -> set[str]:
+    try:
+        from transformers.generation.configuration_utils import ALL_CACHE_IMPLEMENTATIONS
+    except (ImportError, AttributeError):
+        return set()
+    return {str(value) for value in ALL_CACHE_IMPLEMENTATIONS}
+
+
+def _quanto_available() -> bool:
+    try:
+        return importlib.util.find_spec("optimum.quanto") is not None
+    except (ImportError, ModuleNotFoundError, ValueError):
+        return False
+
+
+def available_cache_implementations(cuda: bool) -> dict[str, str]:
+    """Return only cache implementations executable on this runtime.
+
+    Non-dynamic choices are accelerator policies in yyLab. They are hidden on
+    CPU rather than being relabeled or silently executed as a dynamic cache.
+    """
+
+    options = {"dynamic": _CACHE_IMPLEMENTATION_LABELS["dynamic"]}
+    if not cuda:
+        return options
+
+    upstream = _upstream_cache_implementations()
+    for implementation in ("offloaded", "offloaded_static"):
+        if implementation in upstream:
+            options[implementation] = _CACHE_IMPLEMENTATION_LABELS[implementation]
+
+    if "quantized" in upstream and _quanto_available():
+        options["quantized"] = _CACHE_IMPLEMENTATION_LABELS["quantized"]
+
+    from .quantized_offload_cache import quantized_offload_cache_availability
+
+    quantized_offload_available, _ = quantized_offload_cache_availability()
+    if quantized_offload_available:
+        options["quantized_offloaded"] = _CACHE_IMPLEMENTATION_LABELS["quantized_offloaded"]
+
+    for implementation in ("static", "sliding_window"):
+        if implementation in upstream:
+            options[implementation] = _CACHE_IMPLEMENTATION_LABELS[implementation]
+    return options
+
+
+def available_kv_precisions(cache_implementation: str) -> dict[str, str]:
+    """Return exact resident-storage choices for one implemented cache."""
+
+    if cache_implementation == "quantized":
+        return {"int4": "INT4 (Quanto, resident in VRAM)"}
+    if cache_implementation == "quantized_offloaded":
+        return {
+            "int4": "INT4 (packed CPU offload)",
+            "int8": "INT8 (CPU offload)",
+        }
+    if cache_implementation in _CACHE_IMPLEMENTATION_LABELS:
+        return {"none": "Model dtype (not quantized)"}
+    raise ValueError(f"unknown KV cache implementation: {cache_implementation!r}")
+
+
+def _validate_cache_selection(settings: dict, cuda: bool) -> tuple[str, str]:
+    implementation = str(settings.get("cache_implementation", "dynamic"))
+    if implementation not in _CACHE_IMPLEMENTATION_LABELS:
+        raise ValueError(f"unknown KV cache implementation: {implementation!r}")
+
+    quantization = str(settings.get("kv_quant", "none"))
+    allowed = available_kv_precisions(implementation)
+    if quantization not in allowed:
+        if quantization == "fp8":
+            raise ValueError(
+                "legacy fp8 KV cache settings are unsupported; FP8 is not an alias for INT8"
+            )
+        raise ValueError(
+            f"KV cache implementation {implementation!r} requires one of "
+            f"{tuple(allowed)}, got {quantization!r}"
+        )
+
+    available = available_cache_implementations(cuda)
+    if implementation not in available:
+        if not cuda:
+            raise RuntimeError(
+                f"KV cache implementation {implementation!r} requires CUDA; "
+                "yyLab will not substitute a CPU dynamic cache"
+            )
+        raise RuntimeError(
+            f"KV cache implementation {implementation!r} is unavailable in the installed runtime"
+        )
+    return implementation, quantization
+
+
 def _cache_kwargs(settings: dict, cuda: bool) -> tuple[dict, list[str]]:
     notes: list[str] = []
-    impl = settings.get("cache_implementation", "dynamic")
+    impl, kvq = _validate_cache_selection(settings, cuda)
     max_ctx = int(settings.get("max_context_tokens", 8192) or 8192)
     chunk = int(settings.get("prefill_chunk_size", 8192) or 8192)
-    if impl == "dynamic" or not cuda:
-        if impl != "dynamic" and not cuda:
-            notes.append("CPU inference: using dynamic cache.")
+    if impl == "dynamic":
         return {}, notes
     if impl == "offloaded":
         notes.append("KV cache offloaded to CPU RAM (dynamic).")
@@ -215,9 +316,6 @@ def _cache_kwargs(settings: dict, cuda: bool) -> tuple[dict, list[str]]:
             "prefill_chunk_size": chunk,
         }, notes
     if impl == "quantized_offloaded":
-        kvq = str(settings.get("kv_quant", "int4"))
-        if kvq not in {"int4", "int8"}:
-            raise ValueError("quantized KV offload requires int4 or int8 KV quantization")
         notes.append(f"KV history uses packed {kvq} CPU offload with active-layer dequantization.")
         return {}, notes
     if impl == "static":
@@ -227,12 +325,6 @@ def _cache_kwargs(settings: dict, cuda: bool) -> tuple[dict, list[str]]:
             "prefill_chunk_size": chunk,
         }, notes
     if impl == "quantized":
-        kvq = str(settings.get("kv_quant", "int4"))
-        if kvq != "int4":
-            raise ValueError(
-                "the installed Transformers Quanto resident cache supports int4, not int8; "
-                "select int4 or use quantized KV offload for int4/int8 CPU residency"
-            )
         notes.append("KV cache quantized to int4 in VRAM (Optimum Quanto).")
         return {
             "cache_implementation": "quantized",
@@ -248,7 +340,7 @@ def _cache_kwargs(settings: dict, cuda: bool) -> tuple[dict, list[str]]:
             "cache_implementation": "sliding_window",
             "cache_config": {"window_size": int(settings.get("sliding_window", 4096))},
         }, notes
-    return {}, notes
+    raise AssertionError(f"validated cache implementation was not handled: {impl}")
 
 
 def _adaptive_kv_reserve_bytes(
@@ -261,11 +353,11 @@ def _adaptive_kv_reserve_bytes(
 ) -> int:
     """Estimate request KV headroom before adaptive lanes claim free VRAM."""
 
+    implementation, kv_quantization = _validate_cache_selection(settings, cuda)
     if not cuda:
         return 0
-    from .context_math import kv_bytes_per_token
+    from .context_math import kv_bytes_per_token, quantized_kv_bytes_per_token
 
-    implementation = str(settings.get("cache_implementation", "dynamic"))
     total_tokens = max(0, int(prompt_tokens)) + max(0, int(answer_tokens))
     if implementation == "quantized_offloaded":
         layers = max(1, int(getattr(model_config, "num_hidden_layers", 1) or 1))
@@ -287,11 +379,17 @@ def _adaptive_kv_reserve_bytes(
             max(1, int(settings.get("sliding_window", 4096) or 4096)),
         )
         kv_quant = "bf16"
-    elif implementation == "quantized" and settings.get("kv_quant", "int8") != "none":
-        reserve_tokens = total_tokens
-        requested_quant = str(settings.get("kv_quant", "int8"))
-        # Transformers currently resolves the UI's fp8 request to int8.
-        kv_quant = "int8" if requested_quant == "fp8" else requested_quant
+    elif implementation == "quantized":
+        # Transformers' Quanto cache keeps the newest 128 tokens in the model
+        # dtype and quantizes only older history.
+        residual_tokens = min(total_tokens, 128)
+        quantized_tokens = max(0, total_tokens - residual_tokens)
+        return int(
+            math.ceil(
+                kv_bytes_per_token(model_config, "bf16") * residual_tokens
+                + quantized_kv_bytes_per_token(model_config, kv_quantization) * quantized_tokens
+            )
+        )
     else:
         reserve_tokens = total_tokens
         kv_quant = "bf16"
@@ -863,6 +961,7 @@ class Engine:
     def load(self, spec: LoadSpec) -> list[str]:
         from ..models.families import SPALMER_MODEL_FAMILY, family_from_reference
         from ..models.loading import load_base
+        from ..models.precision_capabilities import model_compute_dtype
         from ..mole.inject import MoLEConfig, inject_mole, set_stage
         from ..mole.runtime import AdaptiveExpertRuntime
         from ..mole.store import (
@@ -875,6 +974,11 @@ class Engine:
         if model_family == SPALMER_MODEL_FAMILY:
             return self._load_spalmer(replace(spec, model_family=model_family))
 
+        import torch
+
+        # Reject stale or unsupported cache settings before discarding the
+        # currently loaded model or resolving/loading the replacement.
+        _validate_cache_selection(spec.settings, torch.cuda.is_available())
         resolved_settings, preset_context = _context_mode_settings(spec.ref, dict(spec.settings))
         spec = replace(spec, settings=resolved_settings)
         adaptive_runtime = None
@@ -884,7 +988,6 @@ class Engine:
                 del self.model
                 self.model = None
             self.adaptive_runtime = None
-            import torch
 
             rope_scaling = _rope_scaling(spec.settings)
             load_options = {
@@ -920,7 +1023,12 @@ class Engine:
                     raise ValueError("router snapshot targets a different MoLE layer bank")
                 mole_cfg = MoLEConfig.from_dict(cfg["config"])
                 src = spec.router_path or spec.adapter_path
-                expert_dtype = torch.bfloat16 if cuda else torch.float32
+                if not cuda:
+                    raise RuntimeError(
+                        "MoLE inference requires CUDA for its verified adapter compute contract; "
+                        "yyLab will not substitute an unverified CPU dtype"
+                    )
+                expert_dtype = model_compute_dtype(quant)
                 if mole_cfg.adaptive.enabled:
                     inject_mole(
                         model,
@@ -949,7 +1057,11 @@ class Engine:
             elif spec.adapter_path and spec.adapter_arch == "lora":
                 from peft import PeftModel
 
-                model = PeftModel.from_pretrained(model, spec.adapter_path)
+                model = PeftModel.from_pretrained(
+                    model,
+                    spec.adapter_path,
+                    autocast_adapter_dtype=False,
+                )
                 notes.append("PEFT LoRA adapter applied.")
             model.eval()
             self.model = model
@@ -982,10 +1094,10 @@ class Engine:
                 "SPALMER uses recurrent KDA/NoPE MLA state and does not use RoPE or YaRN; "
                 "select native context"
             )
-        if spec.quant not in {"", "auto", "bf16", "checkpoint", "native"}:
+        if spec.quant not in {"", "auto", "checkpoint", "native"}:
             raise ValueError(
-                "SPALMER precision is checkpoint-native (FP4 expert forward, MXFP8 "
-                "activations, BF16 parameters); select Auto or BF16"
+                "SPALMER precision is fixed by the checkpoint and revalidated against "
+                "native runtime capabilities; select Auto, Native, or Checkpoint"
             )
 
         settings = dict(spec.settings)
@@ -1190,28 +1302,8 @@ class Engine:
 
                 gen_kwargs["logits_processor"] = LogitsProcessorList([runtime.logits_processor()])
                 runtime.begin_decode()
-            had_cache = "cache_implementation" in gen_kwargs or "past_key_values" in gen_kwargs
             try:
-                try:
-                    yield from self._stream(gen_kwargs)
-                except Exception:
-                    if had_cache:
-                        for cache_key in (
-                            "cache_implementation",
-                            "cache_config",
-                            "max_cache_len",
-                            "prefill_chunk_size",
-                            "past_key_values",
-                        ):
-                            gen_kwargs.pop(cache_key, None)
-                        if runtime is not None:
-                            runtime.restart_decode_attempt(
-                                reason="selected KV cache failed; retrying with dynamic cache"
-                            )
-                        self.notes.append("Selected KV cache failed; retried with dynamic cache.")
-                        yield from self._stream(gen_kwargs)
-                    else:
-                        raise
+                yield from self._stream(gen_kwargs)
             finally:
                 if runtime is not None:
                     runtime.end_decode()

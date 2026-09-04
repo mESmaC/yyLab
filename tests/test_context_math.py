@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from yylab.infer.context_math import (
     capacity_rows,
     kv_bytes_per_token,
@@ -30,6 +32,10 @@ def test_kv_bytes_per_token():
     assert kv_bytes_per_token(QWEN_SMALL, "bf16") == 2 * 24 * 2 * 128 * 2
     assert kv_bytes_per_token(QWEN_SMALL, "int8") == 2 * 24 * 2 * 128 * 1
     assert kv_bytes_per_token(QWEN_SMALL, "int4") == 2 * 24 * 2 * 128 * 0.5
+    with pytest.raises(ValueError, match="not an alias for INT8"):
+        kv_bytes_per_token(QWEN_SMALL, "fp8")
+    with pytest.raises(ValueError, match="unknown KV storage precision"):
+        kv_bytes_per_token(QWEN_SMALL, "made_up")
 
 
 def test_kv_gb():
@@ -44,18 +50,47 @@ def test_quantized_kv_bytes_include_group_scales():
 
     assert packed_int4 > raw_int4
     assert packed_int8 > packed_int4
+    padded_head = SimpleNamespace(
+        num_hidden_layers=1,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        hidden_size=5,
+        head_dim=5,
+    )
+    assert quantized_kv_bytes_per_token(padded_head, "int4", group_size=8) == 12
+    with pytest.raises(ValueError, match="group_size must be positive"):
+        quantized_kv_bytes_per_token(QWEN_SMALL, "int4", group_size=0)
 
 
 def test_capacity_rows():
     rows = capacity_rows(QWEN_SMALL, 100_000, vram_free_gb=3.5, ram_gb=32.0, model_gb=0.5)
     by_label = {r["label"]: r for r in rows}
-    assert by_label["KV bf16"]["kv_gb"] < by_label["KV offloaded"]["kv_gb"] + 0.01
-    assert by_label["KV int8 (quant cache)"]["kv_gb"] < by_label["KV bf16"]["kv_gb"]
-    assert by_label["KV int4 (quant cache)"]["fits"] in (True, False)
-    offloaded = by_label["KV offloaded"]
+    assert by_label["KV BF16"]["kv_gb"] < by_label["KV BF16 offloaded"]["kv_gb"] + 0.01
+    assert "KV INT8 resident" not in " ".join(by_label)
+    resident_int4 = by_label["KV INT4 resident (Quanto; 128-token BF16 residual)"]
+    assert resident_int4["kv_gb"] < by_label["KV BF16"]["kv_gb"]
+    assert resident_int4["fits"] in (True, False)
+    offloaded = by_label["KV BF16 offloaded"]
     assert offloaded["location"] == "RAM"
-    assert by_label["KV int8 offloaded"]["location"] == "RAM"
-    assert by_label["KV int4 offloaded"]["kv_gb"] < by_label["KV int8 offloaded"]["kv_gb"]
+    int8_offloaded = by_label["KV INT8 offloaded (32-token BF16 residual)"]
+    int4_offloaded = by_label["KV INT4 offloaded (32-token BF16 residual)"]
+    assert int8_offloaded["location"] == "RAM"
+    assert int4_offloaded["kv_gb"] < int8_offloaded["kv_gb"]
+
+
+def test_capacity_rows_hide_unavailable_runtime_formats():
+    rows = capacity_rows(
+        QWEN_SMALL,
+        100_000,
+        vram_free_gb=0.0,
+        ram_gb=32.0,
+        model_gb=0.5,
+        resident_int4_available=False,
+        offload_available=False,
+        quantized_offload_available=False,
+    )
+
+    assert [row["label"] for row in rows] == ["KV BF16"]
 
 
 def test_max_context_for_budget():
@@ -68,3 +103,6 @@ def test_max_context_for_budget():
 def test_model_weight_gb():
     assert 0.2 < model_weight_gb(0.5, "nf4") < 0.35
     assert 0.9 < model_weight_gb(0.5, "bf16") < 1.1
+    assert 1.8 < model_weight_gb(0.5, "fp32") < 2.0
+    with pytest.raises(ValueError, match="never assume an unimplemented format"):
+        model_weight_gb(0.5, "fp8")

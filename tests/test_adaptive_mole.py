@@ -489,7 +489,7 @@ def test_adaptive_worker_resolves_trains_and_persists_v4_artifact(
         "checkpoint_id": "checkpoint",
         "checkpoint_ref": "tiny-adaptive-base",
         "adapter_id": "adaptive-adapter",
-        "quant": "bf16",
+        "quant": "fp32",
         # These are only valid construction seeds; the real integer solver
         # replaces E/r/K from the actual 100,000-parameter base model.
         "num_experts": 2,
@@ -538,8 +538,8 @@ def test_adaptive_worker_resolves_trains_and_persists_v4_artifact(
     assert derived["cfg"]["domains"] == ["code"]
     assert derived["cfg"]["expert_plan"] == cfg["expert_plan"]
     assert lock_events == [
-        ("check", "checkpoint", "bf16"),
-        ("commit", "checkpoint", "bf16"),
+        ("check", "checkpoint", "fp32"),
+        ("commit", "checkpoint", "fp32"),
     ]
 
     saved = load_mole_config(adapter_path, expected_base_ref="tiny-adaptive-base")

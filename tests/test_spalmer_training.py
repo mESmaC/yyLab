@@ -21,9 +21,12 @@ def _config(**updates):
         "spalmer": {
             "target_parameters": 10_000_000,
             "num_experts": 200,
-            "expert_weight_format": "mxfp4",
-            "attention_backend": "reference",
-            "expert_qat_backend": "reference",
+            "expert_weight_format": "bfloat16",
+            "expert_activation_format": "bfloat16",
+            "attention_backend": "fla",
+            "require_fla": True,
+            "expert_qat_backend": "auto",
+            "ple_backend": "qr",
             "directional": {
                 "enabled": True,
                 "num_feature_groups": 4,
@@ -40,7 +43,10 @@ def _config(**updates):
                 "min_resident_experts": 2,
                 "max_resident_experts": 20,
                 "expert_execution": "grouped",
-                "potentiation_budget": 2,
+                "expert_activation_format": "bfloat16",
+                "expert_master_dtype": "bfloat16",
+                "expert_promotion_format": "bfloat16",
+                "potentiation_budget": 0,
                 "residency_increment": 2,
             },
         },
@@ -56,8 +62,8 @@ def _config(**updates):
         "log_every": 1,
         "save_every": 1,
         "out_checkpoint_id": "ckpt-test",
-        "device": "cpu",
-        "require_cuda": False,
+        "device": "cuda",
+        "require_cuda": True,
     }
     value.update(updates)
     return value
@@ -74,9 +80,12 @@ def test_normalize_spalmer_config_accepts_ui_contract_without_mutation():
     assert normalized["spalmer"]["num_experts"] == 200
     assert normalized["spalmer"]["experts"] == {
         "expert_execution": "grouped",
-        "potentiation_budget": 2,
+        "expert_activation_format": "bfloat16",
+        "expert_master_dtype": "bfloat16",
+        "expert_promotion_format": "bfloat16",
+        "potentiation_budget": 0,
         "residency_increment": 2,
-        "expert_qat_backend": "reference",
+        "expert_qat_backend": "auto",
     }
     assert normalized["spalmer"]["expert_plan_evidence"]["max_active_experts"] == 20
     assert normalized["optimizer_state_offload"] == "cpu"
@@ -93,6 +102,141 @@ def test_normalize_spalmer_config_requires_cpu_optimizer_state_offload():
     )
     with pytest.raises(ValueError, match="optimizer_state_offload='cpu'"):
         bridge.normalize_spalmer_config(config)
+
+
+@pytest.mark.parametrize(
+    ("update", "message"),
+    [
+        ({"ple_backend": "fake_qat"}, "fake-QAT"),
+        ({"expert_qat_backend": "reference"}, "native-only"),
+        ({"experts": {"expert_fake_quantization": True}}, "retired expert emulation"),
+        ({"experts": {"expert_stochastic_rounding": True}}, "retired expert emulation"),
+    ],
+)
+def test_normalize_spalmer_config_rejects_emulated_training(update, message):
+    config = _config()
+    config["spalmer"] = {**config["spalmer"], **update}
+
+    with pytest.raises(ValueError, match=message):
+        bridge.normalize_spalmer_config(config)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "ple_quant_bits",
+        "ple_stochastic_rounding",
+        "ple_sparse_gradients",
+        "ple_alternation_policy",
+        "ple_reference_max_numel",
+    ],
+)
+def test_normalize_spalmer_config_rejects_removed_ple_controls(field):
+    config = _config()
+    config["spalmer"][field] = 4 if field == "ple_quant_bits" else False
+
+    with pytest.raises(ValueError, match="QR-PLE has no fake/reference"):
+        bridge.normalize_spalmer_config(config)
+
+
+def test_normalize_native_low_precision_keeps_bf16_potentiation() -> None:
+    config = _config()
+    config["spalmer"]["expert_weight_format"] = "nvfp4"
+    config["spalmer"]["expert_activation_format"] = "nvfp4"
+    config["spalmer"]["experts"] = {
+        "expert_execution": "loop",
+        "expert_activation_format": "nvfp4",
+        "expert_master_dtype": "bfloat16",
+        "expert_qat_backend": "auto",
+        "expert_promotion_format": "bfloat16",
+        "residency_increment": 2,
+    }
+
+    experts = bridge.normalize_spalmer_config(config)["spalmer"]["experts"]
+    assert experts["potentiation_budget"] == 2
+    assert experts["expert_promotion_format"] == "bfloat16"
+    assert "expert_stochastic_rounding" not in experts
+
+
+def test_native_precision_validation_allows_dense_loop_but_not_grouped() -> None:
+    report = SimpleNamespace(
+        to_dict=lambda: {
+            "expert_precisions": [
+                {
+                    "provider_id": "native_dense",
+                    "weight_format": "nvfp4",
+                    "activation_format": "nvfp4",
+                    "forward_available": True,
+                    "backward_available": True,
+                    "grouped_available": False,
+                    "verified": True,
+                    "selectable": True,
+                    "detail": "native dense",
+                }
+            ]
+        }
+    )
+    requested_devices: list[str | None] = []
+    api = SimpleNamespace(
+        detect_precision_capabilities=lambda device=None: (
+            requested_devices.append(device) or report
+        )
+    )
+    dense = SimpleNamespace(
+        expert_weight_format="nvfp4",
+        expert_activation_format="nvfp4",
+        expert_qat_backend="auto",
+        expert_execution="loop",
+    )
+
+    assert bridge._validate_native_expert_precision(
+        dense, api, device="cuda:1"
+    )["provider_id"] == "native_dense"
+    assert requested_devices == ["cuda:1"]
+    dense.expert_execution = "grouped"
+    with pytest.raises(RuntimeError, match="fall back to BF16"):
+        bridge._validate_native_expert_precision(dense, api)
+
+
+def test_native_precision_validation_skips_an_unavailable_duplicate_provider() -> None:
+    report = SimpleNamespace(
+        to_dict=lambda: {
+            "expert_precisions": [
+                {
+                    "provider_id": "native_broken",
+                    "weight_format": "nvfp4",
+                    "activation_format": "nvfp4",
+                    "forward_available": True,
+                    "backward_available": False,
+                    "grouped_available": False,
+                    "verified": True,
+                    "selectable": False,
+                    "detail": "no backward",
+                },
+                {
+                    "provider_id": "native_working",
+                    "weight_format": "nvfp4",
+                    "activation_format": "nvfp4",
+                    "forward_available": True,
+                    "backward_available": True,
+                    "grouped_available": False,
+                    "verified": True,
+                    "selectable": True,
+                    "detail": "native dense",
+                },
+            ]
+        }
+    )
+    api = SimpleNamespace(detect_precision_capabilities=lambda _device=None: report)
+    experts = SimpleNamespace(
+        expert_weight_format="nvfp4",
+        expert_activation_format="nvfp4",
+        expert_qat_backend="auto",
+        expert_execution="loop",
+    )
+
+    selected = bridge._validate_native_expert_precision(experts, api)
+    assert selected["provider_id"] == "native_working"
 
 
 def test_training_config_enables_cpu_optimizer_state_offload():
@@ -153,6 +297,7 @@ def test_planner_recomputes_with_vocab_custom_experts_directional_and_atxy():
         "plan_fingerprint": "f" * 64,
         "num_experts": 37,
         "expert_weight_format": "nvfp4",
+        "expert_activation_format": "nvfp4",
         "atxy": {
             "enabled": True,
             "value_dim": 32,
@@ -168,6 +313,7 @@ def test_planner_recomputes_with_vocab_custom_experts_directional_and_atxy():
     assert calls["target"] == 10_000_000
     assert calls["vocab"] == 8192
     assert calls["expert_weight_format"] == "nvfp4"
+    assert calls["expert_activation_format"] == "nvfp4"
     assert calls["search_space"].values == {"num_experts": 37}
     assert calls["directional"].values == {
         "num_feature_groups": 4,
@@ -270,7 +416,9 @@ class _FakePlan:
     fingerprint = "plan-fingerprint"
     config = SimpleNamespace(
         num_experts=200,
-        expert_weight_format="mxfp4",
+        expert_weight_format="bfloat16",
+        expert_activation_format="bfloat16",
+        ple_backend="qr",
         d_model=64,
         n_layers=4,
     )
@@ -282,7 +430,9 @@ class _FakePlan:
             "fingerprint": self.fingerprint,
             "config": {
                 "num_experts": 200,
-                "expert_weight_format": "mxfp4",
+                "expert_weight_format": "bfloat16",
+                "expert_activation_format": "bfloat16",
+                "ple_backend": "qr",
                 "d_model": 64,
                 "n_layers": 4,
             },
@@ -417,17 +567,19 @@ def _native_run(
         **(training_updates or {}),
     )
     experts = _ConfigObject(
-        expert_activation_format="mxfp8",
+        expert_weight_format="bfloat16",
+        expert_activation_format="bfloat16",
         expert_master_dtype="bfloat16",
-        expert_qat_backend="reference",
+        expert_qat_backend="auto",
+        expert_execution="grouped",
     )
-    model_config = _ConfigObject(vocab_size=4096, d_model=64, n_layers=4)
+    model_config = _ConfigObject(vocab_size=4096, d_model=64, n_layers=4, ple_backend="qr")
     if recurrence is not None:
         model_config.recurrence = recurrence
     bundle = SimpleNamespace(
         build=lambda: _FakeModel(),
         model=model_config,
-        kda=_ConfigObject(backend="reference"),
+        kda=_ConfigObject(backend="fla"),
         mla=_ConfigObject(num_heads=4),
         experts=experts,
         directional=None,
@@ -502,7 +654,7 @@ def _native_run(
 
 
 def test_run_writes_native_artifact_metadata_without_real_training(tmp_path, monkeypatch):
-    artifacts = _native_run(tmp_path, monkeypatch, api_updates={"FORMAT_VERSION": 6})
+    artifacts = _native_run(tmp_path, monkeypatch, api_updates={"FORMAT_VERSION": 7})
 
     output = artifacts["output"]
     saved = artifacts["saved"]
@@ -517,7 +669,7 @@ def test_run_writes_native_artifact_metadata_without_real_training(tmp_path, mon
 
     assert output / "spalmer.pt" in saved
     assert output / "steps" / "step-00000001" / "spalmer.pt" in saved
-    assert manifest["checkpoint_format"] == "spalmer.prototype.checkpoint.v6"
+    assert manifest["checkpoint_format"] == "spalmer.prototype.checkpoint.v7"
     assert manifest["recurrence"] is None
     assert manifest["effective_depth"] == 4
     assert saved[output / "spalmer.pt"]["recurrence"] is None
@@ -541,13 +693,13 @@ def test_run_writes_native_artifact_metadata_without_real_training(tmp_path, mon
     assert update_args[0].endswith("spalmer.pt")
     assert metadata["model_family"] == "spalmer"
     assert metadata["precision"] == {
-        "expert_weights": "mxfp4",
-        "expert_activations": "mxfp8",
+        "expert_weights": "bfloat16",
+        "expert_activations": "bfloat16",
         "master_weights": "bfloat16",
-        "expert_qat_backend": "reference",
-        "ple_backend": "fake_qat",
-        "ple_quant_bits": 4,
-        "ple_stochastic_rounding": True,
+        "expert_qat_backend": "auto",
+        "expert_execution": "grouped",
+        "ple_backend": "qr",
+        "ple_parameter_dtype": "bfloat16",
         "optimizer_moments": "float32_cpu_offload",
     }
     assert manifest["optimizer_state_placement"]["dense"]["devices"] == ["cpu"]
@@ -572,7 +724,7 @@ def _parent_row(bundle: Path, *, family: str = "spalmer") -> dict:
 def _checkpoint_config(**updates):
     config = _config(
         initialization={"mode": "checkpoint", "checkpoint_id": "ckpt_parent"},
-        spalmer={"attention_backend": "reference"},
+        spalmer={"attention_backend": "fla", "require_fla": True},
     )
     config.update(updates)
     return config
@@ -592,7 +744,7 @@ def test_normalize_spalmer_config_checkpoint_mode_inherits_architecture(tmp_path
         "checkpoint_ref": str(bundle.resolve()),
     }
     assert normalized["tokenizer_ref"] is None
-    assert normalized["spalmer"] == {"attention_backend": "reference", "require_fla": False}
+    assert normalized["spalmer"] == {"attention_backend": "fla", "require_fla": True}
     assert "target_parameters" not in normalized
     assert normalized["epochs"] == 3
 
@@ -604,7 +756,7 @@ def test_normalize_spalmer_config_checkpoint_mode_inherits_architecture(tmp_path
         (lambda bundle: _parent_row(bundle, family="hf"), {}, "not a SPALMER checkpoint"),
         (
             lambda bundle: _parent_row(bundle),
-            {"spalmer": {"attention_backend": "reference", "num_experts": 100}},
+            {"spalmer": {"attention_backend": "fla", "num_experts": 100}},
             "num_experts",
         ),
         (lambda bundle: _parent_row(bundle), {"epochs": 0}, "epochs must be positive"),
@@ -641,12 +793,28 @@ def test_normalize_spalmer_config_rejects_unknown_initialization_mode():
 
 
 def _parent_bundle(
-    path: Path, *, tokenizer_source: str, format_version: int = 5, recurrence=None
+    path: Path, *, tokenizer_source: str, format_version: int = 8, recurrence=None
 ) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     model_config = {"vocab_size": 32, "d_model": 8, "n_layers": 4}
+    experts_config = {
+        "num_experts": 200,
+        "expert_weight_format": "bfloat16",
+        "expert_activation_format": "bfloat16",
+        "expert_master_dtype": "bfloat16",
+        "expert_qat_backend": "auto",
+        "expert_execution": "grouped",
+        "expert_promotion_format": "bfloat16",
+        "potentiation_budget": 0,
+    }
     if format_version >= 7:
         model_config["ple_backend"] = "qr"
+    if format_version == 7:
+        experts_config.update(
+            expert_quant_bits=4,
+            expert_fake_quantization=False,
+            expert_stochastic_rounding=False,
+        )
     if recurrence is not None:
         model_config["recurrence"] = recurrence
     torch.save(
@@ -657,7 +825,7 @@ def _parent_bundle(
             "model_config": model_config,
             "kda_config": {"hidden_size": 8, "num_heads": 2},
             "mla_config": {"hidden_size": 8, "num_heads": 2},
-            "experts_config": {"num_experts": 200, "expert_weight_format": "mxfp4"},
+            "experts_config": experts_config,
             "directional_config": {"d_model": 8, "enabled": True},
             "atxy_config": None,
             "tokenizer_binding": {
@@ -681,7 +849,9 @@ def _parent_bundle(
                     "fingerprint": "parent-plan",
                     "config": {
                         "num_experts": 200,
-                        "expert_weight_format": "mxfp4",
+                        "expert_weight_format": "bfloat16",
+                        "expert_activation_format": "bfloat16",
+                        "ple_backend": "qr" if format_version >= 7 else "fake_qat",
                         "d_model": 8,
                         "n_layers": 4,
                     },
@@ -695,6 +865,24 @@ def _parent_bundle(
 
 
 def _checkpoint_api(load_checkpoint, **extra):
+    capability = SimpleNamespace(
+        to_dict=lambda: {
+            "device": "cuda:0",
+            "expert_precisions": [
+                {
+                    "provider_id": "bf16_torch",
+                    "weight_format": "bfloat16",
+                    "activation_format": "bfloat16",
+                    "forward_available": True,
+                    "backward_available": True,
+                    "grouped_available": True,
+                    "verified": True,
+                    "selectable": True,
+                    "detail": "test native BF16",
+                }
+            ],
+        }
+    )
     return SimpleNamespace(
         load_checkpoint=load_checkpoint,
         SPALMERConfig=_ConfigObject,
@@ -705,6 +893,7 @@ def _checkpoint_api(load_checkpoint, **extra):
         ATXYConfig=_ConfigObject,
         TrainingConfig=lambda **values: SimpleNamespace(**values),
         fla_available=lambda: True,
+        detect_precision_capabilities=lambda _device=None: capability,
         plan_configuration=lambda *_args, **_kwargs: pytest.fail("plan must not be recomputed"),
         build_configs=lambda *_args, **_kwargs: pytest.fail("bundle must not be rebuilt"),
         **extra,
@@ -815,14 +1004,16 @@ def test_run_uses_loaded_model_and_records_parent(tmp_path, monkeypatch):
         optimizer_update_chunk_size=1_048_576,
     )
     experts = _ConfigObject(
-        expert_activation_format="mxfp8",
+        expert_weight_format="bfloat16",
+        expert_activation_format="bfloat16",
         expert_master_dtype="bfloat16",
-        expert_qat_backend="reference",
+        expert_qat_backend="auto",
+        expert_execution="grouped",
     )
     bundle = SimpleNamespace(
         build=lambda: pytest.fail("continued runs must not build a fresh model"),
-        model=_ConfigObject(vocab_size=4096, d_model=64, n_layers=4),
-        kda=_ConfigObject(backend="reference"),
+        model=_ConfigObject(vocab_size=4096, d_model=64, n_layers=4, ple_backend="qr"),
+        kda=_ConfigObject(backend="fla"),
         mla=_ConfigObject(num_heads=4),
         experts=experts,
         directional=None,
@@ -1030,10 +1221,8 @@ def test_training_config_carries_recurrence_fields():
     assert flat.mean_recurrence is None
 
 
-@pytest.mark.parametrize("format_version", [5, 6, 7])
-def test_prepare_checkpoint_run_accepts_supported_bundle_versions(
-    tmp_path, monkeypatch, format_version
-):
+def test_prepare_checkpoint_run_accepts_native_qr_bundle(tmp_path, monkeypatch):
+    format_version = 7
     bundle = _parent_bundle(
         tmp_path / "parent" / "spalmer.pt",
         tokenizer_source=str(tmp_path / "gone"),
@@ -1054,23 +1243,52 @@ def test_prepare_checkpoint_run_accepts_supported_bundle_versions(
     assert prepared.training.mean_recurrence is None
 
 
+@pytest.mark.parametrize("format_version", [5, 6])
+def test_prepare_checkpoint_run_rejects_legacy_fake_qat_ple(
+    tmp_path, monkeypatch, format_version
+):
+    bundle = _parent_bundle(
+        tmp_path / "parent" / "spalmer.pt",
+        tokenizer_source=str(tmp_path / "gone"),
+        format_version=format_version,
+    )
+    monkeypatch.setattr(bridge.db, "q1", lambda sql, args=(): _parent_row(bundle))
+    monkeypatch.setattr("yylab.models.spalmer.relocated_spalmer_tokenizer", lambda binding: None)
+    api = _checkpoint_api(
+        lambda path, **kwargs: (
+            _FakeModel(),
+            _FakeTokenizer(),
+            {"run_id": "parent", "plan": {"fingerprint": "parent-plan"}},
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="fake-QAT PLE"):
+        bridge.prepare_spalmer_run(_checkpoint_config(), api=api)
+
+
 def test_prepare_checkpoint_run_rejects_unsupported_bundle_version(tmp_path, monkeypatch):
     bundle = _parent_bundle(
         tmp_path / "parent" / "spalmer.pt",
         tokenizer_source=str(tmp_path / "gone"),
-        format_version=8,
+        format_version=9,
     )
     monkeypatch.setattr(bridge.db, "q1", lambda sql, args=(): _parent_row(bundle))
     monkeypatch.setattr("yylab.models.spalmer.relocated_spalmer_tokenizer", lambda binding: None)
     api = _checkpoint_api(lambda path, **kwargs: pytest.fail("must not load"))
 
-    with pytest.raises(ValueError, match="format-version 5, 6, or 7"):
+    with pytest.raises(RuntimeError, match="unsupported SPALMER checkpoint format version"):
         bridge.prepare_spalmer_run(_checkpoint_config(), api=api)
 
 
 def _recurrent_parent_api(recurrence):
     model = _FakeModel()
-    model.config = SimpleNamespace(recurrence=recurrence)
+    model.config = SimpleNamespace(
+        recurrence=recurrence,
+        ple_backend="qr",
+        vocab_size=32,
+        d_model=8,
+        n_layers=4,
+    )
     return _checkpoint_api(
         lambda path, **kwargs: (
             model,
@@ -1084,7 +1302,7 @@ def test_prepare_checkpoint_run_checks_parent_recurrence(tmp_path, monkeypatch):
     bundle = _parent_bundle(
         tmp_path / "parent" / "spalmer.pt",
         tokenizer_source=str(tmp_path / "gone"),
-        format_version=6,
+        format_version=7,
         recurrence={
             "prelude_layers": 1,
             "core_layers": 2,

@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from yylab.train.sparse_nvfp4 import (
+    _COMPRESSED_WEIGHT_CACHE,
     _EXECUTION_CACHE,
     _padded_paired_weight,
     _padded_shape,
@@ -52,6 +53,29 @@ def test_sparse_nvfp4_rejects_invalid_public_inputs() -> None:
         )
     with pytest.raises(TypeError, match="BF16"):
         sparse_nvfp4_forward(torch.zeros(2, 8), torch.zeros(4, 8))
+
+
+@pytest.mark.parametrize("backward_backend", ["native", "emulated", "unknown"])
+def test_sparse_bf16_backward_rejects_low_precision_backend_claims(
+    backward_backend: str,
+) -> None:
+    with pytest.raises(ValueError, match="BF16 backward does not use"):
+        sparse_nvfp4_linear(
+            torch.zeros(2, 8, dtype=torch.bfloat16),
+            torch.zeros(4, 8, dtype=torch.bfloat16),
+            backward_precision="bf16",
+            backward_backend=backward_backend,
+        )
+
+
+def test_sparse_mxfp8_backward_rejects_non_native_backend_before_execution() -> None:
+    with pytest.raises(ValueError, match="MXFP8 backward requires"):
+        sparse_nvfp4_linear(
+            torch.zeros(2, 8, dtype=torch.bfloat16),
+            torch.zeros(4, 8, dtype=torch.bfloat16),
+            backward_precision="mxfp8",
+            backward_backend="emulated",
+        )
 
 
 @pytest.fixture(scope="module")
@@ -169,13 +193,25 @@ def test_sparse_nvfp4_autograd_and_current_stream_cache(
         bias = torch.randn(35, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         output = sparse_nvfp4_linear(input, weight, bias)
         output.float().square().mean().backward()
-        # The same padded shape/current stream reuses its host plan and GPU buffers.
-        repeated = sparse_nvfp4_linear(input.detach(), weight.detach(), bias.detach())
+        first_cached_weight = next(iter(_COMPRESSED_WEIGHT_CACHE.values()))
+        # The same parameter version/current stream reuses its compressed weight,
+        # while activation packing is still performed by every forward call.
+        with torch.no_grad():
+            repeated = sparse_nvfp4_linear(input.detach(), weight, bias.detach())
+        assert next(iter(_COMPRESSED_WEIGHT_CACHE.values())) is first_cached_weight
+        with torch.no_grad():
+            weight.add_(0.01)
+            updated = sparse_nvfp4_linear(input.detach(), weight, bias.detach())
+        updated_cached_weight = next(iter(_COMPRESSED_WEIGHT_CACHE.values()))
     torch.cuda.current_stream().wait_stream(stream)
 
     assert len(_EXECUTION_CACHE) == 1
+    assert len(_COMPRESSED_WEIGHT_CACHE) == 1
+    assert updated_cached_weight is not first_cached_weight
+    assert updated_cached_weight.source_version == weight._version
     assert output.shape == (2, 3, 35)
     assert repeated.shape == output.shape
+    assert updated.shape == output.shape
     assert output.dtype == torch.bfloat16
     assert all(
         gradient is not None

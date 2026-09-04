@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import orjson
@@ -9,6 +10,18 @@ from nicegui import ui
 from ... import db
 from ...hw import best_gpu, has_triton, ram_total_gb
 from ...ingest.domains import DOMAINS
+from ...models.bitsandbytes_capabilities import (
+    BITSANDBYTES_QUANTIZATIONS,
+    available_bitsandbytes_quantizations,
+    bitsandbytes_compute_precision,
+)
+from ...models.families import checkpoint_family, hf_compatible_checkpoints
+from ...models.precision_capabilities import (
+    DENSE_MODEL_PRECISIONS,
+    available_dense_precisions,
+    model_execution_device,
+    require_model_precision,
+)
 from ...mole.adaptive import AdaptiveOccupancyConfig, solve_expert_budget
 from ...mole.inject import DEFAULT_TARGET_MODULES
 from ...train.data import DEFAULT_TEXT_CHUNK_CHARS, estimate_steps, tokenizer_stats_key
@@ -185,6 +198,7 @@ def _make_plan(
     isolated_expert_training: bool,
     train_token_routers: bool = False,
     optimizer_state: str = "gpu",
+    dense_precision: str | None = None,
 ):
     gpu = best_gpu()
     shape = _checkpoint_shape(checkpoint)
@@ -192,8 +206,7 @@ def _make_plan(
         return None
     if method == "auto":
         method, quant = _auto_method_quant(checkpoint, quant)
-    return plan_training(
-        PlanInput(
+    plan_input = PlanInput(
             **shape,
             vram_gb=gpu.vram_free_gb,
             ram_gb=ram_total_gb(),
@@ -209,24 +222,48 @@ def _make_plan(
             sm_version=gpu.compute_capability,
             has_triton=has_triton(),
         )
-    )
+    plan = plan_training(plan_input)
+    if plan.method == "qlora" and quant in DENSE_MODEL_PRECISIONS:
+        # The shared planner predates exact-device precision filtering and uses
+        # its ``quant`` field only for QLoRA candidates. A dense value therefore
+        # means no verified QLoRA lane exists: retain the best LoRA plan instead
+        # of inventing a quantized execution mode.
+        plan = plan_training(replace(plan_input, method="lora"))
+    if plan.method in {"full", "lora"}:
+        resolved_dense = (
+            quant if method in {"full", "lora"} else str(dense_precision or "")
+        )
+        if resolved_dense not in DENSE_MODEL_PRECISIONS:
+            raise ValueError("choose an available dense precision for Full/LoRA training")
+        plan = replace(plan, quant=resolved_dense)
+    return plan
 
 
 def _auto_method_quant(checkpoint: dict | None, requested_quant: str) -> tuple[str, str]:
-    """Respect an adapter checkpoint's established quantization family."""
+    """Respect an established checkpoint precision without widening it."""
 
     qat_format = _checkpoint_qat_format(checkpoint)
+    locked = str((checkpoint or {}).get("quant_locked") or "").strip().casefold()
     if qat_format:
         # QAT checkpoints carry high-precision shadow weights and restore their
-        # fake-quant forward path themselves. Stacking bitsandbytes NF4/INT8 on
-        # top would be a second, incompatible quantization transform.
+        # native low-precision forward path themselves. Stacking bitsandbytes
+        # NF4/INT8 on top would be a second, incompatible quantization transform.
+        if locked and locked != "bf16":
+            raise ValueError(
+                f"checkpoint has {qat_format} QAT but is quant-locked to {locked}; "
+                "saved native QAT requires BF16 shadow loading"
+            )
         return "lora", "bf16"
-    locked = str((checkpoint or {}).get("quant_locked") or "").lower()
-    if locked in {"nf4", "int8"}:
+    if locked in BITSANDBYTES_QUANTIZATIONS:
         return "qlora", locked
-    if locked in {"bf16", "fp16"}:
-        return "lora", "bf16"
-    return "auto", requested_quant
+    if locked in DENSE_MODEL_PRECISIONS:
+        return "lora", locked
+    if locked:
+        raise ValueError(f"checkpoint has unsupported precision lock {locked!r}")
+    requested = str(requested_quant or "").strip().casefold()
+    if requested not in {*DENSE_MODEL_PRECISIONS, *BITSANDBYTES_QUANTIZATIONS}:
+        raise ValueError(f"unsupported requested model precision {requested or '<empty>'!r}")
+    return "auto", requested
 
 
 def _checkpoint_qat_format(checkpoint: dict | None) -> str:
@@ -258,6 +295,7 @@ def render_plan(
     rank: int,
     num_experts: int,
     *,
+    dense_precision: str,
     adapter_only: bool,
     isolated_expert_training: bool,
     train_token_routers: bool = False,
@@ -277,18 +315,23 @@ def render_plan(
                 f"GPU: {gpu.name} ({gpu.vram_free_gb:.1f} GB free). Model size unknown — plan appears once checkpoint params are known."
             ).classes("text-sm text-gray-400")
             return
-        plan = _make_plan(
-            checkpoint,
-            seq_len,
-            method,
-            quant,
-            rank,
-            num_experts,
-            adapter_only=adapter_only,
-            isolated_expert_training=isolated_expert_training,
-            train_token_routers=train_token_routers,
-            optimizer_state=optimizer_state,
-        )
+        try:
+            plan = _make_plan(
+                checkpoint,
+                seq_len,
+                method,
+                quant,
+                rank,
+                num_experts,
+                dense_precision=dense_precision,
+                adapter_only=adapter_only,
+                isolated_expert_training=isolated_expert_training,
+                train_token_routers=train_token_routers,
+                optimizer_state=optimizer_state,
+            )
+        except ValueError as exc:
+            ui.label(str(exc)).classes("text-red-400 text-sm")
+            return
         with ui.row().classes("w-full items-center gap-2 flex-wrap"):
             ui.badge(f"{plan.method} · {plan.quant}").props(
                 "color=primary" if plan.feasible else "color=negative"
@@ -349,6 +392,25 @@ def corpus_domains(cid: str) -> set[str]:
 
 @ui.page("/train/mole")
 def train_mole_page():
+    model_device = model_execution_device()
+    dense_precisions = available_dense_precisions(model_device)
+    bnb_quantizations = available_bitsandbytes_quantizations(model_device)
+    dense_precision_options = {
+        precision: precision.upper() for precision in dense_precisions
+    }
+    bnb_quantization_options = {
+        quantization: (
+            f"{quantization.upper()} ({bitsandbytes_compute_precision(quantization).upper()} compute)"
+        )
+        for quantization in bnb_quantizations
+    }
+    default_dense_precision = next(iter(dense_precisions), None)
+    method_options = {"auto": "Auto (recommended)"}
+    if default_dense_precision is not None:
+        method_options["lora"] = f"LoRA ({default_dense_precision.upper()} base default)"
+    if bnb_quantizations:
+        method_options["qlora"] = "QLoRA (quantized base)"
+    default_bnb_quantization = bnb_quantizations[0] if bnb_quantizations else None
     with shell("Train · Mixture of LoRA Experts", "/train/mole"):
         ui.label("Adapter training (frozen base, MoLE)").classes("text-xl font-semibold")
         ui.label("Jointly learn sparse per-token expert routes over one frozen checkpoint.").classes(
@@ -357,7 +419,9 @@ def train_mole_page():
 
         ckpts = {
             c["id"]: f"{c['name']} ({c['params_b']:.2f} B)" if c["params_b"] else c["name"]
-            for c in db.q("SELECT * FROM checkpoints ORDER BY name")
+            for c in hf_compatible_checkpoints(
+                db.q("SELECT * FROM checkpoints WHERE kind!='pending' ORDER BY name")
+            )
         }
         corpora = corpus_options()
 
@@ -389,30 +453,43 @@ def train_mole_page():
                     .props("dense outlined")
                     .classes("w-full")
                 )
-                with field_grid(2):
+                with field_grid(3):
                     method = (
                         ui.select(
-                            {
-                                "auto": "Auto (recommended)",
-                                "qlora": "QLoRA (4-bit base)",
-                                "lora": "LoRA (bf16 base)",
-                            },
+                            method_options,
                             value="auto",
                             label="Training method",
                         )
                         .props("dense outlined")
                         .classes("w-full")
                     )
-                    quant = (
+                    lora_precision = (
                         ui.select(
-                            {"nf4": "NF4", "int8": "INT8"},
-                            value="nf4",
-                            label="Base quant (locked)",
+                            dense_precision_options,
+                            value=default_dense_precision,
+                            label="LoRA base precision",
                         )
                         .props("dense outlined")
                         .classes("w-full")
                     )
-                hint("Quant is locked to this checkpoint+adapter pair for the adapter's lifetime — no drift.")
+                    qlora_quant = (
+                        ui.select(
+                            bnb_quantization_options,
+                            value=default_bnb_quantization,
+                            label="QLoRA base quant",
+                        )
+                        .props("dense outlined")
+                        .classes("w-full")
+                    )
+                hint(
+                    "The selected dense precision or quantized format is locked to this "
+                    "checkpoint+adapter pair for the adapter's lifetime — no drift."
+                )
+                if not bnb_quantizations:
+                    hint(
+                        "QLoRA is omitted because no bitsandbytes NF4/INT8 CUDA "
+                        "forward/backward path passed its capability probe."
+                    )
 
                 ui.separator().classes("my-3")
                 form_section("2", "Training data")
@@ -727,14 +804,20 @@ def train_mole_page():
             update_plan()
 
         def update_plan() -> None:
+            requested_quant = (
+                str(qlora_quant.value or "")
+                if method.value in {"auto", "qlora"} and qlora_quant.value is not None
+                else str(lora_precision.value or "")
+            )
             render_plan(
                 plan_box,
                 checkpoint_row(),
                 int(seq_sel.value or 2048),
                 "auto" if method.value == "auto" else method.value,
-                quant.value,
+                requested_quant,
                 int(rank.value or 8),
                 int(n_exp.value or 8),
+                dense_precision=str(lora_precision.value or ""),
                 adapter_only=True,
                 isolated_expert_training=False,
                 train_token_routers=True,
@@ -816,14 +899,27 @@ def train_mole_page():
                 f"E8/r8 and E4/r16 have equal adapter width.{identity_note}"
             )
 
-        def update_quant_visibility() -> None:
-            quant.enabled = method.value in {"auto", "qlora"}
+        def update_precision_visibility() -> None:
+            lora_precision.enabled = bool(dense_precisions) and method.value in {"auto", "lora"}
+            qlora_quant.enabled = bool(bnb_quantizations) and method.value in {"auto", "qlora"}
 
         def resolve_method() -> tuple[str, str, object | None]:
-            m = method.value
+            m = str(method.value or "auto")
             if m != "auto":
-                return m, quant.value if m == "qlora" else "bf16", None
-            plan_method, plan_quant = _auto_method_quant(checkpoint_row(), quant.value)
+                requested = (
+                    str(qlora_quant.value or "")
+                    if m == "qlora"
+                    else str(lora_precision.value or "")
+                )
+                return m, requested, None
+            requested = (
+                str(qlora_quant.value)
+                if qlora_quant.value is not None
+                else str(lora_precision.value or "")
+            )
+            plan_method, plan_quant = _auto_method_quant(
+                checkpoint_row(), requested
+            )
             plan = _make_plan(
                 checkpoint_row(),
                 int(seq_sel.value or 2048),
@@ -831,15 +927,19 @@ def train_mole_page():
                 plan_quant,
                 int(rank.value or 8),
                 int(n_exp.value or 8),
+                dense_precision=str(lora_precision.value or ""),
                 adapter_only=True,
                 isolated_expert_training=False,
                 train_token_routers=True,
                 optimizer_state=str(optimizer_state.value or "auto"),
             )
             if plan is None:
-                return (
-                    ("qlora", plan_quant, None) if plan_method == "auto" else (plan_method, plan_quant, None)
+                if plan_method != "auto":
+                    return plan_method, plan_quant, None
+                fallback_method = (
+                    "qlora" if plan_quant in BITSANDBYTES_QUANTIZATIONS else "lora"
                 )
+                return fallback_method, plan_quant, None
             return plan.method, plan.quant, plan
 
         def on_start() -> None:
@@ -868,7 +968,17 @@ def train_mole_page():
                 return
 
             ckpt = db.q1("SELECT * FROM checkpoints WHERE id=?", (ckpt_sel.value,))
-            m_resolved, q_resolved, auto_plan = resolve_method()
+            if not ckpt or checkpoint_family(ckpt) == "spalmer":
+                ui.notify(
+                    "MoLE training requires a Hugging Face-compatible base checkpoint.",
+                    type="negative",
+                )
+                return
+            try:
+                m_resolved, q_resolved, auto_plan = resolve_method()
+            except ValueError as exc:
+                ui.notify(str(exc), type="negative", multi_line=True)
+                return
             qat_format = _checkpoint_qat_format(ckpt)
             if qat_format and m_resolved == "qlora":
                 ui.notify(
@@ -891,6 +1001,19 @@ def train_mole_page():
                     type="negative",
                     multi_line=True,
                 )
+                return
+            if qat_format and q_resolved != "bf16":
+                ui.notify(
+                    f"This base restores {qat_format} QAT numerics and requires BF16 shadow loading; "
+                    f"{q_resolved.upper()} was requested.",
+                    type="negative",
+                    multi_line=True,
+                )
+                return
+            try:
+                require_model_precision(q_resolved, model_device)
+            except (RuntimeError, ValueError) as exc:
+                ui.notify(str(exc), type="negative", multi_line=True)
                 return
 
             seq = int(seq_sel.value or 2048)
@@ -982,10 +1105,20 @@ def train_mole_page():
                 type="positive",
             )
 
-        for el in (ckpt_sel, seq_sel, method, quant, rank, n_exp, top_k, optimizer_state):
+        for el in (
+            ckpt_sel,
+            seq_sel,
+            method,
+            lora_precision,
+            qlora_quant,
+            rank,
+            n_exp,
+            top_k,
+            optimizer_state,
+        ):
             el.on_value_change(lambda _: update_plan())
         ckpt_sel.on_value_change(lambda _: update_capacity_summary())
-        method.on_value_change(lambda _: update_quant_visibility())
+        method.on_value_change(lambda _: update_precision_visibility())
         corp_sel.on_value_change(lambda _: update_data_summary())
         dom_filter.on_value_change(lambda _: update_data_summary())
         for el in (rank, n_exp, top_k):
@@ -1013,5 +1146,5 @@ def train_mole_page():
 
         update_routing_mode()
         update_plan()
-        update_quant_visibility()
+        update_precision_visibility()
         update_capacity_summary()

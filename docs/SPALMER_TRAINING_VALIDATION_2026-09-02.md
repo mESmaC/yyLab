@@ -1,5 +1,12 @@
 # SPALMER 10M Training Validation — 2026-09-02
 
+> **Historical, retired numerical lane.** This report records what the first
+> smoke checkpoint demonstrated at the time. That bundle uses fake/reference
+> MXFP4/MXFP8 expert QAT and pre-QR PLE, so current SPALMER and yyLab keep it
+> metadata-scannable but refuse to load, infer, or continue it. New checkpoints
+> use QR-PLE and only exact capability-verified native expert pairs; none of the
+> reference-QAT evidence below is a current executable-path claim.
+
 ## Outcome
 
 The first yyLab-driven SPALMER checkpoint completed successfully and validates
@@ -293,10 +300,19 @@ Final local verification before commit:
 - SPALMER: 347 passed, 3 skipped; Ruff passed.
 - yyLab: 555 passed; Ruff passed.
 
-## Remaining boundaries
+## Training UI follow-up
 
-- MXFP4/MXFP8 execution is the format-faithful reference QAT lane, not a native
-  packed W4A8 GEMM.
+- Selected-corpus capacity should be reported in tokenizer-resolved tokens, not
+  only characters. The displayed capacity must reflect the chosen tokenizer,
+  source splits, corpus-mixing cap, and exact cross-corpus deduplication. Keep
+  characters as secondary provenance; when an exact token count is not cached,
+  show a clearly labeled sampled estimate instead.
+
+## Boundaries at the time of the historical run
+
+- This run's MXFP4/MXFP8 execution used the now-retired format-faithful
+  reference QAT lane, not a native packed GEMM. It is unloadable under the
+  current no-emulation policy.
 - Backward and accelerator parameters remain BF16; Adam moments remain FP32.
 - Exact optimizer resume is false because optimizer moments are not yet stored
   in the checkpoint.

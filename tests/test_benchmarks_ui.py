@@ -25,6 +25,30 @@ def _adapter() -> dict:
     }
 
 
+def test_benchmark_precision_default_and_bnb_labels_are_device_verified(monkeypatch):
+    requested_devices: list[str] = []
+    monkeypatch.setattr(
+        benchmarks,
+        "available_dense_precisions",
+        lambda device: requested_devices.append(str(device)) or ("fp32",),
+    )
+    monkeypatch.setattr(
+        benchmarks,
+        "available_bitsandbytes_quantizations",
+        lambda device: requested_devices.append(str(device)) or ("int8",),
+    )
+
+    options, default = benchmarks._benchmark_precision_options("cuda:2")
+
+    assert default == "fp32"
+    assert options == {
+        "auto": "Auto",
+        "fp32": "FP32",
+        "int8": "INT8 · FP16 compute",
+    }
+    assert requested_devices == ["cuda:2", "cuda:2"]
+
+
 def test_quality_job_config_uses_non_training_adapter_identifier():
     config = benchmarks._quality_job_config(
         _checkpoint(),

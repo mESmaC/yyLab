@@ -1312,7 +1312,6 @@ def train_ftpo(
         cuda=_model_device(model).type == "cuda",
         optimizer_state="cpu_offload",
         implementation="cpu_offload_adamw",
-        master_weight_storage="fp32",
     )
     micro_batch = int(cfg["micro_batch"])
     grad_accum = int(cfg["grad_accum"])

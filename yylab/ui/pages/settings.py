@@ -5,6 +5,11 @@ from nicegui import ui
 from ...config import get_settings, update_settings
 from ...ingest.parallel import auto_worker_count
 from ...ingest.tokenize_stats import DEFAULT_SPECS
+from ...models.bitsandbytes_capabilities import (
+    available_bitsandbytes_quantizations,
+    bitsandbytes_compute_precision,
+)
+from ...models.precision_capabilities import model_execution_device
 from ..shell import panel, shell
 
 
@@ -14,6 +19,14 @@ def settings_page():
         ui.label("Settings").classes("text-xl font-semibold")
         s = get_settings()
         enabled = dict(s.get("tokenizers_enabled", {}))
+        bnb_quantizations = available_bitsandbytes_quantizations(model_execution_device())
+        bnb_quantization_options = {
+            quantization: (
+                f"{quantization.upper()} · "
+                f"{bitsandbytes_compute_precision(quantization).upper()} compute"
+            )
+            for quantization in bnb_quantizations
+        }
 
         with panel().classes("max-w-[560px]"):
             ui.label("Hugging Face").classes("text-base font-semibold mb-2")
@@ -34,11 +47,21 @@ def settings_page():
         with panel().classes("max-w-[560px]"):
             ui.label("Defaults").classes("text-base font-semibold mb-2")
             saved_quant = s.get("default_quant", "nf4")
+            selected_quant = (
+                saved_quant
+                if saved_quant in bnb_quantizations
+                else (bnb_quantizations[0] if bnb_quantizations else None)
+            )
             quant_def = ui.select(
-                {"nf4": "NF4", "int8": "INT8"},
-                value=saved_quant if saved_quant in {"nf4", "int8"} else "nf4",
+                bnb_quantization_options,
+                value=selected_quant,
                 label="Default quant for QLoRA",
             ).props("dense outlined").classes("w-56")
+            quant_def.enabled = bool(bnb_quantizations)
+            if not bnb_quantizations:
+                ui.label(
+                    "QLoRA has no verified bitsandbytes CUDA precision on this GPU."
+                ).classes("text-xs text-amber-400")
             try:
                 saved_workers = int(s.get("ingest_workers") or 0)
             except (TypeError, ValueError):
@@ -59,7 +82,7 @@ def settings_page():
             def save() -> None:
                 update_settings(
                     hf_token=(token_in.value or "").strip(),
-                    default_quant=quant_def.value,
+                    default_quant=str(quant_def.value or ""),
                     tokenizers_enabled={k: bool(c.value) for k, c in checks.items()},
                     ingest_workers=max(0, int(workers_in.value or 0)),
                 )

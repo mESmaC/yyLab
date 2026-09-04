@@ -1,5 +1,10 @@
 # SPALMER continued training and epoch control
 
+> **Historical design record.** Any format-v5/reference/fake-QAT compatibility
+> described below is superseded and unloadable. Current continued training is
+> native-only and accepts executable QR-PLE format-v7/v8 bundles after exact
+> expert-pair capability validation.
+
 Date: 2026-09-03
 Status: approved design (minimal scope), awaiting implementation plan
 

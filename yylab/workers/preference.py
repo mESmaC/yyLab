@@ -339,7 +339,7 @@ def _prepare_policy(config: DPOConfig) -> tuple[nn.Module, Any, bool, list[str]]
         task_type="CAUSAL_LM",
         target_modules="all-linear",
     )
-    model = get_peft_model(model, lora)
+    model = get_peft_model(model, lora, autocast_adapter_dtype=False)
     if config.gradient_checkpointing:
         try:
             model.gradient_checkpointing_enable(

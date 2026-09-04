@@ -1,5 +1,10 @@
 # SPALMER recurrent-depth latent reasoning — final design
 
+> **Historical recurrent-depth design record.** The recurrent architecture
+> remains relevant, but any format-v5/reference/fake-QAT precision or loading
+> examples below are superseded and unloadable. Current execution requires
+> QR-PLE format v7/v8 plus an exact capability-verified native expert pair.
+
 Date: 2026-09-03
 Status: approved design, ready for implementation (SPALMER repo `C:/Users/engin/Desktop/yy/spalmer` main, yyLab `C:/Users/engin/Desktop/yy/yyLab` main checkout — never the `.claude/worktrees` copy).
 

@@ -60,12 +60,16 @@ def test_one_step_schedule_has_no_zero_lr_warmup() -> None:
 
 
 def test_large_joint_optimizer_auto_selects_paged_cpu_backing(monkeypatch) -> None:
-    sentinel = object()
+    from yylab.train import loop
+
+    sentinel = SimpleNamespace()
     calls: list[dict] = []
 
     class FakeParameter:
         requires_grad = True
         is_cuda = True
+        device = torch.device("cuda:0")
+        dtype = torch.bfloat16
 
         def numel(self):
             return 60_000_000
@@ -80,8 +84,26 @@ def test_large_joint_optimizer_auto_selects_paged_cpu_backing(monkeypatch) -> No
 
     fake_bnb = SimpleNamespace(optim=SimpleNamespace(PagedAdamW8bit=fake_paged))
     monkeypatch.setitem(sys.modules, "bitsandbytes", fake_bnb)
+    monkeypatch.setattr(
+        loop,
+        "optimizer_capability_status",
+        lambda **_kwargs: {
+            "torch_adamw": (True, "verified"),
+            "fused_adamw": (True, "verified"),
+            "adamw_8bit": (True, "verified"),
+            "paged_adamw_8bit": (True, "verified paged state"),
+            "cpu_offload_adamw": (True, "verified"),
+        },
+    )
     assert make_optimizer(FakeModel(), 2e-4, cuda=True, optimizer_state="auto") is sentinel
-    assert calls == [{"lr": 2e-4, "weight_decay": 0.0}]
+    assert calls == [{"lr": 2e-4, "weight_decay": 0.0, "min_8bit_size": 0}]
+    assert sentinel._yylab_optimizer_resolution == {
+        "implementation": "paged_adamw_8bit",
+        "state": "cpu_paged",
+        "state_precision": "int8_blockwise",
+        "master_weight_precision": "none",
+        "capability_detail": "verified paged state",
+    }
 
 
 def test_cpu_offload_adamw_matches_torch_and_keeps_state_on_cpu() -> None:

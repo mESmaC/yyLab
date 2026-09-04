@@ -86,11 +86,16 @@ Artifacts live in `./artifacts` (override with `YYLAB_HOME`).
 - **Native SPALMER experiments** — plan and queue scratch 10M, 50M, 100M, or
   exact custom-size SPALMER checkpoints from one or more yyLab corpora while
   reusing any registered or compatible Hugging Face tokenizer. The worker
-  preserves the architecture's per-layer PLE, 3:1 KDA/MLA cycle, directional
-  branch, optional ATXY component, 200 coherent micro-experts, W4/MXFP8 expert
-  QAT, BF16 parameters, and FP32 Adam moments. FLA supplies the optimized CUDA
-  KDA path. Completed native `.pt` bundles are registered automatically and can
-  be loaded directly in Chat or benchmarked. CUDA inference defaults to the
+  preserves the architecture's QR-PLE, 3:1 KDA/MLA cycle, directional branch,
+  optional ATXY component, and 200 coherent micro-experts. Expert precision is
+  selected as an exact capability-verified pair: the integrated providers are
+  NVFP4/NVFP4 and MXFP8/MXFP8 dense per-expert CUDA, plus grouped BF16/BF16.
+  Unsupported pairs are omitted and fail closed; there is no fake/reference
+  fallback. Trainable masters and gradients remain BF16, Adam moments remain
+  FP32 on CPU, and FLA supplies the optimized CUDA KDA path. Executable native
+  `.pt` bundles are registered automatically and can be loaded directly in
+  Chat or benchmarked. Legacy emulated bundles remain metadata-scannable but
+  cannot load. CUDA inference defaults to the
   checkpoint's trained full-pool top-k while independently paging selected
   expert rows through bounded per-layer caches; the older prompt-global
   adaptive-residency controller remains an explicit experimental comparison.
@@ -99,25 +104,24 @@ Artifacts live in `./artifacts` (override with `YYLAB_HOME`).
 - **Explicit base-training precision** — parameter dtype, QAT numerics,
   activation quantization, optimizer implementation/state placement, AdamW
   constants, scheduler/warmup, batching, checkpointing, compile, and fused
-  kernels are separate recipe axes. INT4 remains compatibility-oriented STE
-  QAT because Blackwell has no native INT4 Tensor Core input path. On Blackwell,
-  NVFP4 QAT uses TorchAO's packed E2M1 values, E4M3 block scales, and native
-  block-scaled FP4 forward GEMM. The SM120 sparse lane uses cuSPARSELt's
+  kernels are separate recipe axes. Base training exposes dense BF16/FP16/FP32
+  plus NVFP4 only when its native Blackwell path is available; unsupported
+  low-precision modes fail closed instead of being emulated. NVFP4 uses
+  TorchAO's packed E2M1 values, E4M3 block scales, and native block-scaled FP4
+  forward GEMM. Each native precision choice is exposed only after a cached,
+  bounded forward/backward kernel smoke succeeds on the active GPU. The SM120
+  sparse lane uses cuSPARSELt's
   physically compressed paired-4:8 E2M1 operand, group-32 UE4M3 scales, and
   BF16 output; a real irregular-shape GEMM smoke is required before it is
   reported available. Backward can remain BF16 or use native block-32 MXFP8
-  dgrad/wgrad, with explicit format emulation as a portable fallback. Trainable
-  shadow parameters remain BF16 and optimizer-master storage is selected
-  independently. Ternary W1.58/A8 QAT is available only with the BitNet family.
+  dgrad/wgrad. Trainable shadow parameters remain BF16; full optimizer offload
+  keeps an FP32 master and FP32 Adam moments in CPU memory.
   Every trained base keeps its exact recipe and resolved architecture/precision
   provenance. QAT checkpoints save high-precision shadow tensors plus format
   and sparsity metadata so yyLab can restore the same training numerics.
-  The recommended experimental preset combines compressed sparse NVFP4 forward,
-  native MXFP8 backward, and an adaptive FP8 CPU master. Every master weight has
-  a real E4M3 byte, but only blocks with high reconstruction or lost-update error
-  receive a sparse packed four-bit potentiation overlay. Promotion is capped
-  (10% by default) and hysteretic demotion removes the overlay after a block
-  stabilizes. BF16 accelerator shadows and FP32 Adam moments remain intact.
+  The native sparse/MXFP8 preset combines compressed sparse NVFP4 forward,
+  native MXFP8 backward, and FP32 CPU optimizer offload. The retired adaptive
+  and potentiated FP8 master simulations are not runnable.
 - **MoLE adapter training** — frozen base with all experts and learned routers
   trained jointly on one mixed corpus stream. The legacy E8/r8/k2 preset makes
   one sparse decision per token and transformer block, then reuses that route
@@ -169,9 +173,8 @@ Artifacts live in `./artifacts` (override with `YYLAB_HOME`).
   an automatic paged 8-bit optimizer-state fallback keep host and device memory
   bounded. An explicit full CPU-offload mode keeps master weights and both
   Adam moments in system RAM when maximum VRAM headroom matters more than PCIe
-  transfer speed. Masters may remain FP32 or use the experimental potentiated
-  FP8 representation; optimizer arithmetic and moments stay FP32 in either
-  case. Qwen3 uses cuDNN-priority attention, full Liger kernels, and fused
+  transfer speed. Masters, optimizer arithmetic, and moments remain FP32.
+  Qwen3 uses cuDNN-priority attention, full Liger kernels, and fused
   linear cross entropy (no sequence × vocabulary logits allocation).
 - **Live run terminal** — the selected run's progress, state, errors, and
   bounded log tail update in place without refreshing the page.

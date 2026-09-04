@@ -22,13 +22,41 @@ from ..config import PATHS
 SPALMER_FORMAT = "spalmer.prototype.checkpoint"
 SPALMER_FILENAME = "spalmer.pt"
 SPALMER_QR_PLE_FORMAT_VERSION = 7
-SPALMER_SUPPORTED_FORMAT_VERSIONS = frozenset(range(1, SPALMER_QR_PLE_FORMAT_VERSION + 1))
+SPALMER_CURRENT_FORMAT_VERSION = 8
+# Scanning stays deliberately broader than execution.  Old bundles remain
+# identifiable in the registry so yyLab can explain why they are blocked.
+SPALMER_SUPPORTED_FORMAT_VERSIONS = frozenset(
+    range(1, SPALMER_CURRENT_FORMAT_VERSION + 1)
+)
 SPALMER_PLE_BACKENDS = frozenset({"fake_qat", "qr"})
+SPALMER_NATIVE_EXPERT_PRECISION_PAIRS = frozenset(
+    {
+        ("bfloat16", "bfloat16"),
+        ("float32", "float32"),
+        ("mxfp4", "mxfp8"),
+        ("nvfp4", "nvfp4"),
+        ("nvfp4", "mxfp8"),
+        ("mxfp6", "mxfp8"),
+        ("mxfp8", "mxfp8"),
+    }
+)
 DEFAULT_CONTEXT_LIMIT = 8_192
 ADAPTIVE_EXIT_CRITERIA = ("none", "latent_diff", "kl")
 EXIT_STATE_POLICIES = ("fill", "skip")
 DEFAULT_RECURRENCE_STEPS = 8
 _PER_TOKEN_STEP_LIMIT = 4_096
+# Exact operand pairs with an integrated SPALMER executor in format v8.  The
+# wider config vocabulary reserves names for future providers, but a checkpoint
+# must not be presented as executable merely because one of those names appears
+# in otherwise well-formed metadata.
+_INTEGRATED_EXPERT_PRECISION_PAIRS = frozenset(
+    {
+        ("nvfp4", "nvfp4"),
+        ("mxfp8", "mxfp8"),
+        ("bfloat16", "bfloat16"),
+        ("float32", "float32"),
+    }
+)
 # Chat, the benchmark UI and the checkpoints page all read a bundle's recurrent
 # core through the same three metadata shapes: a run receipt written by the
 # training bridge, a registry row produced by ``scan_spalmer_checkpoint``, and a
@@ -234,6 +262,7 @@ def scan_spalmer_checkpoint(ref: str | Path) -> dict[str, Any]:
             f"SPALMER format-version {format_version} predates QR-PLE but declares "
             f"backend {ple_backend!r}"
         )
+    expert_precision = _scanned_expert_precision(ple_backend, experts_config)
     state_tensor_count = _unique_tensor_numel(model_state.values())
     planned_parameter_count = _metadata_parameter_count(metadata)
     parameter_count = planned_parameter_count or state_tensor_count
@@ -258,6 +287,8 @@ def scan_spalmer_checkpoint(ref: str | Path) -> dict[str, Any]:
         # ``num_hidden_layers`` stays physical; recurrence multiplies the core.
         "spalmer_recurrence_config": recurrence_config,
         "spalmer_ple_backend": ple_backend,
+        "spalmer_expert_precision": expert_precision,
+        "spalmer_precision_executable": expert_precision["executable"],
         "effective_depth": effective_depth,
     }
     return {
@@ -279,6 +310,9 @@ def scan_spalmer_checkpoint(ref: str | Path) -> dict[str, Any]:
         "vocab_size": vocab_size,
         "recurrence_config": recurrence_config,
         "ple_backend": ple_backend,
+        "expert_precision": expert_precision,
+        "precision_executable": expert_precision["executable"],
+        "precision_rejection_reason": expert_precision["rejection_reason"],
         "effective_depth": effective_depth,
         "parameter_dtype": payload.get("model_parameter_dtype"),
         "trained_context_length": trained_context,
@@ -295,6 +329,127 @@ def scan_spalmer_checkpoint(ref: str | Path) -> dict[str, Any]:
         "checkpoint_ref": str(path),
         "path": str(path.parent),
     }
+
+
+def _scanned_expert_precision(
+    ple_backend: str,
+    experts_config: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Classify checkpoint numerics without importing SPALMER or running kernels."""
+
+    experts = dict(experts_config or {})
+    weight = str(experts.get("expert_weight_format") or "").strip().casefold()
+    activation = str(experts.get("expert_activation_format") or "").strip().casefold()
+    backend = str(experts.get("expert_qat_backend") or "").strip().casefold()
+    master = str(experts.get("expert_master_dtype") or "").strip().casefold()
+    execution = str(experts.get("expert_execution") or "").strip().casefold()
+    retired: list[str] = []
+    if ple_backend != "qr":
+        retired.append("retired fake-QAT PLE")
+    if weight == "legacy_int":
+        retired.append("legacy expert weights")
+    if backend == "reference":
+        retired.append("reference expert backend")
+    if bool(experts.get("expert_fake_quantization", False)):
+        retired.append("expert fake quantization")
+    if bool(experts.get("expert_stochastic_rounding", False)):
+        retired.append("emulated expert stochastic quantization")
+    missing: list[str] = []
+    if not weight:
+        missing.append("weight format")
+    if not activation:
+        missing.append("activation format")
+    if not backend:
+        missing.append("native backend policy")
+    if not master:
+        missing.append("master dtype")
+    if not execution:
+        missing.append("execution mode")
+
+    reason = ""
+    if retired:
+        reason = (
+            "checkpoint requires retired emulated precision ("
+            + ", ".join(retired)
+            + "); yyLab has no fake or reference fallback"
+        )
+    elif missing:
+        reason = (
+            "checkpoint does not prove an executable native precision contract; missing "
+            + ", ".join(missing)
+        )
+    elif (weight, activation) not in SPALMER_NATIVE_EXPERT_PRECISION_PAIRS:
+        reason = f"checkpoint declares unsupported expert precision pair {weight!r}/{activation!r}"
+    elif backend not in {"auto", "native"}:
+        reason = f"checkpoint declares unsupported expert backend {backend!r}"
+    elif master != ("float32" if weight == "float32" else "bfloat16"):
+        reason = (
+            "checkpoint expert master dtype does not match its execution pair: "
+            f"{master!r} for {weight!r}/{activation!r}"
+        )
+    elif execution not in {"grouped", "loop"}:
+        reason = f"checkpoint declares unsupported expert execution mode {execution!r}"
+    elif (weight, activation) not in _INTEGRATED_EXPERT_PRECISION_PAIRS:
+        reason = (
+            "checkpoint declares an expert precision pair with no integrated native "
+            f"SPALMER executor: {weight or 'missing'}/{activation or 'missing'}"
+        )
+
+    return {
+        "weight_format": weight or None,
+        "activation_format": activation or None,
+        "master_dtype": master or None,
+        "backend": backend or None,
+        "execution": execution or None,
+        "ple_backend": ple_backend,
+        "executable": not reason,
+        "rejection_reason": reason or None,
+    }
+
+
+def require_executable_spalmer_checkpoint(ref: str | Path) -> dict[str, Any]:
+    """Return scan metadata or reject a bundle that requires emulation."""
+
+    scanned = scan_spalmer_checkpoint(ref)
+    reason = str(scanned.get("precision_rejection_reason") or "")
+    if reason:
+        raise ValueError(f"SPALMER checkpoint is metadata-only and cannot execute: {reason}")
+    return scanned
+
+
+def _require_native_precision_capability(
+    scanned: Mapping[str, Any],
+    device: torch.device,
+) -> dict[str, Any]:
+    """Require the checkpoint's exact pair and dispatch mode on this device."""
+
+    precision = _plain_dict(scanned.get("expert_precision"), "expert_precision")
+    from spalmer.precision import detect_precision_capabilities
+
+    report = detect_precision_capabilities(device)
+    capability = report.require(
+        str(precision["weight_format"]),
+        str(precision["activation_format"]),
+    )
+    if precision.get("execution") == "grouped" and not capability.grouped_available:
+        raise RuntimeError(
+            f"native provider {capability.provider_id!r} is dense per-expert, but the "
+            "checkpoint requires grouped execution; yyLab will not substitute BF16 bmm"
+        )
+    return capability.to_dict()
+
+
+def require_spalmer_precision_capability(
+    ref: str | Path,
+    device: str | torch.device | None = None,
+) -> dict[str, Any]:
+    """Validate a bundle's exact declared precision against the current device."""
+
+    scanned = require_executable_spalmer_checkpoint(ref)
+    resolved = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    if resolved.type == "cuda" and resolved.index is None:
+        resolved = torch.device("cuda", torch.cuda.current_device())
+    return _require_native_precision_capability(scanned, resolved)
 
 
 class SpalmerTokenizerFacade:
@@ -1028,6 +1183,7 @@ def load_spalmer_runtime(
     """Load a native bundle and return an HF-shaped inference facade."""
 
     checkpoint_path = resolve_spalmer_checkpoint(ref)
+    scanned = require_executable_spalmer_checkpoint(checkpoint_path)
     if max_context_tokens is not None and max_context_tokens <= 0:
         raise ValueError("max_context_tokens must be positive")
     if expert_cache_size is not None and expert_cache_size <= 0:
@@ -1036,6 +1192,10 @@ def load_spalmer_runtime(
         raise ValueError(
             "paged expert inference cannot use legacy request-global dynamic residency"
         )
+
+    cuda = torch.cuda.is_available()
+    device = torch.device("cuda" if cuda else "cpu")
+    precision_capability = _require_native_precision_capability(scanned, device)
 
     # Keep SPALMER optional for yyLab installations that only use HF models.
     from spalmer import load_checkpoint
@@ -1058,14 +1218,13 @@ def load_spalmer_runtime(
         warm_start=warm_start,
         exit_state_policy=exit_state_policy,
     )
-    cuda = torch.cuda.is_available()
-    device = torch.device("cuda" if cuda else "cpu")
     offload: dict[str, object] | None = None
     if cuda:
         # Checkpoint loading is deliberately CPU-first.  Casting on CPU is
-        # safe; the selective placement call below is the only operation that
-        # may move SPALMER weights onto the accelerator.
-        model.to(device="cpu", dtype=torch.bfloat16)
+        # unnecessary: SPALMER has already validated and restored the exact
+        # checkpoint master dtype.  The selective placement call below is the
+        # only operation that may move weights onto the accelerator.
+        model.to(device="cpu")
         model.eval()
         if expert_offload:
             enable_offload = getattr(model, "enable_expert_offload", None)
@@ -1115,7 +1274,10 @@ def load_spalmer_runtime(
         else:
             model.to(device=device)
     else:
-        model.to(device=device, dtype=torch.float32)
+        # Preserve the checkpoint dtype that the exact CPU capability probe
+        # just approved.  This matters for native FP32 CPU development bundles
+        # and prevents a validated pair from being silently changed afterward.
+        model.to(device=device)
         model.eval()
 
     context_limit = int(
@@ -1139,7 +1301,12 @@ def load_spalmer_runtime(
         )
 
     notes = [
-        "Loaded native SPALMER checkpoint.",
+        "Loaded capability-verified native SPALMER checkpoint.",
+        "Expert precision: "
+        f"{precision_capability['weight_format'].upper()}/"
+        f"{precision_capability['activation_format'].upper()} via "
+        f"{precision_capability['provider_id']} "
+        f"({'grouped' if precision_capability['grouped_available'] else 'dense per expert'}).",
         "SPALMER uses NoPE and native recurrent KDA/MLA state; HF RoPE and KV-cache modes do not apply.",
     ]
     if tokenizer_override is not None:
@@ -1176,7 +1343,7 @@ def load_spalmer_runtime(
         notes.append("SPALMER parameters run as BF16 on CUDA; physical expert offload is disabled.")
     else:
         notes.append(
-            "SPALMER is using the FP32 CPU fallback; all experts remain CPU-resident and "
+            "SPALMER is using native BF16 CPU execution; all experts remain CPU-resident and "
             "an accelerator expert cache is not applicable."
         )
     if recurrence_config is not None:
@@ -1873,6 +2040,8 @@ __all__ = [
     "SpalmerTokenizerFacade",
     "is_spalmer_checkpoint",
     "load_spalmer_runtime",
+    "require_executable_spalmer_checkpoint",
     "resolve_spalmer_checkpoint",
     "scan_spalmer_checkpoint",
+    "require_spalmer_precision_capability",
 ]

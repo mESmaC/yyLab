@@ -6,6 +6,11 @@ from ... import db
 from ...config import get_settings, update_settings
 from ...hw import best_gpu, system_report
 from ...infer.context_math import capacity_rows, kv_bytes_per_token, max_context_for_budget, model_weight_gb
+from ...infer.engine import (
+    _validate_cache_selection,
+    available_cache_implementations,
+    available_kv_precisions,
+)
 from ...models.families import checkpoint_family
 from ..shell import panel, shell
 
@@ -38,6 +43,22 @@ def context_page():
         engine = dict(get_settings()["engine"])
         sysinfo = system_report()
         gpu = best_gpu()
+        try:
+            import torch
+
+            cuda_available = bool(gpu is not None and torch.cuda.is_available())
+        except ImportError:
+            cuda_available = False
+        cache_options = available_cache_implementations(cuda_available)
+        saved_cache = str(engine.get("cache_implementation", "dynamic"))
+        selected_cache = saved_cache if saved_cache in cache_options else None
+        saved_kv_quant = str(engine.get("kv_quant", "none"))
+        initial_kv_options = (
+            available_kv_precisions(selected_cache)
+            if selected_cache is not None
+            else {"none": "Select an available cache first"}
+        )
+        selected_kv_quant = saved_kv_quant if saved_kv_quant in initial_kv_options else None
         ram_gb = sysinfo["ram_gb"]
 
         with ui.row().classes("w-full gap-4 items-start flex-wrap"):
@@ -49,34 +70,26 @@ def context_page():
                     label="Attention implementation",
                 ).props("dense outlined").classes("w-full")
                 cache = ui.select(
-                    {
-                        "dynamic": "Dynamic (default)",
-                        "offloaded": "Offloaded to CPU RAM (dynamic)",
-                        "offloaded_static": "Offloaded to CPU RAM (static, chunked prefill)",
-                        "quantized": "Quantized KV cache (in VRAM)",
-                        "quantized_offloaded": "Quantized KV offload (packed CPU int4/int8)",
-                        "static": "Static (pre-allocated, in VRAM)",
-                        "sliding_window": "Sliding window (deprecated upstream)",
-                    },
-                    value=engine["cache_implementation"],
+                    cache_options,
+                    value=selected_cache,
                     label="KV cache implementation",
                 ).props("dense outlined").classes("w-full")
+                if selected_cache is None:
+                    ui.label(
+                        f"Saved cache {saved_cache!r} is unavailable on this runtime. "
+                        "Choose an available implementation before saving or loading a model."
+                    ).classes("text-xs text-red-400")
                 kvq = ui.select(
-                    {
-                        "none": "None",
-                        "int8": "INT8 (~half; quantized offload)",
-                        "int4": "INT4 (~quarter; resident or offloaded)",
-                    },
-                    value=(
-                        "int4"
-                        if engine.get("cache_implementation") == "quantized"
-                        else engine["kv_quant"]
-                        if engine["kv_quant"] in {"none", "int8", "int4"}
-                        else "none"
-                    ),
+                    initial_kv_options,
+                    value=selected_kv_quant,
                     label="KV storage precision",
                 ).props("dense outlined").classes("w-full")
-                with ui.row().classes("w-full gap-3"):
+                if selected_kv_quant is None:
+                    ui.label(
+                        f"Saved KV precision {saved_kv_quant!r} is invalid for {saved_cache!r}; "
+                        "it will not be aliased or silently replaced."
+                    ).classes("text-xs text-red-400")
+                with ui.row().classes("w-full gap-3") as kv_offload_controls:
                     kv_offload_group = ui.number(
                         "Quant group size",
                         value=engine.get("kv_offload_group_size", 64),
@@ -95,14 +108,21 @@ def context_page():
                     "Pin quantized CPU KV buffers",
                     value=bool(engine.get("kv_offload_pin_memory", True)),
                 ).tooltip("Pinned buffers improve CPU-to-GPU transfer overlap but consume pinned host memory.")
+                kv_offload_controls.visible = selected_cache == "quantized_offloaded"
+                kv_offload_pin.visible = selected_cache == "quantized_offloaded"
 
                 def align_cache_precision() -> None:
-                    if cache.value == "quantized" and kvq.value != "int4":
-                        kvq.set_value("int4")
-                        ui.notify("The resident Quanto cache uses INT4; selected INT4.", type="info")
-                    elif cache.value == "quantized_offloaded" and kvq.value not in {"int4", "int8"}:
-                        kvq.set_value("int4")
-                        ui.notify("Quantized offload requires INT4 or INT8; selected INT4.", type="info")
+                    quantized_offload = cache.value == "quantized_offloaded"
+                    kv_offload_controls.visible = quantized_offload
+                    kv_offload_pin.visible = quantized_offload
+                    if cache.value is None:
+                        kvq.set_options({"none": "Select an available cache first"}, value=None)
+                        return
+                    options = available_kv_precisions(str(cache.value))
+                    current = str(kvq.value) if kvq.value is not None else None
+                    if current not in options:
+                        current = next(iter(options)) if len(options) == 1 else None
+                    kvq.set_options(options, value=current)
 
                 cache.on_value_change(lambda _: align_cache_precision())
                 with ui.row().classes("w-full gap-3"):
@@ -190,6 +210,17 @@ def context_page():
                     ).classes("text-xs text-gray-500")
 
                 def save() -> None:
+                    try:
+                        _validate_cache_selection(
+                            {
+                                "cache_implementation": cache.value,
+                                "kv_quant": kvq.value,
+                            },
+                            cuda_available,
+                        )
+                    except (RuntimeError, ValueError) as exc:
+                        ui.notify(str(exc), type="negative")
+                        return
                     update_settings(
                         engine={
                             "attn_implementation": attn.value,
@@ -285,9 +316,28 @@ def context_page():
                 return
             ctx = int(cap_len.value)
             quant_locked = c["quant_locked"] or "bf16"
-            m_gb = model_weight_gb(c["params_b"], quant_locked) if c["params_b"] else 0.0
+            try:
+                m_gb = (
+                    model_weight_gb(c["params_b"], quant_locked)
+                    if c["params_b"]
+                    else 0.0
+                )
+            except ValueError as exc:
+                cap_info.text = f"Checkpoint precision cannot execute: {exc}"
+                return
             vram_free = gpu.vram_free_gb if gpu else 0.0
-            rows = capacity_rows(cfg, ctx, vram_free, ram_gb, m_gb)
+            rows = capacity_rows(
+                cfg,
+                ctx,
+                vram_free,
+                ram_gb,
+                m_gb,
+                quant_group_size=int(engine.get("kv_offload_group_size", 64) or 64),
+                offload_residual_length=int(engine.get("kv_offload_residual_length", 32) or 0),
+                resident_int4_available="quantized" in cache_options,
+                offload_available=bool({"offloaded", "offloaded_static"} & cache_options.keys()),
+                quantized_offload_available="quantized_offloaded" in cache_options,
+            )
             per_tok = kv_bytes_per_token(cfg, "bf16")
             max_ram = max_context_for_budget(cfg, max(ram_gb - 4.0, 0.0), "bf16")
             cap_info.text = (

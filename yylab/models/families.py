@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +57,18 @@ def is_spalmer_checkpoint(checkpoint: Mapping[str, Any] | None) -> bool:
     return checkpoint_family(checkpoint) == SPALMER_MODEL_FAMILY
 
 
+def hf_compatible_checkpoints(
+    checkpoints: Iterable[Mapping[str, Any]],
+) -> list[Mapping[str, Any]]:
+    """Filter generic Hugging Face workflows away from native-only families."""
+
+    return [
+        checkpoint
+        for checkpoint in checkpoints
+        if checkpoint_family(checkpoint) == HF_MODEL_FAMILY
+    ]
+
+
 def _normalize_family(value: str) -> str:
     if value in {"spalmer", "spalmer_v1"}:
         return SPALMER_MODEL_FAMILY
@@ -68,5 +80,6 @@ __all__ = [
     "SPALMER_MODEL_FAMILY",
     "checkpoint_family",
     "family_from_reference",
+    "hf_compatible_checkpoints",
     "is_spalmer_checkpoint",
 ]

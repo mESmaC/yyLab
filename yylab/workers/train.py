@@ -9,6 +9,7 @@ from pathlib import Path
 
 from .. import db
 from ..artifacts import adapter_dir, checkpoint_dir, read_json, router_dir, run_dir, write_json
+from ..models.precision_capabilities import model_compute_dtype, require_dense_precision
 from ..mole.adaptive import AdaptiveOccupancyConfig, AdaptiveOccupancyController
 from ..mole.inject import (
     MoLEConfig,
@@ -62,8 +63,8 @@ from ..train.data import (
     normalize_training_objective,
     plan_expert_data,
 )
-from ..train.loop import LoopOpts, make_optimizer, train_loop
-from ..train.low_precision import apply_qat, qat_metadata
+from ..train.loop import LoopOpts, make_optimizer, optimizer_runtime_metadata, train_loop
+from ..train.low_precision import LOW_PRECISION_METADATA_KEY, apply_qat, qat_metadata
 
 
 def log(msg: str) -> None:
@@ -600,7 +601,7 @@ def _run_mole_joint_per_token(
     replaced = inject_mole(
         model,
         mole_cfg,
-        expert_dtype=torch.bfloat16 if cuda else torch.float32,
+        expert_dtype=model_compute_dtype(quant),
     )
     if not replaced:
         raise RuntimeError("no target linear modules matched the requested MoLE architecture")
@@ -647,8 +648,14 @@ def _run_mole_joint_per_token(
         cuda=cuda,
         optimizer_state=cfg.get("optimizer_state", "auto"),
     )
-    optimizer_impl = type(optimizer).__name__
-    log(f"optimizer={optimizer_impl}; state mode={cfg.get('optimizer_state', 'auto')}")
+    optimizer_resolution = optimizer_runtime_metadata(optimizer)
+    optimizer_impl = optimizer_resolution["implementation"]
+    log(
+        f"optimizer requested=auto/{cfg.get('optimizer_state', 'auto')}; "
+        f"resolved={optimizer_impl}/{optimizer_resolution['state']}; "
+        f"moments={optimizer_resolution['state_precision']}; "
+        f"master={optimizer_resolution['master_weight_precision']}"
+    )
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps=_warmup_steps(cfg["max_steps"]),
@@ -688,8 +695,9 @@ def _run_mole_joint_per_token(
         "fused_linear_cross_entropy": fused_ce,
         "liger_full_kernels": fused_ce and full_liger,
         "cudnn_priority_sdpa": bool(cfg.get("cudnn_sdpa", True)),
-        "optimizer_state": cfg.get("optimizer_state", "auto"),
+        "optimizer_state": optimizer_resolution["state"],
         "optimizer_impl": optimizer_impl,
+        "optimizer_resolution": optimizer_resolution,
     }
     if budget_plan is not None:
         metadata.update(
@@ -841,7 +849,7 @@ def run_mole(cfg: dict, rd: Path) -> dict:
         top_k=1,
         target_modules=final_cfg.target_modules,
     )
-    replaced = inject_mole(model, resident_cfg, expert_dtype=torch.bfloat16 if cuda else torch.float32)
+    replaced = inject_mole(model, resident_cfg, expert_dtype=model_compute_dtype(quant))
     if not replaced:
         raise RuntimeError("no target linear modules matched the requested MoLE architecture")
     set_trainable_expert(model, 0)
@@ -991,7 +999,6 @@ def run_mole(cfg: dict, rd: Path) -> dict:
 
 
 def run_router(cfg: dict, rd: Path) -> dict:
-    import torch
     from transformers.optimization import get_cosine_schedule_with_warmup
 
     a_row = db.q1("SELECT * FROM adapters WHERE id=?", (cfg["adapter_id"],))
@@ -1016,14 +1023,15 @@ def run_router(cfg: dict, rd: Path) -> dict:
     mole_cfg = MoLEConfig.from_dict(saved["config"])
     # Load the legacy expert bank strictly before adding the new shared-router
     # namespace. Existing adapters and old per-layer router snapshots remain valid.
-    inject_mole(model, mole_cfg, expert_dtype=torch.bfloat16 if cuda else torch.float32)
+    adapter_dtype = model_compute_dtype(quant)
+    inject_mole(model, mole_cfg, expert_dtype=adapter_dtype)
     n = apply_mole_weights(model, load_mole_weights(a_row["path"]))
     log(f"loaded adapter weights into {n} expert matrices")
     mole_cfg.router_type = "shared_prompt"
     mole_cfg.top_k = min(cfg.get("top_k") or mole_cfg.top_k, mole_cfg.num_experts)
     mole_cfg.router_hidden_size = int(cfg.get("router_hidden_size", 256))
     mole_cfg.router_max_tokens = int(cfg.get("router_max_tokens", 256))
-    attach_shared_router(model, mole_cfg)
+    attach_shared_router(model, mole_cfg, router_dtype=adapter_dtype)
     set_active_expert(model, None)
     set_stage(model, "router")
     if cfg.get("grad_ckpt", True):
@@ -1193,14 +1201,13 @@ def _create_scratch_base(cfg: dict):
     if dtype_name not in dtype_map:
         raise ValueError(f"unsupported parameter dtype: {dtype_name}")
     cuda = torch.cuda.is_available()
-    if not cuda and dtype_name == "fp16":
-        raise ValueError("FP16 scratch training requires CUDA")
     dtype = dtype_map[dtype_name]
     seed = int(cfg.get("seed", 42))
     torch.manual_seed(seed)
     if cuda:
         torch.cuda.manual_seed_all(seed)
     device = torch.device("cuda:0" if cuda else "cpu")
+    require_dense_precision(dtype_name, device)
     # Construct directly on the destination device and requested dtype. This
     # avoids a second full-sized host model during random initialization.
     with torch.device(device):
@@ -1216,6 +1223,7 @@ def _create_scratch_base(cfg: dict):
         "seed": seed,
     }
 
+
     notes = [
         f"randomly initialized {model.config.model_type} with "
         f"{estimate_parameter_count(resolved_spec):,} parameters on {device}",
@@ -1223,38 +1231,33 @@ def _create_scratch_base(cfg: dict):
         f"native context={resolved_spec.max_position_embeddings:,}; "
         f"training sequence={int(cfg['seq_len']):,}",
     ]
-    low_precision = qat_metadata(
-        qat_mode,
-        group_size=int(precision.get("qat_group_size") or 32),
-        activation=str(precision.get("activation_qat") or "none"),
+    low_precision = _requested_qat_metadata(
+        precision,
         parameter_dtype=dtype_name,
-        sparsity=str(precision.get("sparsity") or "none"),
-        backend=str(precision.get("qat_backend") or "auto"),
-        sparsity_backend=str(precision.get("sparsity_backend") or "auto"),
-        backward_precision=str(precision.get("backward_precision") or "bf16"),
-        backward_backend=str(precision.get("backward_backend") or "auto"),
+        device=device,
     )
     if low_precision is not None:
         count = apply_qat(model, low_precision)
-        native_note = (
-            "native block-scaled FP4 forward GEMMs"
-            if low_precision.get("native_low_bit_gemm")
-            else "emulated low-bit forward numerics"
-        )
+        if not low_precision.get("native_low_bit_gemm"):
+            raise RuntimeError("low-precision metadata did not resolve to a native GEMM")
+        native_note = "native block-scaled FP4 forward GEMMs"
         if low_precision.get("native_sparse_gemm"):
             sparse_note = "; compressed paired-4:8 cuSPARSELt execution"
         elif low_precision.get("sparsity") != "none":
-            sparse_note = "; paired 4:8 SAT mask with dense FP4 execution"
+            raise RuntimeError(
+                "structured low-precision metadata did not resolve to a native compressed GEMM"
+            )
         else:
             sparse_note = ""
+        if (
+            low_precision.get("backward_precision") == "mxfp8"
+            and not low_precision.get("native_low_bit_backward")
+        ):
+            raise RuntimeError("MXFP8 backward did not resolve to a native GEMM")
         backward_note = (
             "; native block-32 MXFP8 dgrad/wgrad"
             if low_precision.get("native_low_bit_backward")
-            else (
-                "; emulated block-32 MXFP8 dgrad/wgrad"
-                if low_precision.get("backward_precision") == "mxfp8"
-                else "; BF16 dgrad/wgrad"
-            )
+            else "; BF16 dgrad/wgrad"
         )
         notes.append(
             f"{qat_mode} QAT applied to {count} transformer Linear modules; "
@@ -1263,14 +1266,172 @@ def _create_scratch_base(cfg: dict):
     return model, tokenizer, cuda, dtype_name, notes
 
 
+_QAT_EXECUTION_FIELDS = (
+    "format",
+    "backend",
+    "group_size",
+    "activation",
+    "parameter_dtype",
+    "sparsity",
+    "sparsity_backend",
+    "backward_precision",
+    "backward_backend",
+)
+
+
+def _requested_qat_metadata(
+    precision: dict,
+    *,
+    parameter_dtype: str,
+    device=None,
+) -> dict | None:
+    qat_mode = str(precision.get("qat") or "none")
+    return qat_metadata(
+        qat_mode,
+        device=device,
+        group_size=int(
+            precision.get("qat_group_size")
+            or (16 if qat_mode == "nvfp4" else 32)
+        ),
+        activation=str(
+            precision.get("activation_qat")
+            or ("nvfp4" if qat_mode == "nvfp4" else "none")
+        ),
+        parameter_dtype=parameter_dtype,
+        sparsity=str(precision.get("sparsity") or "none"),
+        backend=str(precision.get("qat_backend") or "auto"),
+        sparsity_backend=str(precision.get("sparsity_backend") or "auto"),
+        backward_precision=str(precision.get("backward_precision") or "bf16"),
+        backward_backend=str(precision.get("backward_backend") or "auto"),
+    )
+
+
+def _effective_precision_recipe(
+    precision: dict,
+    metadata: dict | None,
+    *,
+    inherited: bool,
+) -> dict:
+    effective = dict(precision)
+    effective["inherit_checkpoint_low_precision"] = bool(inherited)
+    if metadata is None:
+        effective["qat"] = "none"
+        effective["resolved_low_precision"] = None
+        return effective
+    sparsity = str(metadata["sparsity"])
+    backward_precision = str(metadata["backward_precision"])
+    effective.update(
+        {
+            "parameter_dtype": str(metadata["parameter_dtype"]),
+            "qat": str(metadata["format"]),
+            "qat_group_size": int(metadata["group_size"]),
+            "activation_qat": str(metadata["activation"]),
+            "qat_backend": "native",
+            "sparsity": sparsity,
+            "sparsity_backend": "compressed" if sparsity != "none" else "auto",
+            "backward_precision": backward_precision,
+            "backward_backend": "native" if backward_precision == "mxfp8" else "auto",
+            "resolved_low_precision": dict(metadata),
+        }
+    )
+    return effective
+
+
+def _configure_continued_low_precision(
+    model,
+    precision: dict,
+    *,
+    parameter_dtype: str,
+    inherit_checkpoint_low_precision: bool,
+) -> tuple[dict, str | None]:
+    """Resolve the exact low-precision execution recipe for a loaded base."""
+
+    requested = _requested_qat_metadata(
+        precision,
+        parameter_dtype=parameter_dtype,
+        device=next(model.parameters()).device,
+    )
+    inherited_raw = getattr(
+        getattr(model, "config", None),
+        LOW_PRECISION_METADATA_KEY,
+        None,
+    )
+    inherited = dict(inherited_raw) if isinstance(inherited_raw, dict) else None
+    if inherit_checkpoint_low_precision:
+        if inherited is None:
+            raise ValueError(
+                "checkpoint low-precision inheritance was requested, but the loaded "
+                "checkpoint has no native low-precision recipe"
+            )
+        if requested is not None:
+            mismatches = [
+                field
+                for field in _QAT_EXECUTION_FIELDS
+                if requested.get(field) != inherited.get(field)
+            ]
+            if mismatches:
+                raise ValueError(
+                    "requested low-precision recipe conflicts with the inherited "
+                    "checkpoint recipe: "
+                    + ", ".join(mismatches)
+                )
+        effective = _effective_precision_recipe(
+            precision,
+            inherited,
+            inherited=True,
+        )
+        return effective, "retained the checkpoint's verified native low-precision recipe"
+
+    if inherited is not None:
+        # load_base(..., restore_saved_qat=False) must remove this marker along
+        # with the inherited QAT classes. Keeping it would reactivate a recipe
+        # that this run explicitly declined.
+        raise RuntimeError(
+            "dense checkpoint loading retained an unrequested low-precision recipe"
+        )
+    if requested is None:
+        return _effective_precision_recipe(precision, None, inherited=False), None
+
+    count = apply_qat(model, requested)
+    effective = _effective_precision_recipe(
+        precision,
+        requested,
+        inherited=False,
+    )
+    return (
+        effective,
+        f"applied requested verified native {requested['format']} QAT to {count} Linear modules",
+    )
+
+
 def _make_base_optimizer(model, cfg: dict, *, cuda: bool):
-    optimizer_cfg = cfg.get("optimizer") if isinstance(cfg.get("optimizer"), dict) else {}
+    if not isinstance(cfg.get("optimizer"), dict):
+        cfg["optimizer"] = {}
+    optimizer_cfg = cfg["optimizer"]
+    master_format = str(optimizer_cfg.get("master_weight_storage", "fp32") or "fp32")
+    if master_format != "fp32":
+        raise ValueError(
+            "legacy potentiated/adaptive FP8 optimizer masters are not executable; "
+            "use the FP32 CPU master"
+        )
+    retired_adaptive_fields = {
+        "adaptive_max_promoted_fraction",
+        "adaptive_promote_threshold",
+        "adaptive_demote_threshold",
+        "adaptive_demote_patience",
+    }
+    configured_retired_fields = sorted(retired_adaptive_fields.intersection(optimizer_cfg))
+    if configured_retired_fields:
+        raise ValueError(
+            "retired adaptive optimizer-master settings are not executable: "
+            + ", ".join(configured_retired_fields)
+        )
     lr = float(optimizer_cfg.get("lr", cfg.get("lr", 5e-5)))
     betas = (
         float(optimizer_cfg.get("beta1", 0.9)),
         float(optimizer_cfg.get("beta2", 0.999)),
     )
-    return make_optimizer(
+    optimizer = make_optimizer(
         model,
         lr,
         weight_decay=float(optimizer_cfg.get("weight_decay", cfg.get("weight_decay", 0.0))),
@@ -1279,18 +1440,9 @@ def _make_base_optimizer(model, cfg: dict, *, cuda: bool):
         implementation=str(optimizer_cfg.get("implementation", "auto") or "auto"),
         betas=betas,
         eps=float(optimizer_cfg.get("eps", 1e-8)),
-        master_weight_storage=str(optimizer_cfg.get("master_weight_storage", "fp32") or "fp32"),
-        adaptive_max_promoted_fraction=float(
-            optimizer_cfg.get("adaptive_max_promoted_fraction", 0.10)
-        ),
-        adaptive_promote_threshold=float(
-            optimizer_cfg.get("adaptive_promote_threshold", 0.55)
-        ),
-        adaptive_demote_threshold=float(
-            optimizer_cfg.get("adaptive_demote_threshold", 0.20)
-        ),
-        adaptive_demote_patience=int(optimizer_cfg.get("adaptive_demote_patience", 2)),
     )
+    optimizer_cfg["resolved"] = optimizer_runtime_metadata(optimizer)
+    return optimizer
 
 
 def _make_base_scheduler(optimizer, cfg: dict):
@@ -1354,6 +1506,12 @@ def run_base(cfg: dict, rd: Path) -> dict:
 
     precision = _precision_config(cfg)
     requested_dtype = str(precision.get("parameter_dtype") or "bf16")
+    requested_qat = str(precision.get("qat") or "none")
+    inherit_saved_qat = bool(precision.get("inherit_checkpoint_low_precision", False))
+    if method == "qlora" and (requested_qat != "none" or inherit_saved_qat):
+        raise ValueError(
+            "QLoRA base quantization cannot be combined with native QAT execution"
+        )
     quant = str(cfg.get("quant") or "nf4") if method == "qlora" else requested_dtype
     if mode == "scratch":
         model, tokenizer, cuda, quant, notes = _create_scratch_base(cfg)
@@ -1365,12 +1523,21 @@ def run_base(cfg: dict, rd: Path) -> dict:
             raise ValueError("continued base training requires a checkpoint reference")
         if method != "full":
             enforce_quant_lock(checkpoint_id, quant)
-        restore_saved_qat = bool(precision.get("inherit_checkpoint_low_precision", False))
         model, tokenizer, cuda, quant, notes = load_base(
             checkpoint_ref,
             quant,
-            restore_saved_qat=restore_saved_qat,
+            restore_saved_qat=inherit_saved_qat,
         )
+        precision, low_precision_note = _configure_continued_low_precision(
+            model,
+            precision,
+            parameter_dtype=requested_dtype,
+            inherit_checkpoint_low_precision=inherit_saved_qat,
+        )
+        cfg["precision"] = precision
+        requested_dtype = str(precision["parameter_dtype"])
+        if low_precision_note is not None:
+            notes.append(low_precision_note)
 
     for note in notes:
         log(f"note: {note}")
@@ -1403,7 +1570,7 @@ def run_base(cfg: dict, rd: Path) -> dict:
             bias="none",
             task_type="CAUSAL_LM",
         )
-        model = get_peft_model(model, peft_cfg)
+        model = get_peft_model(model, peft_cfg, autocast_adapter_dtype=False)
         model.print_trainable_parameters()
     if cfg.get("grad_ckpt", True):
         enable_grad_ckpt(model)
@@ -1425,10 +1592,26 @@ def run_base(cfg: dict, rd: Path) -> dict:
     optimizer = _make_base_optimizer(model, cfg, cuda=cuda)
     scheduler, warmup_steps = _make_base_scheduler(optimizer, cfg)
     optimizer_cfg = cfg.get("optimizer") if isinstance(cfg.get("optimizer"), dict) else {}
+    optimizer_resolution = optimizer_runtime_metadata(optimizer)
+    write_json(
+        rd / "optimizer_resolution.json",
+        {
+            "requested": {
+                "implementation": str(optimizer_cfg.get("implementation", "auto") or "auto"),
+                "state": str(optimizer_cfg.get("state", "auto") or "auto"),
+            },
+            "resolved": optimizer_resolution,
+        },
+    )
+    # Keep the canonical run recipe replayable and retain exactly what auto chose.
+    write_json(rd / "config.json", cfg)
     log(
-        f"optimizer={type(optimizer).__name__}; scheduler={type(scheduler).__name__}; "
-        f"warmup={warmup_steps} steps; "
-        f"master={optimizer_cfg.get('master_weight_storage', 'fp32')}"
+        f"optimizer requested={optimizer_cfg.get('implementation', 'auto')}/"
+        f"{optimizer_cfg.get('state', 'auto')}; resolved="
+        f"{optimizer_resolution['implementation']}/{optimizer_resolution['state']}; "
+        f"moments={optimizer_resolution['state_precision']}; "
+        f"master={optimizer_resolution['master_weight_precision']}; "
+        f"scheduler={type(scheduler).__name__}; warmup={warmup_steps} steps"
     )
     batches = build_batches(cfg, tokenizer, cfg["max_steps"])
     train_model = model
@@ -1562,7 +1745,8 @@ def run_base(cfg: dict, rd: Path) -> dict:
         "parameter_dtype": requested_dtype,
         "qat": precision.get("qat", "none"),
         "sparsity": precision.get("sparsity", "none"),
-        "master_weight_storage": optimizer_cfg.get("master_weight_storage", "fp32"),
+        "master_weight_storage": optimizer_resolution["master_weight_precision"],
+        "optimizer_resolution": optimizer_resolution,
         "persistent_optimizer_state": master_summary,
         "corpora": list(cfg["corpora"]),
         "corpus_mix": cfg["corpus_mix"],

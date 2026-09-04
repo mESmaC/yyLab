@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from types import MethodType, SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -747,12 +748,14 @@ def test_train_loop_attention_context_covers_checkpoint_recompute(tmp_path, monk
 def test_small_cuda_parameter_set_prefers_fused_adamw(monkeypatch):
     from yylab.train import loop
 
-    sentinel = object()
+    sentinel = SimpleNamespace()
     calls: list[dict] = []
 
     class FakeParameter:
         requires_grad = True
         is_cuda = True
+        device = torch.device("cuda:0")
+        dtype = torch.bfloat16
 
         def numel(self):
             return 10_092_544
@@ -766,8 +769,21 @@ def test_small_cuda_parameter_set_prefers_fused_adamw(monkeypatch):
         return sentinel
 
     monkeypatch.setattr(loop.torch.optim, "AdamW", fake_adamw)
+    monkeypatch.setattr(
+        loop,
+        "optimizer_capability_status",
+        lambda **_kwargs: {
+            "torch_adamw": (True, "verified"),
+            "fused_adamw": (True, "verified fused state"),
+            "adamw_8bit": (True, "verified"),
+            "paged_adamw_8bit": (True, "verified"),
+            "cpu_offload_adamw": (True, "verified"),
+        },
+    )
     assert make_optimizer(FakeModel(), 3e-4, cuda=True) is sentinel
     assert calls == [{"lr": 3e-4, "weight_decay": 0.0, "fused": True}]
+    assert sentinel._yylab_optimizer_resolution["implementation"] == "fused_adamw"
+    assert sentinel._yylab_optimizer_resolution["state_precision"] == "bfloat16"
 
 
 def test_planner_qlora_on_small_gpu():
@@ -892,6 +908,7 @@ def test_make_plan_preserves_base_and_mole_training_semantics(tmp_path, monkeypa
         "nf4",
         16,
         1,
+        dense_precision="bf16",
         adapter_only=False,
         isolated_expert_training=False,
     )
@@ -902,12 +919,63 @@ def test_make_plan_preserves_base_and_mole_training_semantics(tmp_path, monkeypa
         "nf4",
         16,
         4,
+        dense_precision="bf16",
         adapter_only=True,
         isolated_expert_training=True,
     )
     assert base.method == "full"
     assert mole.method == "lora"
     assert any("sequentially" in note for note in mole.notes)
+
+
+def test_make_plan_preserves_explicit_dense_lora_precision(tmp_path, monkeypatch):
+    from yylab.ui.pages import train_mole
+
+    gpu = SimpleNamespace(vram_free_gb=64.0, compute_capability="8.9")
+    monkeypatch.setattr(train_mole, "best_gpu", lambda: gpu)
+    monkeypatch.setattr(train_mole, "ram_total_gb", lambda: 64.0)
+    monkeypatch.setattr(train_mole, "has_triton", lambda: False)
+
+    plan = train_mole._make_plan(
+        {"params_b": 0.1, "ref": str(tmp_path), "quant_locked": "fp16"},
+        512,
+        "auto",
+        "nf4",
+        16,
+        1,
+        dense_precision="fp32",
+        adapter_only=True,
+        isolated_expert_training=False,
+    )
+
+    assert plan.method == "lora"
+    assert plan.quant == "fp16"
+
+
+def test_make_plan_uses_selected_dense_precision_when_auto_chooses_lora(
+    tmp_path, monkeypatch
+):
+    from yylab.ui.pages import train_mole
+
+    gpu = SimpleNamespace(vram_free_gb=64.0, compute_capability="8.9")
+    monkeypatch.setattr(train_mole, "best_gpu", lambda: gpu)
+    monkeypatch.setattr(train_mole, "ram_total_gb", lambda: 64.0)
+    monkeypatch.setattr(train_mole, "has_triton", lambda: False)
+
+    plan = train_mole._make_plan(
+        {"params_b": 0.1, "ref": str(tmp_path)},
+        512,
+        "auto",
+        "nf4",
+        16,
+        1,
+        dense_precision="fp32",
+        adapter_only=True,
+        isolated_expert_training=False,
+    )
+
+    assert plan.method == "lora"
+    assert plan.quant == "fp32"
 
 
 def test_blackwell_compute_capability_note_is_numeric():
@@ -929,6 +997,19 @@ def test_planner_lora_when_model_fits():
     plan = plan_training(PlanInput(params_b=0.5, vram_gb=16.0, seq_len=1024, method="auto"))
     assert plan.feasible
     assert plan.method in {"lora", "full"}
+
+
+def test_planner_rejects_unimplemented_precision_instead_of_estimating_it():
+    with pytest.raises(ValueError, match="never estimates an unimplemented or emulated format"):
+        plan_training(
+            PlanInput(
+                params_b=0.5,
+                vram_gb=16.0,
+                seq_len=1024,
+                method="qlora",
+                quant="fp8",
+            )
+        )
 
 
 def _seed_corpus(tmp_path: Path) -> str:
@@ -1021,7 +1102,7 @@ def test_run_mole_end_to_end(tmp_path, monkeypatch):
     adapter_id = db.new_id("adp")
     db.execute(
         "INSERT INTO adapters(id, name, created_at, checkpoint_id, arch, quant, status) VALUES(?,?,?,?,?,?,?)",
-        (adapter_id, "tiny-mole", db.now_iso(), ckpt_id, "mole", "nf4", "training"),
+        (adapter_id, "tiny-mole", db.now_iso(), ckpt_id, "mole", "fp32", "training"),
     )
 
     def fake_load(ref, quant):
@@ -1039,7 +1120,7 @@ def test_run_mole_end_to_end(tmp_path, monkeypatch):
         "checkpoint_id": ckpt_id,
         "checkpoint_ref": str(model_dir),
         "adapter_id": adapter_id,
-        "quant": "nf4",
+        "quant": "fp32",
         "num_experts": 2,
         "rank": 4,
         "alpha": None,
@@ -1074,7 +1155,7 @@ def test_run_mole_end_to_end(tmp_path, monkeypatch):
     assert (Path(a["path"]) / "mole_weights.safetensors").exists()
     assert (Path(a["path"]) / "mole_config.json").exists()
     ckpt = db.q1("SELECT quant_locked FROM checkpoints WHERE id=?", (ckpt_id,))
-    assert ckpt["quant_locked"] == "nf4"
+    assert ckpt["quant_locked"] == "fp32"
 
     cfg["quant"] = "int8"
     try:

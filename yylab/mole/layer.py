@@ -37,6 +37,7 @@ class TopKRouter(nn.Module):
         in_features: int,
         num_experts: int,
         top_k: int,
+        dtype: torch.dtype | None = None,
         device: torch.device | None = None,
         identity_expert: bool = False,
     ) -> None:
@@ -49,7 +50,13 @@ class TopKRouter(nn.Module):
         self.identity_expert = bool(identity_expert)
         self.num_routes = num_routes
         self.top_k = top_k
-        self.gate = nn.Linear(in_features, num_routes, bias=False, device=device)
+        self.gate = nn.Linear(
+            in_features,
+            num_routes,
+            bias=False,
+            dtype=dtype,
+            device=device,
+        )
         nn.init.zeros_(self.gate.weight)
 
     def forward(
@@ -59,7 +66,7 @@ class TopKRouter(nn.Module):
         top_k: int | None = None,
         allowed_experts: tuple[int, ...] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        logits = self.gate(x.float())
+        logits = self.gate(x.to(dtype=self.gate.weight.dtype))
         selected_k = self.top_k if top_k is None else int(top_k)
         if not 1 <= selected_k <= self.num_routes:
             raise ValueError("runtime top-k must be within [1, num_routes]")
@@ -108,6 +115,7 @@ class SharedTokenRouter(TopKRouter):
         hidden_size: int,
         num_experts: int,
         top_k: int,
+        dtype: torch.dtype | None = None,
         device: torch.device | None = None,
         adaptive: bool = False,
         identity_expert: bool = False,
@@ -118,6 +126,7 @@ class SharedTokenRouter(TopKRouter):
             hidden_size,
             num_experts,
             top_k,
+            dtype=dtype,
             device=device,
             identity_expert=identity_expert,
         )
@@ -131,7 +140,7 @@ class SharedTokenRouter(TopKRouter):
         if self.adaptive:
             # softplus(1.854...) ~= 2 nats before the learned utility term.
             self.surprise_bias = nn.Parameter(
-                torch.full((num_experts,), 1.8545866, dtype=torch.float32, device=device)
+                torch.full((num_experts,), 1.8545866, dtype=dtype, device=device)
             )
         else:
             self.register_parameter("surprise_bias", None)
@@ -177,7 +186,7 @@ class SharedTokenRouter(TopKRouter):
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if not self.adaptive:
             return super().forward(x)
-        raw_utility = self.gate(x.float())
+        raw_utility = self.gate(x.to(dtype=self.gate.weight.dtype))
         assert self.surprise_bias is not None
         predicted_nll = F.softplus(self.surprise_bias - raw_utility)
         selection_utility = -predicted_nll
@@ -260,6 +269,7 @@ class SharedPromptRouter(nn.Module):
         top_k: int,
         hidden_width: int | None = 256,
         max_prompt_tokens: int = 256,
+        dtype: torch.dtype | None = None,
         device: torch.device | None = None,
         identity_expert: bool = False,
     ) -> None:
@@ -282,15 +292,15 @@ class SharedPromptRouter(nn.Module):
         self.max_prompt_tokens = max_prompt_tokens
         if hidden_width is None:
             self.network = nn.Sequential(
-                nn.LayerNorm(hidden_size, device=device),
-                nn.Linear(hidden_size, num_routes, device=device),
+                nn.LayerNorm(hidden_size, dtype=dtype, device=device),
+                nn.Linear(hidden_size, num_routes, dtype=dtype, device=device),
             )
         else:
             self.network = nn.Sequential(
-                nn.LayerNorm(hidden_size, device=device),
-                nn.Linear(hidden_size, hidden_width, device=device),
+                nn.LayerNorm(hidden_size, dtype=dtype, device=device),
+                nn.Linear(hidden_size, hidden_width, dtype=dtype, device=device),
                 nn.SiLU(),
-                nn.Linear(hidden_width, num_routes, device=device),
+                nn.Linear(hidden_width, num_routes, dtype=dtype, device=device),
             )
         self.last_router_logits: torch.Tensor | None = None
         self.last_router_weights: torch.Tensor | None = None
@@ -322,29 +332,30 @@ class SharedPromptRouter(nn.Module):
         if hidden_states.ndim == 2:
             if attention_mask is not None:
                 raise ValueError("attention_mask requires sequence-shaped hidden states")
-            return hidden_states.float()
+            return hidden_states.to(dtype=self.network[0].weight.dtype)
         if hidden_states.ndim != 3:
             raise ValueError("shared prompt routing expects [batch, sequence, hidden] states")
         hidden_states = hidden_states[:, : self.max_prompt_tokens]
+        compute_dtype = self.network[0].weight.dtype
         if attention_mask is None:
-            return hidden_states.float().mean(dim=1)
+            return hidden_states.to(dtype=compute_dtype).mean(dim=1)
         mask = attention_mask[:, : hidden_states.shape[1]]
         if mask.shape != hidden_states.shape[:2]:
             raise ValueError("attention_mask must match the routed prompt tokens")
-        mask = mask.to(device=hidden_states.device, dtype=torch.float32)
+        mask = mask.to(device=hidden_states.device, dtype=compute_dtype)
         count = mask.sum(dim=1, keepdim=True).clamp_min(1.0)
-        return (hidden_states.float() * mask.unsqueeze(-1)).sum(dim=1) / count
+        return (hidden_states.to(dtype=compute_dtype) * mask.unsqueeze(-1)).sum(dim=1) / count
 
     def logits_from_features(self, features: torch.Tensor) -> torch.Tensor:
         if features.ndim != 2 or features.shape[-1] != self.hidden_size:
             raise ValueError(f"router features must have shape [batch, {self.hidden_size}]")
-        return self.network(features.float())
+        return self.network(features.to(dtype=self.network[0].weight.dtype))
 
     def forward(
         self, hidden_states: torch.Tensor, attention_mask: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         logits = self.logits_from_features(self.prompt_features(hidden_states, attention_mask))
-        probabilities = torch.softmax(logits.float(), dim=-1)
+        probabilities = torch.softmax(logits, dim=-1)
         top_values, indices = torch.topk(probabilities, self.top_k, dim=-1)
         if self.top_k == 1:
             # A literal p/p normalization is exactly one and has zero
@@ -403,8 +414,11 @@ class MoLELinear(nn.Module):
         self.top_k = min(top_k, self.num_routes)
         self.adaptive = bool(adaptive)
         dtype = expert_dtype or base.weight.dtype
-        if dtype in (torch.uint8, torch.int8):
-            dtype = torch.bfloat16
+        if dtype not in {torch.float16, torch.bfloat16, torch.float32}:
+            raise ValueError(
+                "quantized or non-floating base projections require an explicit, "
+                "verified MoLE compute dtype"
+            )
         self.experts = nn.ModuleList(
             [
                 LoRAExpert(
@@ -431,8 +445,10 @@ class MoLELinear(nn.Module):
                 in_f,
                 num_experts,
                 self.top_k,
+                dtype=dtype,
+                device=base.weight.device,
                 identity_expert=self.identity_expert,
-            ).to(device=base.weight.device)
+            )
         )
         object.__setattr__(
             self,

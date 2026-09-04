@@ -145,6 +145,14 @@ def test_engine_rejects_hf_only_options_for_spalmer(monkeypatch):
                 adapter_path="adapter",
             )
         )
+    with pytest.raises(ValueError, match="fixed by the checkpoint"):
+        engine.load(
+            LoadSpec(
+                ref="fixture.pt",
+                quant="bf16",
+                model_family="spalmer",
+            )
+        )
 
 
 def test_engine_never_constructs_hf_quantized_cache_for_spalmer(monkeypatch):
@@ -216,20 +224,31 @@ def test_spalmer_recipe_reads_trained_and_scanned_metadata_shapes():
         {
             "precision": {
                 "expert_weights": "nvfp4",
-                "expert_activations": "mxfp8",
+                "expert_activations": "nvfp4",
                 "master_weights": "bfloat16",
             }
         }
-    ) == "SPALMER · NVFP4/MXFP8 · BF16 master"
+    ) == "SPALMER · NVFP4/NVFP4 · BF16 master"
     assert _spalmer_base_recipe(
         {
-            "experts_config": {
-                "expert_weight_format": "mxfp4",
-                "expert_activation_format": "mxfp8",
+            "expert_precision": {
+                "weight_format": "mxfp8",
+                "activation_format": "mxfp8",
                 "expert_master_dtype": "bfloat16",
             }
         }
-    ) == "SPALMER · MXFP4/MXFP8 · BF16 master"
+    ) == "SPALMER · MXFP8/MXFP8 · BF16 master"
+    assert _spalmer_base_recipe(
+        {
+            "expert_precision": {
+                "weight_format": "mxfp4",
+                "activation_format": "mxfp8",
+                "master_dtype": "bfloat16",
+                "executable": False,
+            },
+            "precision_executable": False,
+        }
+    ).endswith("metadata-only (blocked legacy precision)")
 
 
 def test_stack_lock_infers_spalmer_family_for_direct_configs(tmp_path):

@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+import torch
 from nicegui import ui
 
 from ... import db
@@ -11,7 +12,16 @@ from ...artifacts import run_dir
 from ...benchmark.models import BenchmarkSuite, load_suite
 from ...hw import best_gpu
 from ...infer.engine import ENGINE
+from ...models.bitsandbytes_capabilities import (
+    available_bitsandbytes_quantizations,
+    bitsandbytes_compute_precision,
+)
 from ...models.families import checkpoint_family
+from ...models.precision_capabilities import (
+    available_dense_precisions,
+    model_execution_device,
+    preferred_dense_precision,
+)
 from ...models.spalmer import recurrence_metadata
 from ...workers.launch import launch_worker
 from ..components import empty_state, field_grid, form_section, hint, status_badge
@@ -42,6 +52,29 @@ SPALMER_ADAPTIVE_EXIT_LABELS = {
     "kl": "Adaptive · output KL",
 }
 SPALMER_ADAPTIVE_EXITS = frozenset(SPALMER_ADAPTIVE_EXIT_LABELS)
+
+
+def _benchmark_precision_options(
+    device: str | torch.device,
+) -> tuple[dict[str, str], str]:
+    """Build selector choices and a dense default proven on the exact device."""
+
+    dense_precisions = available_dense_precisions(device)
+    if not dense_precisions:
+        raise RuntimeError(
+            "no dense benchmark precision passed the exact-device capability probe"
+        )
+    options = {"auto": "Auto"}
+    options.update((precision, precision.upper()) for precision in dense_precisions)
+    options.update(
+        (
+            quantization,
+            f"{quantization.upper()} · "
+            f"{bitsandbytes_compute_precision(quantization).upper()} compute",
+        )
+        for quantization in available_bitsandbytes_quantizations(device)
+    )
+    return options, dense_precisions[0]
 
 
 def _checkpoint_is_recurrent(row: dict | None) -> bool:
@@ -82,8 +115,12 @@ def _resolve_quant(checkpoint: dict, requested: str, adapter: dict | None = None
     gpu = best_gpu()
     params_b = float(checkpoint.get("params_b") or 0.0)
     if gpu and params_b and params_b * 2.3 > gpu.vram_free_gb:
-        return "nf4"
-    return "bf16"
+        available = available_bitsandbytes_quantizations(model_execution_device())
+        if "nf4" in available:
+            return "nf4"
+        if "int8" in available:
+            return "int8"
+    return preferred_dense_precision(model_execution_device())
 
 
 def _quality_job_config(
@@ -676,6 +713,10 @@ def _load_bundled_suite() -> BenchmarkSuite:
 @ui.page("/benchmarks")
 def benchmarks_page() -> None:
     suite = _load_bundled_suite()
+    model_device = model_execution_device()
+    quantization_options, benchmark_dense_default = _benchmark_precision_options(
+        model_device
+    )
     state: dict[str, Any] = {
         "selected": None,
         "table_signature": None,
@@ -722,7 +763,7 @@ def benchmarks_page() -> None:
                         )
                         quality_quant = (
                             ui.select(
-                                {"auto": "Auto", "bf16": "BF16", "nf4": "NF4", "int8": "INT8"},
+                                quantization_options,
                                 value="auto",
                                 label="Quantization",
                             )
@@ -933,8 +974,8 @@ def benchmarks_page() -> None:
                         )
                         perf_quant = (
                             ui.select(
-                                {"auto": "Auto", "bf16": "BF16", "nf4": "NF4", "int8": "INT8"},
-                                value="bf16",
+                                quantization_options,
+                                value=benchmark_dense_default,
                                 label="Quantization",
                             )
                             .props("dense outlined")

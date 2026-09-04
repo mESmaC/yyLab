@@ -27,7 +27,7 @@ yylab/
   train/
     planner.py     VRAM-aware auto method picker (full/lora/qlora)
     base_config.py validated scratch architecture, exact parameter count/solver
-    low_precision.py state-compatible STE QAT and saved-format restoration
+    low_precision.py native low-precision QAT and fail-closed format restoration
     data.py        shard streaming + EOS-packed sequence batches
     loop.py        generic training loop (metrics, aux loss, saves)
     preference.py  normalized pair/trace schemas, provenance, collator, DPO objective
@@ -260,47 +260,39 @@ single "precision" selector:
 
 - `parameter_dtype` chooses the stored/trainable shadow parameters: BF16,
   FP16, or FP32. FP16 scratch training requires CUDA.
-- `precision.qat` chooses dense, INT4, NVFP4, or ternary forward numerics.
-  INT4 uses grouped symmetric fake quantization. On a supported Blackwell CUDA
-  stack, NVFP4 quantizes weights and activations into packed E2M1 payloads with
-  E4M3 scales over groups of 16 and dispatches native block-scaled FP4 forward
-  GEMMs through TorchAO. Ternary uses BitNet W1.58 weights and INT8 activation
-  QAT and is rejected for Qwen3/Llama; BitNet rejects INT4/NVFP4.
-- `precision.qat_backend` chooses automatic, required-native, or explicitly
-  emulated execution. A required-native request fails preflight if the backend
-  is unavailable. NVFP4 forces matching NVFP4 activation quantization, while
-  ternary uses the BitNet W1.58/A8 contract.
+- `precision.qat` chooses dense or NVFP4 forward numerics. NVFP4 quantizes
+  weights and activations into packed E2M1 payloads with E4M3 scales over groups
+  of 16 and dispatches native block-scaled FP4 forward GEMMs through TorchAO.
+  It is exposed only after a real forward/backward smoke succeeds on the active
+  Blackwell GPU. BitNet currently supports dense training only.
+- `precision.qat_backend` accepts automatic native selection or required-native
+  execution. Both resolve to the verified native backend or fail preflight;
+  there is no emulated runtime fallback. NVFP4 forces matching NVFP4 activation
+  quantization and BF16 trainable parameters.
 - `precision.sparsity=paired_4:8` retains two complete two-value pairs from
   each group of eight along weight K. This is NVIDIA's E2M1 sparse-MMA pattern;
   arbitrary scalar 2:4 masks are not compatible with sparse NVFP4 hardware.
-- `precision.sparsity_backend` independently chooses automatic, required
-  compressed cuSPARSELt execution, or dense masked execution. The compressed
-  SM120 lane uses group-32 UE4M3 scales (not TorchAO dense NVFP4's group-16
-  payload) and fails a required request unless a real GEMM smoke succeeds.
+- `precision.sparsity_backend` resolves paired 4:8 only to compressed
+  cuSPARSELt execution. The compressed SM120 lane uses group-32 UE4M3 scales
+  (not TorchAO dense NVFP4's group-16 payload) and is exposed only after its
+  native forward/backward smoke succeeds.
 - `precision.backward_precision` selects BF16 or MXFP8 dgrad/wgrad for native
   NVFP4 autograd. MXFP8 uses E4M3 elements with an E8M0 scale per 32 values;
-  `precision.backward_backend` selects native Tensor Core execution or
-  format-faithful emulation. Native status requires both gradient GEMMs to run.
+  `precision.backward_backend` resolves to native Tensor Core execution or
+  fails closed. Native status requires both gradient GEMMs to run.
 - optimizer implementation, state placement (`gpu`, `cpu_paged`, or full
   `cpu_offload`), learning rate, weight decay, betas, epsilon, scheduler, and
   warmup are explicit. Gradient accumulation, clipping/checkpointing, TF32,
   compile mode, cuDNN-priority SDPA, and Liger kernels remain separate runtime
   controls.
-- `optimizer.master_weight_storage` selects an FP32 CPU master, the legacy
-  dense-residual potentiated E4M3 representation, or adaptive E4M3
-  potentiation. Adaptive state stores one real E4M3 byte per weight, one
-  power-of-two scale and hysteresis counter per 32-value block, and sparse
-  block indices/residual rows only for promoted regions. A block is promoted
-  when normalized reconstruction and lost-update error identify it as
-  troublesome, capped by `adaptive_max_promoted_fraction`; a lower threshold
-  and patience counter demote it after stabilization. Accelerator parameters
-  remain BF16 and Adam moments remain FP32.
+- full CPU-offload uses one FP32 CPU master plus FP32 Adam moments. The former
+  potentiated/adaptive E4M3 master representations were software simulations;
+  their presets, controls, implementation, and checkpoint-resume path are
+  retired and fail closed.
 
-All QAT modes retain dense BF16 shadow parameters for updates and checkpointing.
-Optimizer updates use either those parameters directly or the independently selected
-CPU master representation.
-INT4 and ternary use yyLab's straight-through fake-quant `QATLinear`. Native
-NVFP4 packs each forward's activations and effective weights and invokes
+NVFP4 retains dense BF16 shadow parameters for updates and checkpointing.
+GPU optimizers update those parameters directly; full optimizer offload uses
+the fixed FP32 CPU master. Native NVFP4 packs each forward's activations and effective weights and invokes
 PyTorch's SM120 scaled FP4 GEMM. Compressed NVFP4 instead calls cuSPARSELt 0.9.1
 directly with a paired-4:8 E2M1 weight, UE4M3 scales, FP32 accumulation, and BF16
 output. Its proven padding contract is M×16, N×32, K×64; yyLab pads and slices
@@ -314,9 +306,10 @@ gradients so masked pairs may regrow. With `sparsity_backend=compressed`, that
 effective weight is physically compressed for the forward GEMM and metadata
 records `native_sparse_gemm=true`. The trainable checkpoint deliberately still
 stores BF16 shadow weights, so `compressed_sparse_checkpoint=false`; deployment
-packing remains a separate export contract. Dense-masked execution stays
-available for portability and saved native recipes may use it when loaded on a
-non-native device without rewriting recipe provenance.
+packing remains a separate export contract. Dense-masked execution and runtime
+precision substitution are not available. Legacy non-native recipes fail
+closed when restoration is requested; callers may explicitly load only their
+high-precision shadow weights with QAT restoration disabled.
 
 ### Recipe identity, provenance, and reload
 
@@ -364,17 +357,11 @@ above the validated fused-optimizer threshold to bitsandbytes
 `PagedAdamW8bit`, whose compact unified-memory state can page to CPU RAM; the
 UI also exposes explicit GPU and paged-state choices. A full CPU-offload option
 keeps master parameters and both Adam moments in system RAM, copying gradients
-down and updated parameters back once per optimizer step. FP32 master storage
-costs four bytes per parameter. The legacy potentiated-FP8 alternative costs
-about 1.625 bytes per parameter because every value owns a residual nibble.
-Adaptive FP8 starts near 1.15625 bytes per parameter (one E4M3 byte plus
-scale/counter overhead) and adds 20 bytes per promoted 32-value block for its
-index and packed residual row. At the default 10% block cap, its upper bound is
-about 1.21875 bytes per parameter. This is persistent master-state compression,
-not a direct float8 AdamW; optimizer arithmetic and moments remain FP32.
+down and updated parameters back once per optimizer step. The FP32 CPU master
+costs four bytes per parameter; each FP32 Adam moment costs another four.
 That is the memory-saving part of ZeRO-Offload on this single-GPU system; there
 is no useful data-parallel state partition to perform with world size one. The
-planner accounts for the reduced VRAM and reports the corresponding RAM state.
+planner reports the corresponding GPU and RAM state.
 Legacy stage-2 prompt-router training uses the same guarded planner.
 
 ## Corpora intake pipeline
@@ -534,8 +521,10 @@ Run kinds:
   list of corpora and persist that selection, the active domain filter, and the
   corpus-mix policy in run and artifact provenance. New runs use deterministic
   document-level round-robin mixing; legacy configs that omit `corpus_mix`
-  retain their historical concatenate replay. Saved QAT bases carry
-  reloadable fake-quant metadata and high-precision shadow tensors.
+  retain their historical concatenate replay. Saved native-QAT bases carry the
+  verified native precision recipe and high-precision shadow tensors. Legacy
+  emulated recipes are never restored; requesting only their dense shadow
+  explicitly disables QAT rather than executing an emulation.
 - `preference_dpo` — a dedicated worker normalizes JSONL/JSON/Parquet files or
   recursive shard directories into canonical `prompt`, `chosen`, and
   `rejected` pairs. Direct pair rows and explicitly labelled/scored/ranked
@@ -661,8 +650,11 @@ log-normal Poisson with expectation r̄ and backpropagates through only the last
 without a recurrent core — or omitting `mean_recurrence` with one — fails
 closed, in `normalize_spalmer_config` for scratch runs and in
 `_prepare_checkpoint_run` (after the parent is loaded) for continued ones.
-Continued training accepts bundle format versions 5 and 6; a v5 bundle simply
-has no recurrence block and loads as a flat stack.
+Metadata scanning recognizes historical bundle versions so the registry can
+identify them, but continued training requires executable QR-PLE format v7 or
+v8. Format-v7 QR bundles migrate by discarding the retired PLE control fields.
+Pre-v7 fake-QAT PLE bundles are metadata-only and cannot load, infer, or
+continue under the native-only policy.
 
 Telemetry: `progress.json` and `metrics.jsonl` rows carry `recurrence_steps`,
 `backprop_steps`, `effective_depth`, `latent_delta_final`, and
@@ -689,25 +681,50 @@ then `metadata.recurrence`.
 
 ### SPALMER PLE backends
 
-`spalmer.ple_backend` in a scratch recipe selects the per-layer embedding
-implementation. It is an architectural choice: the planner counts it, the plan
-fingerprint records it, the bundle stores it (checkpoint format v7), and a
-continued run inherits it from the parent. A recipe without the key resolves
-to `fake_qat`, so every existing run, plan, and fingerprint is unchanged.
+`spalmer.ple_backend` is fixed to `qr` for new recipes. It is an architectural
+choice recorded in the planner fingerprint and checkpoint; new bundles use
+format v8. Format v7 introduced QR-PLE and remains migratable, while its now
+removed quantization-control fields are discarded. The former `fake_qat`
+identifier is retained only by metadata scanners so old bundles receive an
+explicit fail-closed explanation. It is not a loadable inference, continuation,
+or training backend.
 
-- `fake_qat` (default): every physical layer owns one wide
-  `[vocab, lanes × d_model]` table whose forward operands are derived with
-  four-bit stochastic fake quantization.
-- `qr`: physical layer 0 is one exact BF16 `[vocab, d_model]` input table
-  with no lanes; layers 1 and up compose `lanes` quotient/remainder lanes, each
-  a remainder codebook of `m_i` rows and a quotient codebook of
-  `ceil(vocab / m_i)` rows, where the `m_i` are the first `lanes` primes at or
-  above `ceil(sqrt(vocab))` (`spalmer.qr`). Everything stays BF16 and no
-  quantizer runs. The Train · SPALMER preview, the run log,
-  `spalmer_manifest.json`, and the registry `meta_json["ple"]` block report
-  exact-input, QR-refresh, control, and total PLE parameters separately, and
-  the planner redistributes the freed capacity into width, depth, the shared
-  channel, and the expert banks while holding the same total target.
+QR-PLE uses physical layer 0 as one exact BF16 `[vocab, d_model]` input table
+with no lanes. Layers 1 and up compose `lanes` quotient/remainder lanes, each
+with a remainder codebook of `m_i` rows and a quotient codebook of
+`ceil(vocab / m_i)` rows, where the `m_i` are the first `lanes` primes at or
+above `ceil(sqrt(vocab))` (`spalmer.qr`). Everything stays BF16 and no
+quantizer runs. The Train · SPALMER preview, run log,
+`spalmer_manifest.json`, and registry `meta_json["ple"]` block report exact
+input, QR refresh, controls, and total PLE parameters separately. The planner
+redistributes the released capacity into width, depth, the shared channel, and
+expert banks while holding the same total target.
+
+### SPALMER native expert precision
+
+SPALMER precision choices are exact weight/activation pairs returned by
+`detect_precision_capabilities` after a bounded forward-and-backward smoke on
+the selected device. yyLab never constructs choices from independent format
+lists and never substitutes an emulated implementation. The integrated paths
+are:
+
+- `NVFP4/NVFP4`: real packed E2M1/E4M3 NVFP4 Tensor Core forward GEMMs, with
+  native MXFP8 dgrad and wgrad; dense per-expert dispatch;
+- `MXFP8/MXFP8`: native MXFP8 forward, dgrad, and wgrad; dense per-expert
+  dispatch;
+- `BF16/BF16`: ordinary native PyTorch BF16 forward/backward with grouped
+  execution.
+
+A dense-only provider records `expert_execution="loop"`; `grouped` is legal
+only when that exact capability reports grouped support. In particular,
+MXFP4/MXFP8 and NVFP4/MXFP8 are not selectable merely because their individual
+formats are known. Low-precision execution keeps one BF16 trainable master and
+BF16 gradients, with FP32 Adam moments offloaded to CPU. Expert potentiation may
+promote a bounded complete expert to the verified BF16/BF16 tier; the BF16 base
+pair has no higher tier and therefore uses a zero promotion budget. QR-PLE
+tables and codebooks remain exact BF16. No PLE/expert fake quantization,
+stochastic packing, reference backend, or silent BF16 matmul fallback is
+executable.
 
 ## Benchmarks
 

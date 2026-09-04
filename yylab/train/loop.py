@@ -6,27 +6,11 @@ import time
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 
 import torch
 from torch.optim import Optimizer
-
-from .potentiated import (
-    DEFAULT_ADAPTIVE_DEMOTE_PATIENCE,
-    DEFAULT_ADAPTIVE_DEMOTE_THRESHOLD,
-    DEFAULT_ADAPTIVE_MAX_PROMOTED_FRACTION,
-    DEFAULT_ADAPTIVE_PROMOTE_THRESHOLD,
-    DEFAULT_POTENTIATION_BLOCK_SIZE,
-    FP8_ADAPTIVE_MASTER,
-    FP8_POTENTIATED_MASTER,
-    MASTER_WEIGHT_FORMATS,
-    AdaptivePotentiatedFP8State,
-    PotentiatedFP8State,
-    encode_adaptive_potentiated_fp8,
-    encode_potentiated_fp8,
-)
-
-POTENTIATED_MASTER_CHUNK_SIZE = 1_048_576
 
 
 @dataclass
@@ -48,22 +32,337 @@ class LoopOpts:
 
 FUSED_ADAMW_MAX_PARAMS = 50_000_000
 
+OPTIMIZER_IMPLEMENTATIONS = (
+    "torch_adamw",
+    "fused_adamw",
+    "adamw_8bit",
+    "paged_adamw_8bit",
+    "cpu_offload_adamw",
+)
+OPTIMIZER_STATE_MODES = ("auto", "gpu", "cpu_paged", "cpu_offload")
+
+_OPTIMIZER_PARAMETER_DTYPES = {
+    "bfloat16": torch.bfloat16,
+    "float16": torch.float16,
+    "float32": torch.float32,
+}
+
+
+@dataclass(frozen=True)
+class OptimizerResolution:
+    implementation: str
+    state: str
+    state_precision: str
+    master_weight_precision: str
+    capability_detail: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "implementation": self.implementation,
+            "state": self.state,
+            "state_precision": self.state_precision,
+            "master_weight_precision": self.master_weight_precision,
+            "capability_detail": self.capability_detail,
+        }
+
+
+def _parameter_dtype_name(params: list[torch.Tensor]) -> str:
+    names = sorted({str(parameter.dtype).removeprefix("torch.") for parameter in params})
+    return names[0] if len(names) == 1 else "mixed[" + ",".join(names) + "]"
+
+
+def _probe_optimizer_implementation(
+    implementation: str,
+    device: torch.device,
+    parameter_dtype: str,
+) -> tuple[bool, str]:
+    """Execute one real update and verify the requested state representation."""
+
+    try:
+        if implementation == "paged_adamw_8bit":
+            # bitsandbytes only allocates paged storage above its 100k-element
+            # threshold. A toy scalar probe would therefore be a false positive.
+            elements = 131_072
+        elif implementation == "adamw_8bit":
+            elements = 8_192
+        else:
+            elements = 8
+        dtype = _OPTIMIZER_PARAMETER_DTYPES.get(parameter_dtype)
+        if dtype is None:
+            raise RuntimeError(
+                f"optimizer capability probing requires one exact parameter dtype, "
+                f"got {parameter_dtype!r}"
+            )
+        if device.type == "cpu" and dtype != torch.float32:
+            raise RuntimeError(
+                f"CPU optimizer execution is exposed only for FP32 parameters, got {dtype}"
+            )
+        parameter = torch.nn.Parameter(
+            torch.zeros(elements, device=device, dtype=dtype)
+        )
+        parameter.grad = torch.ones_like(parameter)
+        if implementation == "torch_adamw":
+            optimizer = torch.optim.AdamW([parameter], lr=1e-3)
+        elif implementation == "fused_adamw":
+            if device.type != "cuda":
+                raise RuntimeError("fused AdamW requires CUDA")
+            optimizer = torch.optim.AdamW([parameter], lr=1e-3, fused=True)
+        elif implementation in {"adamw_8bit", "paged_adamw_8bit"}:
+            if device.type != "cuda":
+                raise RuntimeError("bitsandbytes optimizers require CUDA")
+            import bitsandbytes as bnb
+
+            optimizer_type = (
+                bnb.optim.PagedAdamW8bit
+                if implementation == "paged_adamw_8bit"
+                else bnb.optim.AdamW8bit
+            )
+            optimizer = optimizer_type([parameter], lr=1e-3, min_8bit_size=0)
+        elif implementation == "cpu_offload_adamw":
+            optimizer = CPUOffloadAdamW([parameter], lr=1e-3)
+        else:  # pragma: no cover - callers use the public constant
+            raise ValueError(f"unknown optimizer implementation: {implementation}")
+
+        optimizer.step()
+        state = optimizer.state[parameter]
+        if not bool(torch.isfinite(parameter).all()) or bool(
+            torch.equal(parameter, torch.zeros_like(parameter))
+        ):
+            raise RuntimeError("optimizer update was non-finite or left the parameter unchanged")
+        if implementation in {"torch_adamw", "fused_adamw"}:
+            moments = [state.get("exp_avg"), state.get("exp_avg_sq")]
+            if not all(
+                isinstance(value, torch.Tensor)
+                and value.device == device
+                and value.dtype == parameter.dtype
+                for value in moments
+            ):
+                raise RuntimeError(
+                    "Adam moments did not match the parameter device and precision"
+                )
+            detail = (
+                f"real update passed with {parameter.dtype} moments on {device}"
+            )
+        elif implementation == "adamw_8bit":
+            moments = [state.get("state1"), state.get("state2")]
+            if not all(
+                isinstance(value, torch.Tensor)
+                and value.dtype == torch.uint8
+                and value.device == device
+                for value in moments
+            ):
+                raise RuntimeError("8-bit Adam moments were not uint8 CUDA tensors")
+            detail = "real update passed with blockwise uint8 CUDA moments"
+        elif implementation == "paged_adamw_8bit":
+            moments = [state.get("state1"), state.get("state2")]
+            if not all(
+                isinstance(value, torch.Tensor)
+                and value.dtype == torch.uint8
+                and value.device.type == "cpu"
+                and bool(getattr(value, "is_paged", False))
+                for value in moments
+            ):
+                raise RuntimeError("paged 8-bit moments were not CPU-backed paged tensors")
+            detail = (
+                "real update passed with CPU-backed paged uint8 large moments; "
+                "small buffers remain CUDA-resident"
+            )
+        else:
+            tensors = [state.get("master_param"), state.get("exp_avg"), state.get("exp_avg_sq")]
+            if not all(
+                isinstance(value, torch.Tensor)
+                and value.device.type == "cpu"
+                and value.dtype == torch.float32
+                for value in tensors
+            ):
+                raise RuntimeError("offloaded master and moments were not FP32 CPU tensors")
+            detail = "real update passed with FP32 CPU master and moments"
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        return True, detail
+    except Exception as exc:  # capability detection must fail closed
+        return False, f"real optimizer update failed: {exc}"
+
+
+@lru_cache(maxsize=8)
+def _probe_optimizer_capabilities(
+    use_cuda: bool,
+    device_index: int,
+    parameter_dtype: str,
+) -> tuple[tuple[str, bool, str], ...]:
+    device = torch.device("cuda", device_index) if use_cuda else torch.device("cpu")
+    return tuple(
+        (
+            implementation,
+            *_probe_optimizer_implementation(
+                implementation,
+                device,
+                parameter_dtype,
+            ),
+        )
+        for implementation in OPTIMIZER_IMPLEMENTATIONS
+    )
+
+
+def optimizer_capability_status(
+    *,
+    cuda: bool | None = None,
+    device_index: int | None = None,
+    parameter_dtype: str | None = None,
+    force_refresh: bool = False,
+) -> dict[str, tuple[bool, str]]:
+    """Return optimizer paths proven executable on the selected local device."""
+
+    requested_cuda = torch.cuda.is_available() if cuda is None else bool(cuda)
+    if requested_cuda and not torch.cuda.is_available():
+        return {
+            implementation: (False, "CUDA was requested but is unavailable")
+            for implementation in OPTIMIZER_IMPLEMENTATIONS
+        }
+    index = 0
+    if requested_cuda:
+        index = torch.cuda.current_device() if device_index is None else int(device_index)
+        if index < 0 or index >= torch.cuda.device_count():
+            return {
+                implementation: (False, f"CUDA device index {index} is unavailable")
+                for implementation in OPTIMIZER_IMPLEMENTATIONS
+            }
+    if force_refresh:
+        _probe_optimizer_capabilities.cache_clear()
+    resolved_dtype = str(
+        parameter_dtype or ("bfloat16" if requested_cuda else "float32")
+    ).strip().casefold()
+    return {
+        implementation: (available, detail)
+        for implementation, available, detail in _probe_optimizer_capabilities(
+            requested_cuda,
+            index,
+            resolved_dtype,
+        )
+    }
+
+
+def _implementation_state(implementation: str, *, cuda: bool) -> str:
+    if implementation == "paged_adamw_8bit":
+        return "cpu_paged"
+    if implementation == "cpu_offload_adamw":
+        return "cpu_offload"
+    return "gpu" if cuda else "cpu"
+
+
+def resolve_optimizer_choice(
+    *,
+    trainable_parameters: int,
+    cuda: bool,
+    optimizer_state: str,
+    implementation: str,
+    parameter_dtype: str,
+    device_index: int | None = None,
+) -> OptimizerResolution:
+    """Resolve one verified optimizer without cross-implementation fallback."""
+
+    requested_state = str(optimizer_state or "auto")
+    requested_implementation = str(implementation or "auto")
+    if requested_state not in OPTIMIZER_STATE_MODES:
+        raise ValueError(f"unknown optimizer-state mode: {requested_state}")
+    if requested_implementation not in {"auto", *OPTIMIZER_IMPLEMENTATIONS}:
+        raise ValueError(f"unknown optimizer implementation: {requested_implementation}")
+    if requested_state == "gpu" and not cuda:
+        raise ValueError("GPU optimizer state was requested, but training is not using CUDA")
+
+    inferred_state = (
+        _implementation_state(requested_implementation, cuda=cuda)
+        if requested_implementation != "auto"
+        else None
+    )
+    if (
+        requested_state != "auto"
+        and inferred_state is not None
+        and requested_state != inferred_state
+    ):
+        raise ValueError(
+            f"optimizer implementation {requested_implementation!r} stores state as "
+            f"{inferred_state!r}, not requested {requested_state!r}"
+        )
+
+    status = optimizer_capability_status(
+        cuda=cuda,
+        device_index=device_index,
+        parameter_dtype=parameter_dtype,
+    )
+    if requested_implementation != "auto":
+        selected = requested_implementation
+    elif requested_state == "cpu_offload":
+        selected = "cpu_offload_adamw"
+    elif requested_state == "cpu_paged":
+        selected = "paged_adamw_8bit"
+    elif requested_state == "gpu":
+        candidates = (
+            ("fused_adamw", "adamw_8bit", "torch_adamw")
+            if trainable_parameters <= FUSED_ADAMW_MAX_PARAMS
+            else ("adamw_8bit", "fused_adamw", "torch_adamw")
+        )
+        selected = next((candidate for candidate in candidates if status[candidate][0]), "")
+    elif cuda and trainable_parameters > FUSED_ADAMW_MAX_PARAMS:
+        candidates = (
+            "paged_adamw_8bit",
+            "adamw_8bit",
+            "fused_adamw",
+            "torch_adamw",
+        )
+        selected = next((candidate for candidate in candidates if status[candidate][0]), "")
+    else:
+        candidates = (
+            ("fused_adamw", "adamw_8bit", "torch_adamw")
+            if cuda
+            else ("torch_adamw", "cpu_offload_adamw")
+        )
+        selected = next((candidate for candidate in candidates if status[candidate][0]), "")
+    if not selected:
+        raise RuntimeError(
+            f"no execution-verified optimizer is available for state mode {requested_state!r}"
+        )
+    available, detail = status[selected]
+    if not available:
+        raise RuntimeError(f"{selected} is unavailable: {detail}")
+
+    resolved_state = _implementation_state(selected, cuda=cuda)
+    if requested_state != "auto" and requested_state != resolved_state:
+        raise ValueError(
+            f"optimizer state {requested_state!r} cannot be provided by {selected!r}"
+        )
+    if selected in {"adamw_8bit", "paged_adamw_8bit"}:
+        state_precision = "int8_blockwise"
+        master_precision = "none"
+    elif selected == "cpu_offload_adamw":
+        state_precision = "fp32"
+        master_precision = "fp32"
+    else:
+        state_precision = parameter_dtype
+        master_precision = "none"
+    return OptimizerResolution(
+        implementation=selected,
+        state=resolved_state,
+        state_precision=state_precision,
+        master_weight_precision=master_precision,
+        capability_detail=detail,
+    )
+
+
+def optimizer_runtime_metadata(optimizer: Optimizer) -> dict[str, str]:
+    metadata = getattr(optimizer, "_yylab_optimizer_resolution", None)
+    if not isinstance(metadata, dict):
+        raise RuntimeError("optimizer has no yyLab resolution receipt")
+    return dict(metadata)
+
 
 class CPUOffloadAdamW(Optimizer):
-    """AdamW with offloaded master weights and FP32 moments in system RAM.
+    """AdamW with FP32 master weights and moments in system RAM.
 
     Trainable parameters and gradients remain on the accelerator. Each step
     transfers gradients to CPU, updates the offloaded state, then copies the
     new parameter values back. This trades PCIe traffic for predictable VRAM
     use and is the useful part of ZeRO-Offload on a single-GPU workstation.
-
-    The potentiated-FP8 modes persist each master as a block-scaled E4M3 base.
-    The legacy format stores a packed four-bit sub-ULP residual everywhere;
-    the adaptive format stores that residual only for troublesome blocks and
-    demotes them with hysteresis after they stabilize. Adam moments and all
-    optimizer arithmetic remain FP32. These modes are therefore not equivalent
-    to casting a normal AdamW parameter to float8, which would discard most
-    small updates.
     """
 
     def __init__(
@@ -73,12 +372,6 @@ class CPUOffloadAdamW(Optimizer):
         betas: tuple[float, float] = (0.9, 0.999),
         eps: float = 1e-8,
         weight_decay: float = 0.0,
-        master_weight_storage: str = "fp32",
-        master_chunk_size: int = POTENTIATED_MASTER_CHUNK_SIZE,
-        adaptive_max_promoted_fraction: float = DEFAULT_ADAPTIVE_MAX_PROMOTED_FRACTION,
-        adaptive_promote_threshold: float = DEFAULT_ADAPTIVE_PROMOTE_THRESHOLD,
-        adaptive_demote_threshold: float = DEFAULT_ADAPTIVE_DEMOTE_THRESHOLD,
-        adaptive_demote_patience: int = DEFAULT_ADAPTIVE_DEMOTE_PATIENCE,
     ) -> None:
         if lr < 0:
             raise ValueError("learning rate must be non-negative")
@@ -88,24 +381,6 @@ class CPUOffloadAdamW(Optimizer):
             raise ValueError("Adam betas must be within [0, 1)")
         if weight_decay < 0:
             raise ValueError("weight decay must be non-negative")
-        if master_weight_storage not in MASTER_WEIGHT_FORMATS:
-            raise ValueError(f"unknown master-weight storage: {master_weight_storage}")
-        if master_chunk_size < 1 or master_chunk_size % DEFAULT_POTENTIATION_BLOCK_SIZE:
-            raise ValueError(
-                "potentiated-master chunk size must be a positive multiple of the block size"
-            )
-        if not 0.0 <= adaptive_max_promoted_fraction <= 1.0:
-            raise ValueError("adaptive max promoted fraction must be within [0, 1]")
-        if adaptive_demote_threshold > adaptive_promote_threshold:
-            raise ValueError("adaptive demote threshold cannot exceed promote threshold")
-        if not 1 <= adaptive_demote_patience <= 255:
-            raise ValueError("adaptive demote patience must be within [1, 255]")
-        self.master_weight_storage = master_weight_storage
-        self.master_chunk_size = int(master_chunk_size)
-        self.adaptive_max_promoted_fraction = float(adaptive_max_promoted_fraction)
-        self.adaptive_promote_threshold = float(adaptive_promote_threshold)
-        self.adaptive_demote_threshold = float(adaptive_demote_threshold)
-        self.adaptive_demote_patience = int(adaptive_demote_patience)
         super().__init__(
             params,
             {
@@ -113,195 +388,7 @@ class CPUOffloadAdamW(Optimizer):
                 "betas": betas,
                 "eps": eps,
                 "weight_decay": weight_decay,
-                "master_weight_storage": master_weight_storage,
-                "adaptive_max_promoted_fraction": self.adaptive_max_promoted_fraction,
-                "adaptive_promote_threshold": self.adaptive_promote_threshold,
-                "adaptive_demote_threshold": self.adaptive_demote_threshold,
-                "adaptive_demote_patience": self.adaptive_demote_patience,
             },
-        )
-
-    @staticmethod
-    def _restore_potentiated_master(state: dict) -> PotentiatedFP8State:
-        return PotentiatedFP8State(
-            base=state["master_fp8"],
-            potentiation=state["master_potentiation"],
-            scale=state["master_scale"],
-            shape=tuple(state["master_shape"]),
-            block_size=int(state["master_block_size"]),
-        )
-
-    @staticmethod
-    def _store_potentiated_master(state: dict, master: PotentiatedFP8State) -> None:
-        state["master_fp8"] = master.base
-        state["master_potentiation"] = master.potentiation
-        state["master_scale"] = master.scale
-        state["master_shape"] = master.shape
-        state["master_block_size"] = master.block_size
-
-    @staticmethod
-    def _store_potentiated_range(
-        state: dict,
-        master: PotentiatedFP8State,
-        start: int,
-        end: int,
-    ) -> None:
-        if start % 2 or start % master.block_size:
-            raise ValueError("potentiated-master chunks must start on block boundaries")
-        state["master_fp8"][start:end].copy_(master.base.reshape(-1))
-        first_byte = start // 2
-        last_byte = (end + 1) // 2
-        state["master_potentiation"][first_byte:last_byte].copy_(master.potentiation)
-        first_block = start // master.block_size
-        last_block = (end + master.block_size - 1) // master.block_size
-        state["master_scale"][first_block:last_block].copy_(master.scale)
-
-    @staticmethod
-    def _restore_adaptive_master(state: dict) -> AdaptivePotentiatedFP8State:
-        return AdaptivePotentiatedFP8State(
-            base=state["master_fp8"],
-            promoted_blocks=state["master_promoted_blocks"],
-            potentiation=state["master_promoted_potentiation"],
-            scale=state["master_scale"],
-            stability=state["master_promotion_stability"],
-            shape=tuple(state["master_shape"]),
-            block_size=int(state["master_block_size"]),
-            max_promoted_fraction=float(state["master_max_promoted_fraction"]),
-            promote_threshold=float(state["master_promote_threshold"]),
-            demote_threshold=float(state["master_demote_threshold"]),
-            demote_patience=int(state["master_demote_patience"]),
-        )
-
-    @staticmethod
-    def _store_adaptive_master(
-        state: dict, master: AdaptivePotentiatedFP8State
-    ) -> None:
-        state["master_fp8"] = master.base
-        state["master_promoted_blocks"] = master.promoted_blocks
-        state["master_promoted_potentiation"] = master.potentiation
-        state["master_scale"] = master.scale
-        state["master_promotion_stability"] = master.stability
-        state["master_shape"] = master.shape
-        state["master_block_size"] = master.block_size
-        state["master_max_promoted_fraction"] = master.max_promoted_fraction
-        state["master_promote_threshold"] = master.promote_threshold
-        state["master_demote_threshold"] = master.demote_threshold
-        state["master_demote_patience"] = master.demote_patience
-
-    @staticmethod
-    def _store_adaptive_dense_range(
-        state: dict,
-        master: AdaptivePotentiatedFP8State,
-        start: int,
-        end: int,
-    ) -> None:
-        if start % master.block_size:
-            raise ValueError("adaptive-master chunks must start on block boundaries")
-        state["master_fp8"][start:end].copy_(master.base.reshape(-1))
-        first_block = start // master.block_size
-        last_block = (end + master.block_size - 1) // master.block_size
-        state["master_scale"][first_block:last_block].copy_(master.scale)
-        state["master_promotion_stability"][first_block:last_block].copy_(
-            master.stability
-        )
-
-    @staticmethod
-    def _adaptive_chunk_quota(
-        first_block: int,
-        last_block: int,
-        total_blocks: int,
-        max_promoted_fraction: float,
-    ) -> int:
-        """Distribute a hard parameter-wide promotion cap across chunks."""
-
-        total_limit = int(total_blocks * max_promoted_fraction)
-        before = first_block * total_limit // max(1, total_blocks)
-        after = last_block * total_limit // max(1, total_blocks)
-        return after - before
-
-    @staticmethod
-    def _potentiation_generator(state: dict, start: int) -> torch.Generator:
-        # Stateless chunk seeding makes an optimizer state_dict resume exact
-        # without persisting a large generator blob for every parameter.
-        seed = (
-            int(state["master_seed"])
-            + int(state["step"]) * 6_364_136_223_846_793_005
-            + int(start)
-        ) % (2**63 - 1)
-        return torch.Generator(device="cpu").manual_seed(seed)
-
-    def _initialize_potentiated_master(self, state: dict, parameter: torch.Tensor) -> None:
-        count = parameter.numel()
-        block_size = DEFAULT_POTENTIATION_BLOCK_SIZE
-        state["master_fp8"] = torch.empty(count, dtype=torch.float8_e4m3fn, device="cpu")
-        state["master_potentiation"] = torch.zeros((count + 1) // 2, dtype=torch.uint8)
-        state["master_scale"] = torch.empty((count + block_size - 1) // block_size)
-        state["master_shape"] = tuple(parameter.shape)
-        state["master_block_size"] = block_size
-        state["master_seed"] = int(torch.randint(0, 2**31 - 1, ()).item())
-        flat = parameter.detach().reshape(-1)
-        for start in range(0, count, self.master_chunk_size):
-            end = min(start + self.master_chunk_size, count)
-            source = flat[start:end].to(device="cpu", dtype=torch.float32, copy=True)
-            encoded = encode_potentiated_fp8(
-                source,
-                block_size=block_size,
-                generator=self._potentiation_generator(state, start),
-            )
-            self._store_potentiated_range(state, encoded, start, end)
-
-    def _initialize_adaptive_master(self, state: dict, parameter: torch.Tensor) -> None:
-        count = parameter.numel()
-        block_size = DEFAULT_POTENTIATION_BLOCK_SIZE
-        total_blocks = (count + block_size - 1) // block_size
-        state["master_fp8"] = torch.empty(count, dtype=torch.float8_e4m3fn, device="cpu")
-        state["master_scale"] = torch.empty(total_blocks, dtype=torch.float32)
-        state["master_promotion_stability"] = torch.zeros(
-            total_blocks, dtype=torch.uint8
-        )
-        state["master_shape"] = tuple(parameter.shape)
-        state["master_block_size"] = block_size
-        state["master_max_promoted_fraction"] = self.adaptive_max_promoted_fraction
-        state["master_promote_threshold"] = self.adaptive_promote_threshold
-        state["master_demote_threshold"] = self.adaptive_demote_threshold
-        state["master_demote_patience"] = self.adaptive_demote_patience
-        state["master_seed"] = int(torch.randint(0, 2**31 - 1, ()).item())
-        promoted_blocks: list[torch.Tensor] = []
-        potentiation: list[torch.Tensor] = []
-        flat = parameter.detach().reshape(-1)
-        for start in range(0, count, self.master_chunk_size):
-            end = min(start + self.master_chunk_size, count)
-            first_block = start // block_size
-            last_block = (end + block_size - 1) // block_size
-            source = flat[start:end].to(device="cpu", dtype=torch.float32, copy=True)
-            encoded = encode_adaptive_potentiated_fp8(
-                source,
-                block_size=block_size,
-                generator=self._potentiation_generator(state, start),
-                max_promoted_fraction=self.adaptive_max_promoted_fraction,
-                max_promoted_blocks=self._adaptive_chunk_quota(
-                    first_block,
-                    last_block,
-                    total_blocks,
-                    self.adaptive_max_promoted_fraction,
-                ),
-                promote_threshold=self.adaptive_promote_threshold,
-                demote_threshold=self.adaptive_demote_threshold,
-                demote_patience=self.adaptive_demote_patience,
-            )
-            self._store_adaptive_dense_range(state, encoded, start, end)
-            if encoded.promoted_blocks.numel():
-                promoted_blocks.append(encoded.promoted_blocks + first_block)
-                potentiation.append(encoded.potentiation)
-        state["master_promoted_blocks"] = (
-            torch.cat(promoted_blocks).to(torch.int32)
-            if promoted_blocks
-            else torch.empty(0, dtype=torch.int32)
-        )
-        state["master_promoted_potentiation"] = (
-            torch.cat(potentiation)
-            if potentiation
-            else torch.empty((0, block_size // 2), dtype=torch.uint8)
         )
 
     def master_state_summary(self) -> dict[str, float | int | str]:
@@ -312,36 +399,15 @@ class CPUOffloadAdamW(Optimizer):
             for name in ("exp_avg", "exp_avg_sq")
             if isinstance((tensor := value.get(name)), torch.Tensor)
         )
-        if self.master_weight_storage == "fp32":
-            storage = sum(
-                value["master_param"].numel() * value["master_param"].element_size()
-                for value in values
-                if "master_param" in value
-            )
-            return {
-                "format": "fp32",
-                "bytes": storage,
-                "promoted_fraction": 0.0,
-                "moment_format": "fp32",
-                "moment_bytes": moment_storage,
-            }
-        storage = 0
-        promoted = 0
-        count = 0
-        for value in values:
-            if "master_fp8" not in value:
-                continue
-            if self.master_weight_storage == FP8_ADAPTIVE_MASTER:
-                master = self._restore_adaptive_master(value)
-            else:
-                master = self._restore_potentiated_master(value)
-            storage += master.storage_bytes
-            promoted += round(master.promoted_fraction * master.numel)
-            count += master.numel
+        storage = sum(
+            value["master_param"].numel() * value["master_param"].element_size()
+            for value in values
+            if "master_param" in value
+        )
         return {
-            "format": self.master_weight_storage,
+            "format": "fp32",
             "bytes": storage,
-            "promoted_fraction": promoted / count if count else 0.0,
+            "promoted_fraction": 0.0,
             "moment_format": "fp32",
             "moment_bytes": moment_storage,
         }
@@ -361,6 +427,18 @@ class CPUOffloadAdamW(Optimizer):
             raise TypeError("optimizer state_dict must be a dictionary")
         saved_groups = state_dict.get("param_groups", [])
         saved_states = state_dict.get("state", {})
+        for saved_group in saved_groups:
+            master_format = str(saved_group.get("master_weight_storage", "fp32") or "fp32")
+            if master_format != "fp32":
+                raise ValueError(
+                    "legacy FP8 optimizer-master checkpoints are not executable; "
+                    "restart with an FP32 CPU master"
+                )
+        if any("master_fp8" in saved for saved in saved_states.values()):
+            raise ValueError(
+                "legacy FP8 optimizer-master checkpoints are not executable; "
+                "restart with an FP32 CPU master"
+            )
         if len(saved_groups) != len(self.param_groups):
             raise ValueError(
                 "loaded optimizer state has a different number of parameter groups"
@@ -377,7 +455,15 @@ class CPUOffloadAdamW(Optimizer):
             group_values = {
                 name: copy.deepcopy(value)
                 for name, value in saved_group.items()
-                if name != "params"
+                if name
+                not in {
+                    "params",
+                    "master_weight_storage",
+                    "adaptive_max_promoted_fraction",
+                    "adaptive_promote_threshold",
+                    "adaptive_demote_threshold",
+                    "adaptive_demote_patience",
+                }
             }
             live_group.clear()
             live_group.update(group_values)
@@ -389,12 +475,6 @@ class CPUOffloadAdamW(Optimizer):
                 live: dict = {}
                 tensor_dtypes = {
                     "master_param": torch.float32,
-                    "master_fp8": torch.float8_e4m3fn,
-                    "master_potentiation": torch.uint8,
-                    "master_promoted_blocks": torch.int32,
-                    "master_promoted_potentiation": torch.uint8,
-                    "master_promotion_stability": torch.uint8,
-                    "master_scale": torch.float32,
                     "exp_avg": torch.float32,
                     "exp_avg_sq": torch.float32,
                 }
@@ -408,26 +488,6 @@ class CPUOffloadAdamW(Optimizer):
                     else:
                         live[name] = copy.deepcopy(value)
                 self.state[parameter] = live
-        if self.param_groups:
-            group = self.param_groups[0]
-            self.master_weight_storage = str(
-                group.get("master_weight_storage", self.master_weight_storage)
-            )
-            self.adaptive_max_promoted_fraction = float(
-                group.get(
-                    "adaptive_max_promoted_fraction",
-                    self.adaptive_max_promoted_fraction,
-                )
-            )
-            self.adaptive_promote_threshold = float(
-                group.get("adaptive_promote_threshold", self.adaptive_promote_threshold)
-            )
-            self.adaptive_demote_threshold = float(
-                group.get("adaptive_demote_threshold", self.adaptive_demote_threshold)
-            )
-            self.adaptive_demote_patience = int(
-                group.get("adaptive_demote_patience", self.adaptive_demote_patience)
-            )
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -446,152 +506,13 @@ class CPUOffloadAdamW(Optimizer):
                 state = self.state[parameter]
                 if not state:
                     state["step"] = 0
-                    if self.master_weight_storage in {
-                        FP8_POTENTIATED_MASTER,
-                        FP8_ADAPTIVE_MASTER,
-                    }:
-                        state["exp_avg"] = torch.zeros(parameter.numel(), dtype=torch.float32)
-                        state["exp_avg_sq"] = torch.zeros(parameter.numel(), dtype=torch.float32)
-                        if self.master_weight_storage == FP8_ADAPTIVE_MASTER:
-                            self._initialize_adaptive_master(state, parameter)
-                        else:
-                            self._initialize_potentiated_master(state, parameter)
-                    else:
-                        master = parameter.detach().to(
-                            device="cpu", dtype=torch.float32, copy=True
-                        )
-                        state["exp_avg"] = torch.zeros_like(master)
-                        state["exp_avg_sq"] = torch.zeros_like(master)
-                        state["master_param"] = master
+                    master = parameter.detach().to(
+                        device="cpu", dtype=torch.float32, copy=True
+                    )
+                    state["exp_avg"] = torch.zeros_like(master)
+                    state["exp_avg_sq"] = torch.zeros_like(master)
+                    state["master_param"] = master
                 state["step"] += 1
-                if self.master_weight_storage == FP8_ADAPTIVE_MASTER:
-                    persisted = self._restore_adaptive_master(state)
-                    flat_parameter = parameter.reshape(-1)
-                    flat_gradient = parameter.grad.detach().reshape(-1)
-                    count = parameter.numel()
-                    block_size = persisted.block_size
-                    total_blocks = persisted.num_blocks
-                    promoted_blocks: list[torch.Tensor] = []
-                    potentiation: list[torch.Tensor] = []
-                    for start in range(0, count, self.master_chunk_size):
-                        end = min(start + self.master_chunk_size, count)
-                        first_block = start // block_size
-                        last_block = (end + block_size - 1) // block_size
-                        previous = persisted.slice_range(start, end)
-                        master = previous.dequantize()
-                        reference = master.clone()
-                        gradient = flat_gradient[start:end].to(
-                            device="cpu", dtype=torch.float32, copy=True
-                        )
-                        exp_avg = state["exp_avg"][start:end]
-                        exp_avg_sq = state["exp_avg_sq"][start:end]
-                        if group["weight_decay"]:
-                            master.mul_(1.0 - lr * group["weight_decay"])
-                        exp_avg.mul_(beta1).add_(gradient, alpha=1.0 - beta1)
-                        exp_avg_sq.mul_(beta2).addcmul_(
-                            gradient, gradient, value=1.0 - beta2
-                        )
-                        bias_correction1 = 1.0 - beta1 ** state["step"]
-                        bias_correction2 = 1.0 - beta2 ** state["step"]
-                        denominator = (
-                            exp_avg_sq.sqrt()
-                            .div_(bias_correction2**0.5)
-                            .add_(group["eps"])
-                        )
-                        master.addcdiv_(
-                            exp_avg,
-                            denominator,
-                            value=-(lr / bias_correction1),
-                        )
-                        encoded = encode_adaptive_potentiated_fp8(
-                            master,
-                            block_size=block_size,
-                            generator=self._potentiation_generator(state, start),
-                            previous=previous,
-                            update_reference=reference,
-                            max_promoted_fraction=persisted.max_promoted_fraction,
-                            max_promoted_blocks=self._adaptive_chunk_quota(
-                                first_block,
-                                last_block,
-                                total_blocks,
-                                persisted.max_promoted_fraction,
-                            ),
-                            promote_threshold=persisted.promote_threshold,
-                            demote_threshold=persisted.demote_threshold,
-                            demote_patience=persisted.demote_patience,
-                        )
-                        self._store_adaptive_dense_range(state, encoded, start, end)
-                        if encoded.promoted_blocks.numel():
-                            promoted_blocks.append(encoded.promoted_blocks + first_block)
-                            potentiation.append(encoded.potentiation)
-                        flat_parameter[start:end].copy_(
-                            encoded.dequantize().to(
-                                device=parameter.device,
-                                dtype=parameter.dtype,
-                            )
-                        )
-                    state["master_promoted_blocks"] = (
-                        torch.cat(promoted_blocks).to(torch.int32)
-                        if promoted_blocks
-                        else torch.empty(0, dtype=torch.int32)
-                    )
-                    state["master_promoted_potentiation"] = (
-                        torch.cat(potentiation)
-                        if potentiation
-                        else torch.empty((0, block_size // 2), dtype=torch.uint8)
-                    )
-                    continue
-                if self.master_weight_storage == FP8_POTENTIATED_MASTER:
-                    persisted = self._restore_potentiated_master(state)
-                    flat_parameter = parameter.reshape(-1)
-                    flat_gradient = parameter.grad.detach().reshape(-1)
-                    count = parameter.numel()
-                    for start in range(0, count, self.master_chunk_size):
-                        end = min(start + self.master_chunk_size, count)
-                        master = persisted.dequantize_range(start, end)
-                        gradient = flat_gradient[start:end].to(
-                            device="cpu", dtype=torch.float32, copy=True
-                        )
-                        exp_avg = state["exp_avg"][start:end]
-                        exp_avg_sq = state["exp_avg_sq"][start:end]
-                        if group["weight_decay"]:
-                            master.mul_(1.0 - lr * group["weight_decay"])
-                        exp_avg.mul_(beta1).add_(gradient, alpha=1.0 - beta1)
-                        exp_avg_sq.mul_(beta2).addcmul_(
-                            gradient, gradient, value=1.0 - beta2
-                        )
-                        bias_correction1 = 1.0 - beta1 ** state["step"]
-                        bias_correction2 = 1.0 - beta2 ** state["step"]
-                        denominator = (
-                            exp_avg_sq.sqrt()
-                            .div_(bias_correction2**0.5)
-                            .add_(group["eps"])
-                        )
-                        master.addcdiv_(
-                            exp_avg,
-                            denominator,
-                            value=-(lr / bias_correction1),
-                        )
-                        encoded = encode_potentiated_fp8(
-                            master,
-                            block_size=persisted.block_size,
-                            generator=self._potentiation_generator(state, start),
-                            previous_scale=persisted.scale[
-                                start // persisted.block_size : (
-                                    end + persisted.block_size - 1
-                                )
-                                // persisted.block_size
-                            ],
-                        )
-                        self._store_potentiated_range(state, encoded, start, end)
-                        flat_parameter[start:end].copy_(
-                            encoded.dequantize().to(
-                                device=parameter.device,
-                                dtype=parameter.dtype,
-                            )
-                        )
-                    continue
-
                 master = state["master_param"]
                 gradient = parameter.grad.detach().to(
                     device="cpu", dtype=torch.float32, copy=True
@@ -693,35 +614,39 @@ def make_optimizer(
     lr: float,
     weight_decay: float = 0.0,
     cuda: bool = True,
-    optimizer_state: str = "gpu",
+    optimizer_state: str = "auto",
     implementation: str = "auto",
     betas: tuple[float, float] = (0.9, 0.999),
     eps: float = 1e-8,
-    master_weight_storage: str = "fp32",
-    adaptive_max_promoted_fraction: float = DEFAULT_ADAPTIVE_MAX_PROMOTED_FRACTION,
-    adaptive_promote_threshold: float = DEFAULT_ADAPTIVE_PROMOTE_THRESHOLD,
-    adaptive_demote_threshold: float = DEFAULT_ADAPTIVE_DEMOTE_THRESHOLD,
-    adaptive_demote_patience: int = DEFAULT_ADAPTIVE_DEMOTE_PATIENCE,
 ) -> Optimizer:
     params = [p for p in model.parameters() if p.requires_grad]
+    if not params:
+        raise ValueError("cannot build an optimizer without trainable parameters")
     trainable = sum(p.numel() for p in params)
-    if optimizer_state not in {"gpu", "auto", "cpu_paged", "cpu_offload"}:
-        raise ValueError(f"unknown optimizer-state mode: {optimizer_state}")
-    implementations = {
-        "auto",
-        "torch_adamw",
-        "fused_adamw",
-        "adamw_8bit",
-        "paged_adamw_8bit",
-        "cpu_offload_adamw",
-    }
-    if implementation not in implementations:
-        raise ValueError(f"unknown optimizer implementation: {implementation}")
-    if master_weight_storage not in MASTER_WEIGHT_FORMATS:
-        raise ValueError(f"unknown master-weight storage: {master_weight_storage}")
-    cpu_offload = optimizer_state == "cpu_offload" or implementation == "cpu_offload_adamw"
-    if master_weight_storage != "fp32" and not cpu_offload:
-        raise ValueError("potentiated FP8 master weights require CPU-offload AdamW")
+    parameter_devices = {parameter.device for parameter in params}
+    if len(parameter_devices) != 1:
+        devices = ", ".join(sorted(str(device) for device in parameter_devices))
+        raise ValueError(
+            "optimizer selection requires all trainable parameters on one exact device; "
+            f"found {devices}"
+        )
+    parameter_device = next(iter(parameter_devices))
+    if cuda and parameter_device.type != "cuda":
+        raise ValueError("CUDA optimizer requested for parameters that are not all on CUDA")
+    if not cuda and parameter_device.type != "cpu":
+        raise ValueError(
+            "CPU optimizer selection requires CPU parameters; "
+            f"found {parameter_device}"
+        )
+    device_index = parameter_device.index if parameter_device.type == "cuda" else None
+    resolution = resolve_optimizer_choice(
+        trainable_parameters=trainable,
+        cuda=cuda,
+        optimizer_state=optimizer_state,
+        implementation=implementation,
+        parameter_dtype=_parameter_dtype_name(params),
+        device_index=device_index,
+    )
     common = {"lr": lr, "weight_decay": weight_decay}
     # Keep the old default call shape for compatibility with lightweight test
     # doubles while forwarding every user-selected numerical control.
@@ -729,62 +654,35 @@ def make_optimizer(
         common["betas"] = betas
     if eps != 1e-8:
         common["eps"] = eps
-    if cpu_offload:
-        return CPUOffloadAdamW(
-            params,
-            lr=lr,
-            weight_decay=weight_decay,
-            betas=betas,
-            eps=eps,
-            master_weight_storage=master_weight_storage,
-            adaptive_max_promoted_fraction=adaptive_max_promoted_fraction,
-            adaptive_promote_threshold=adaptive_promote_threshold,
-            adaptive_demote_threshold=adaptive_demote_threshold,
-            adaptive_demote_patience=adaptive_demote_patience,
-        )
-    use_paged = implementation == "paged_adamw_8bit" or (
-        implementation == "auto"
-        and (
-            optimizer_state == "cpu_paged"
-            or (optimizer_state == "auto" and trainable > FUSED_ADAMW_MAX_PARAMS)
-        )
-    )
-    if cuda and use_paged:
-        try:
-            import bitsandbytes as bnb
-
-            # On a single GPU there is no data-parallel state for ZeRO to
-            # partition. PagedAdamW8bit provides the useful equivalent here:
-            # compact states backed by unified memory that can page to CPU RAM.
-            return bnb.optim.PagedAdamW8bit(
+    try:
+        if resolution.implementation == "cpu_offload_adamw":
+            optimizer: Optimizer = CPUOffloadAdamW(
                 params,
-                **common,
+                lr=lr,
+                weight_decay=weight_decay,
+                betas=betas,
+                eps=eps,
             )
-        except Exception as exc:  # noqa: BLE001
-            if implementation == "paged_adamw_8bit":
-                raise RuntimeError("PagedAdamW8bit was requested but is unavailable") from exc
-    # Fused AdamW was substantially faster for the small active expert/router
-    # parameter sets and adds negligible memory. Large/full fine-tunes retain
-    # the memory-oriented 8-bit optimizer path.
-    use_fused = implementation == "fused_adamw" or (
-        implementation == "auto" and trainable <= FUSED_ADAMW_MAX_PARAMS
-    )
-    if cuda and use_fused and params and all(p.is_cuda for p in params):
-        try:
-            return torch.optim.AdamW(params, **common, fused=True)
-        except (RuntimeError, TypeError, ValueError) as exc:
-            if implementation == "fused_adamw":
-                raise RuntimeError("fused AdamW was requested but is unavailable") from exc
-    use_8bit = implementation == "adamw_8bit" or implementation == "auto"
-    if cuda and use_8bit:
-        try:
+        elif resolution.implementation == "paged_adamw_8bit":
             import bitsandbytes as bnb
 
-            return bnb.optim.AdamW8bit(params, **common)
-        except Exception as exc:  # noqa: BLE001
-            if implementation == "adamw_8bit":
-                raise RuntimeError("AdamW8bit was requested but is unavailable") from exc
-    return torch.optim.AdamW(params, **common)
+            optimizer = bnb.optim.PagedAdamW8bit(params, **common, min_8bit_size=0)
+        elif resolution.implementation == "adamw_8bit":
+            import bitsandbytes as bnb
+
+            optimizer = bnb.optim.AdamW8bit(params, **common, min_8bit_size=0)
+        elif resolution.implementation == "fused_adamw":
+            optimizer = torch.optim.AdamW(params, **common, fused=True)
+        elif resolution.implementation == "torch_adamw":
+            optimizer = torch.optim.AdamW(params, **common)
+        else:  # pragma: no cover - resolution is closed over the public enum
+            raise AssertionError(f"unhandled optimizer: {resolution.implementation}")
+    except Exception as exc:  # no implementation substitution after resolution
+        raise RuntimeError(
+            f"verified optimizer {resolution.implementation} failed to construct"
+        ) from exc
+    optimizer._yylab_optimizer_resolution = resolution.to_dict()
+    return optimizer
 
 
 def train_loop(

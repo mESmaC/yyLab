@@ -6,6 +6,16 @@ from pathlib import Path
 from nicegui import ui
 
 from ... import db
+from ...models.bitsandbytes_capabilities import (
+    available_bitsandbytes_quantizations,
+    bitsandbytes_compute_precision,
+)
+from ...models.families import checkpoint_family, hf_compatible_checkpoints
+from ...models.precision_capabilities import (
+    available_dense_precisions,
+    model_execution_device,
+    require_model_precision,
+)
 from ...train.preference import (
     PREFERENCE_OBJECTIVE,
     PREFERENCE_RUN_KIND,
@@ -27,6 +37,20 @@ def build_preference_run_config(**values: object) -> DPOConfig:
 
 @ui.page("/train/preference")
 def train_preference_page() -> None:
+    model_device = model_execution_device()
+    dense_precisions = available_dense_precisions(model_device)
+    policy_precision_options = {
+        precision: f"LoRA · {precision.upper()}"
+        for precision in dense_precisions
+    }
+    policy_precision_options.update(
+        (
+            quantization,
+            f"QLoRA · {quantization.upper()} · "
+            f"{bitsandbytes_compute_precision(quantization).upper()} compute",
+        )
+        for quantization in available_bitsandbytes_quantizations(model_device)
+    )
     with shell("Train · Preference", "/train/preference"):
         ui.label("Offline preference optimization").classes("text-xl font-semibold")
         ui.label(
@@ -37,6 +61,7 @@ def train_preference_page() -> None:
         checkpoint_rows = db.q(
             "SELECT * FROM checkpoints WHERE kind!='pending' ORDER BY created_at DESC"
         )
+        checkpoint_rows = hf_compatible_checkpoints(checkpoint_rows)
         checkpoints = {
             row["id"]: (
                 f"{row['name']} ({float(row.get('params_b') or 0):g}B"
@@ -95,14 +120,12 @@ def train_preference_page() -> None:
                 with field_grid(3):
                     quant = (
                         ui.select(
-                            {
-                                "bf16": "LoRA · BF16",
-                                "fp16": "LoRA · FP16",
-                                "fp32": "LoRA · FP32",
-                                "nf4": "QLoRA · NF4",
-                                "int8": "QLoRA · INT8",
-                            },
-                            value="bf16",
+                            policy_precision_options,
+                            value=(
+                                "bf16"
+                                if "bf16" in dense_precisions
+                                else next(iter(policy_precision_options), None)
+                            ),
                             label="Policy loading",
                         )
                         .props("dense outlined")
@@ -269,6 +292,12 @@ def train_preference_page() -> None:
             if row is None:
                 ui.notify("Choose a base checkpoint.", type="warning")
                 return
+            if checkpoint_family(row) == "spalmer":
+                ui.notify(
+                    "Preference training requires a Hugging Face-compatible base checkpoint.",
+                    type="negative",
+                )
+                return
             validated = validate_pairs(notify=False)
             if validated is None:
                 ui.notify("Fix the preference dataset before starting.", type="negative")
@@ -281,6 +310,11 @@ def train_preference_page() -> None:
                     f"Checkpoint is quant-locked to {locked}; DPO requested {requested_quant}.",
                     type="negative",
                 )
+                return
+            try:
+                require_model_precision(requested_quant)
+            except (RuntimeError, ValueError) as exc:
+                ui.notify(str(exc), type="negative", multi_line=True)
                 return
             adapter_id = db.new_id("adp")
             run_id = db.new_id("run")

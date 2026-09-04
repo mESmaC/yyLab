@@ -11,6 +11,7 @@ from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
+from ..models.precision_capabilities import model_compute_dtype
 from ..mole.inject import DEFAULT_TARGET_MODULES
 from .models import canonical_json
 from .quality import _artifact_lock
@@ -332,7 +333,7 @@ def run_training_performance(
         replaced = inject_mole(
             model,
             mole_cfg,
-            expert_dtype=torch.bfloat16 if cuda else torch.float32,
+            expert_dtype=model_compute_dtype(resolved_quant),
         )
         if not replaced:
             raise RuntimeError("no target linear modules matched the requested MoLE architecture")

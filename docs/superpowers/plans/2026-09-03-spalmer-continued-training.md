@@ -1,5 +1,11 @@
 # SPALMER Continued Training and Epoch Control Implementation Plan
 
+> **Historical implementation record — not the current precision contract.**
+> Its format-v5/reference/fake-QAT examples are retired and unloadable. Current
+> yyLab continues only QR-PLE format-v7/v8 bundles whose exact native expert
+> precision pair passes capability validation; do not replay the obsolete code
+> snippets in this plan.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Let a registered SPALMER checkpoint start a new full-parameter causal-LM run, and expose the trainer's epoch loop on the Train · SPALMER page.

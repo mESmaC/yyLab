@@ -316,7 +316,7 @@ def test_engine_loads_v4_router_without_materializing_expert_lanes(
     save_mole(artifact, source, config, base_ref="toy")
 
     def fake_load_base(_ref, _quant, **_options):
-        return _ToyLM(), _EngineTokenizer(), False, "bf16", []
+        return _ToyLM(), _EngineTokenizer(), True, "fp32", []
 
     monkeypatch.setattr(loading_module, "load_base", fake_load_base)
     engine = Engine()
@@ -324,7 +324,7 @@ def test_engine_loads_v4_router_without_materializing_expert_lanes(
     notes = engine.load(
         LoadSpec(
             ref="toy",
-            quant="bf16",
+            quant="fp32",
             adapter_path=str(artifact),
             adapter_arch="mole",
         )
@@ -400,21 +400,21 @@ def test_kv_reserve_tracks_cache_location_and_quantization() -> None:
         num_hidden_layers=2,
         num_attention_heads=2,
         num_key_value_heads=1,
-        hidden_size=8,
+        hidden_size=128,
     )
 
     dynamic = _adaptive_kv_reserve_bytes(
         config,
         {"cache_implementation": "dynamic"},
-        prompt_tokens=10,
-        answer_tokens=20,
+        prompt_tokens=100,
+        answer_tokens=100,
         cuda=True,
     )
     quantized = _adaptive_kv_reserve_bytes(
         config,
-        {"cache_implementation": "quantized", "kv_quant": "int8"},
-        prompt_tokens=10,
-        answer_tokens=20,
+        {"cache_implementation": "quantized", "kv_quant": "int4"},
+        prompt_tokens=100,
+        answer_tokens=100,
         cuda=True,
     )
     offloaded = _adaptive_kv_reserve_bytes(
@@ -425,9 +425,9 @@ def test_kv_reserve_tracks_cache_location_and_quantization() -> None:
         cuda=True,
     )
 
-    assert dynamic == 32 * 30
-    assert quantized == 16 * 30
-    assert offloaded == 32 * 256
+    assert dynamic == 512 * 200
+    assert quantized == 512 * 128 + 136 * 72
+    assert offloaded == 512 * 256
     assert (
         _adaptive_kv_reserve_bytes(
             config,
@@ -440,7 +440,7 @@ def test_kv_reserve_tracks_cache_location_and_quantization() -> None:
     )
 
 
-def test_engine_cache_fallback_restarts_adaptive_decode_state() -> None:
+def test_engine_cache_failure_is_not_retried_with_another_precision() -> None:
     class FakeRuntime:
         def __init__(self) -> None:
             self.reserve: int | None = None
@@ -458,7 +458,7 @@ def test_engine_cache_fallback_restarts_adaptive_decode_state() -> None:
             self.begins += 1
 
         def restart_decode_attempt(self, *, reason: str) -> None:
-            assert "dynamic cache" in reason
+            del reason
             self.retries += 1
 
         def end_decode(self) -> None:
@@ -494,26 +494,22 @@ def test_engine_cache_fallback_restarts_adaptive_decode_state() -> None:
         nonlocal attempts
         attempts += 1
         attempt_kwargs.append(dict(kwargs))
-        if attempts == 1:
-            raise RuntimeError("cache setup failed")
-        yield "ok"
+        raise RuntimeError("cache setup failed")
+        yield  # pragma: no cover
 
     engine._stream = MethodType(fake_stream, engine)
 
-    output = "".join(
-        engine.generate_stream(
-            [{"role": "user", "content": "hi"}],
-            max_new_tokens=5,
+    with pytest.raises(RuntimeError, match="cache setup failed"):
+        "".join(
+            engine.generate_stream(
+                [{"role": "user", "content": "hi"}],
+                max_new_tokens=5,
+            )
         )
-    )
 
-    assert output == "ok"
-    assert attempts == 2
+    assert attempts == 1
     assert runtime.reserve == 32 * 8
     assert runtime.begins == 1
-    assert runtime.retries == 1
+    assert runtime.retries == 0
     assert runtime.ends == 1
     assert attempt_kwargs[0]["cache_implementation"] == "static"
-    assert "cache_implementation" not in attempt_kwargs[1]
-    assert "max_cache_len" not in attempt_kwargs[1]
-    assert "prefill_chunk_size" not in attempt_kwargs[1]

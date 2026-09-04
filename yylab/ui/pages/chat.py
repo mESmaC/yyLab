@@ -13,7 +13,16 @@ from ...config import get_settings
 from ...hw import best_gpu
 from ...infer.engine import ENGINE, LoadSpec
 from ...jobs import JOBS
+from ...models.bitsandbytes_capabilities import (
+    available_bitsandbytes_quantizations,
+    bitsandbytes_compute_precision,
+)
 from ...models.families import checkpoint_family
+from ...models.precision_capabilities import (
+    available_dense_precisions,
+    model_execution_device,
+    preferred_dense_precision,
+)
 from ...models.spalmer import recurrence_metadata
 from ..components import empty_state
 from ..shell import ACCENT, PANEL, PANEL_EDGE, panel, shell
@@ -314,6 +323,21 @@ def chat_page():
             c["id"]: c["name"] for c in db.q("SELECT * FROM checkpoints WHERE kind!='pending' ORDER BY name")
         }
         engine_settings = dict(get_settings()["engine"])
+        model_device = model_execution_device()
+        bnb_quantizations = available_bitsandbytes_quantizations(model_device)
+        dense_precisions = available_dense_precisions(model_device)
+        quantization_options = {"auto": "Auto quant"}
+        quantization_options.update(
+            (precision, precision.upper()) for precision in dense_precisions
+        )
+        quantization_options.update(
+            (
+                quantization,
+                f"{quantization.upper()} · "
+                f"{bitsandbytes_compute_precision(quantization).upper()} compute",
+            )
+            for quantization in bnb_quantizations
+        )
         messages: list[dict] = []
         stream_state: dict = {
             "q": None,
@@ -333,7 +357,7 @@ def chat_page():
                 rtr_sel = ui.select({}, label="Router snapshot").props("dense outlined").classes("w-56")
                 quant_sel = (
                     ui.select(
-                        {"auto": "Auto quant", "bf16": "BF16", "nf4": "NF4", "int8": "INT8"},
+                        quantization_options,
                         value="auto",
                         label="Base quant",
                     )
@@ -679,8 +703,11 @@ def chat_page():
                 return quant_sel.value
             gpu = best_gpu()
             if gpu and ckpt_row["params_b"] and ckpt_row["params_b"] * 2.3 > gpu.vram_free_gb:
-                return "nf4"
-            return "bf16"
+                if "nf4" in bnb_quantizations:
+                    return "nf4"
+                if "int8" in bnb_quantizations:
+                    return "int8"
+            return preferred_dense_precision(model_device)
 
         def on_load() -> None:
             if not ckpt_sel.value:

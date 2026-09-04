@@ -1,5 +1,32 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
+
+
+def reject_unverified_checkpoint_quantization(base_cfg) -> None:
+    """Reject checkpoint-owned quantizers that bypass yyLab capability probes.
+
+    Native yyLab QAT is recorded separately in ``yylab_low_precision``. Any
+    Transformers ``quantization_config`` would otherwise be activated by
+    ``from_pretrained`` without going through yyLab's exact operator checks;
+    that includes BitNet's software STE/dense-linear integration.
+    """
+
+    raw = getattr(base_cfg, "quantization_config", None)
+    if raw is None:
+        return
+    if isinstance(raw, Mapping):
+        values = dict(raw)
+    else:
+        converter = getattr(raw, "to_dict", None)
+        values = dict(converter()) if callable(converter) else {}
+    method = str(values.get("quant_method") or type(raw).__name__).strip()
+    raise ValueError(
+        "checkpoint-embedded quantization is not executable through yyLab's "
+        f"native capability contract ({method or 'unknown'}); load an unquantized "
+        "checkpoint and choose one of the verified runtime precision options"
+    )
+
 
 def trained_context_length(base_cfg) -> int:
     """Return the checkpoint's trained RoPE length rather than a padded runtime limit."""
@@ -69,23 +96,47 @@ def load_base(
     import torch
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-    from ..train.low_precision import apply_saved_qat
+    from ..train.low_precision import apply_saved_qat, preflight_saved_qat
+    from .bitsandbytes_capabilities import bitsandbytes_compute_precision
+    from .families import SPALMER_MODEL_FAMILY, family_from_reference
+    from .precision_capabilities import require_model_precision
 
     notes: list[str] = []
     cuda = torch.cuda.is_available()
+    quant = str(quant).strip().casefold()
+    if family_from_reference(ref) == SPALMER_MODEL_FAMILY:
+        raise ValueError(
+            "SPALMER checkpoints are not Hugging Face base models; use the native "
+            "SPALMER training or inference path"
+        )
+    device = "cuda:0" if cuda else "cpu"
+    require_model_precision(quant, device)
+
     tokenizer = AutoTokenizer.from_pretrained(ref)
     if tokenizer.pad_token is None and tokenizer.eos_token is not None:
         tokenizer.pad_token = tokenizer.eos_token
 
     base_cfg = AutoConfig.from_pretrained(ref)
+    reject_unverified_checkpoint_quantization(base_cfg)
     saved_qat = getattr(base_cfg, "yylab_low_precision", None)
     if saved_qat and quant in {"nf4", "int8"}:
         raise ValueError(
             "A QAT-trained base cannot also be loaded through bitsandbytes NF4/INT8. "
             "Load its saved BF16/FP16/FP32 shadow checkpoint instead."
         )
+    if saved_qat and restore_saved_qat:
+        if quant != "bf16":
+            raise ValueError(
+                "Restoring native low-precision checkpoint numerics requires BF16 loading"
+            )
+        preflight_saved_qat(dict(saved_qat), device)
 
     kwargs: dict = {
+        # Reuse the exact config object inspected above. Letting
+        # ``from_pretrained`` resolve the reference a second time would give a
+        # checkpoint-embedded quantizer another path around the fail-closed
+        # capability boundary.
+        "config": base_cfg,
         "attn_implementation": attn_implementation,
         # Stream checkpoint shards directly into their destination tensors.
         # This avoids a second full-sized CPU state dict during worker startup.
@@ -95,18 +146,20 @@ def load_base(
         # Qwen3's default 40,960 runtime allocation is 8,192 prompt
         # positions plus its native 32,768-token trained sequence.
         merged_rope = _merged_rope_parameters(base_cfg, rope_scaling)
-        kwargs["rope_scaling"] = merged_rope
+        # A supplied config makes Transformers pass unknown kwargs to the
+        # model constructor instead of applying them as config overrides.
+        # Mutate the already-validated copy explicitly so there is still only
+        # one config resolution between validation and model construction.
+        base_cfg.rope_scaling = merged_rope
         if max_position_embeddings is not None:
             target_context = int(max_position_embeddings)
             if target_context < 1:
                 raise ValueError("max_position_embeddings must be positive")
-            kwargs["max_position_embeddings"] = target_context
+            base_cfg.max_position_embeddings = target_context
             notes.append(
                 f"{str(merged_rope.get('rope_type') or 'RoPE').upper()} context extension: "
                 f"{target_context:,} positions."
             )
-    if quant == "fp8":
-        raise ValueError("FP8 base loading is not implemented; choose NF4, INT8, or BF16")
     if cuda and quant == "nf4":
         kwargs["quantization_config"] = BitsAndBytesConfig(
             load_in_4bit=True,
@@ -117,18 +170,19 @@ def load_base(
         kwargs["dtype"] = torch.bfloat16
     elif cuda and quant == "int8":
         kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
-        kwargs["dtype"] = torch.bfloat16
+        compute_precision = bitsandbytes_compute_precision(quant)
+        if compute_precision != "fp16":
+            raise RuntimeError(
+                "the verified bitsandbytes INT8 provider no longer declares FP16 compute"
+            )
+        kwargs["dtype"] = torch.float16
     else:
         dtype_map = {
             "bf16": torch.bfloat16,
             "fp16": torch.float16,
             "fp32": torch.float32,
-            "": torch.bfloat16,
         }
-        requested_dtype = dtype_map.get(quant, torch.bfloat16)
-        kwargs["dtype"] = requested_dtype if cuda else torch.float32
-        if not cuda and quant not in {"bf16", "fp16", "fp32", ""}:
-            notes.append("No CUDA GPU: quantization disabled, using fp32 on CPU (slow).")
+        kwargs["dtype"] = dtype_map[quant]
     if cuda:
         kwargs["device_map"] = {"": 0}
 
@@ -149,23 +203,23 @@ def load_base(
                 "Loaded high-precision shadow weights without restoring inherited QAT numerics."
             )
     if qat_meta is not None:
-        execution = (
-            "native low-bit forward"
-            if qat_meta.get("native_low_bit_gemm")
-            else "emulated low-bit forward"
-        )
+        if not qat_meta.get("native_low_bit_gemm"):
+            raise RuntimeError("saved low-precision recipe is not backed by a native GEMM")
+        execution = "native low-bit forward"
         sparsity = str(qat_meta.get("sparsity") or "none")
         if qat_meta.get("native_sparse_gemm"):
             sparsity_note = f"; {sparsity} compressed sparse forward"
         elif sparsity != "none":
-            sparsity_note = f"; {sparsity} dense-masked forward"
+            raise RuntimeError("saved sparse precision recipe is not backed by a native compressed GEMM")
         else:
             sparsity_note = ""
         backward = str(qat_meta.get("backward_precision") or "bf16")
+        if backward == "mxfp8" and not qat_meta.get("native_low_bit_backward"):
+            raise RuntimeError("saved MXFP8 backward recipe is not backed by a native GEMM")
         backward_note = (
             "; native MXFP8 backward"
             if qat_meta.get("native_low_bit_backward")
-            else f"; {backward} backward"
+            else "; BF16 backward"
         )
         notes.append(
             f"restored {qat_meta.get('format')} QAT numerics on {qat_count} Linear modules "

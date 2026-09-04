@@ -8,29 +8,17 @@ BASE_RECIPE_VERSION = 4
 FAMILY_LABELS = {
     "qwen3": "Qwen3 decoder",
     "llama": "Llama decoder",
-    "bitnet": "BitNet b1.58 decoder",
+    "bitnet": "BitNet topology (dense precision only)",
 }
 
 QAT_LABELS = {
     "none": "None (dense training)",
-    "int4": "INT4 compatibility QAT (fake quant; no native INT4 Tensor Core GEMM)",
-    "nvfp4": "NVFP4 W4A4 QAT (native FP4 forward when available)",
-    "ternary": "Ternary BitNet b1.58 QAT (W1.58/A8; experimental)",
+    "nvfp4": "NVFP4 W4A4 (native Tensor Core training)",
 }
 
 SPARSITY_LABELS = {
     "none": "Dense weights",
     "paired_4:8": "Paired 4:8 (NVFP4's 50% sparse Tensor Core pattern)",
-}
-
-MASTER_WEIGHT_LABELS = {
-    "fp32": "FP32 master (maximum update fidelity)",
-    "fp8_e4m3_adaptive": (
-        "Adaptive FP8 master (selective sparse potentiation; recommended experimental)"
-    ),
-    "fp8_e4m3_potentiated": (
-        "Legacy potentiated FP8 master (dense residual for every weight)"
-    ),
 }
 
 TRAINING_RECIPE_PRESETS: dict[str, dict[str, object]] = {
@@ -40,37 +28,22 @@ TRAINING_RECIPE_PRESETS: dict[str, dict[str, object]] = {
         "qat": "nvfp4",
         "qat_backend": "native",
         "qat_group_size": 16,
-        "activation_qat": "none",
+        "activation_qat": "nvfp4",
         "sparsity": "paired_4:8",
+        "sparsity_backend": "compressed",
     },
-    "nvfp4_paired_4to8_fp8_master": {
+    "nvfp4_sparse_mxfp8_cpu_offload": {
         "parameter_dtype": "bf16",
         "qat": "nvfp4",
         "qat_backend": "native",
         "qat_group_size": 16,
-        "activation_qat": "none",
-        "sparsity": "paired_4:8",
-        "optimizer_state": "cpu_offload",
-        "optimizer_impl": "cpu_offload_adamw",
-        "master_weight_storage": "fp8_e4m3_potentiated",
-    },
-    "nvfp4_sparse_mxfp8_adaptive": {
-        "parameter_dtype": "bf16",
-        "qat": "nvfp4",
-        "qat_backend": "native",
-        "qat_group_size": 16,
-        "activation_qat": "none",
+        "activation_qat": "nvfp4",
         "sparsity": "paired_4:8",
         "sparsity_backend": "compressed",
         "backward_precision": "mxfp8",
         "backward_backend": "native",
         "optimizer_state": "cpu_offload",
         "optimizer_impl": "cpu_offload_adamw",
-        "master_weight_storage": "fp8_e4m3_adaptive",
-        "adaptive_max_promoted_fraction": 0.10,
-        "adaptive_promote_threshold": 0.55,
-        "adaptive_demote_threshold": 0.20,
-        "adaptive_demote_patience": 2,
     },
 }
 
@@ -177,10 +150,11 @@ class ScratchModelSpec:
             self.resolved_vocab_size(tokenizer_vocab_size)
         if qat_mode not in QAT_LABELS:
             raise ValueError(f"unsupported QAT target: {qat_mode}")
-        if qat_mode == "ternary" and self.family != "bitnet":
-            raise ValueError("ternary QAT requires the BitNet architecture")
-        if self.family == "bitnet" and qat_mode not in {"none", "ternary"}:
-            raise ValueError("BitNet supports dense or ternary QAT recipes, not INT4/NVFP4 QAT")
+        if self.family == "bitnet" and qat_mode != "none":
+            raise ValueError(
+                "BitNet currently supports dense training only; no native low-precision "
+                "training backend is integrated"
+            )
         if qat_mode == "nvfp4" and (
             self.hidden_size % 32 or self.intermediate_size % 32 or self.head_dim % 16
         ):
@@ -510,8 +484,6 @@ def projected_training_memory_gb(
     *,
     parameter_dtype: str = "bf16",
     optimizer_state: str = "gpu",
-    master_weight_storage: str = "fp32",
-    adaptive_max_promoted_fraction: float = 0.10,
 ) -> tuple[float, float]:
     """Return coarse GPU/RAM parameter-state projections, excluding activations."""
 
@@ -520,35 +492,14 @@ def projected_training_memory_gb(
     # AdamW moments are FP32; fused/8-bit implementations may use less, so this
     # intentionally reports a conservative upper bound.
     adam_bytes = int(parameters) * 8
-    if master_weight_storage == "fp8_e4m3_adaptive":
-        blocks = (int(parameters) + 31) // 32
-        promoted_blocks = int(blocks * max(0.0, min(1.0, adaptive_max_promoted_fraction)))
-        # E4M3 byte/value, FP32 block scale, uint8 hysteresis counter, then
-        # only the selected int32 indices and packed 4-bit residual rows.
-        master_bytes = (
-            int(parameters)
-            + blocks * 5
-            + promoted_blocks * (4 + 16)
-        )
-    elif master_weight_storage == "fp8_e4m3_potentiated":
-        # One E4M3 byte, one packed residual nibble, and one FP32 scale per
-        # 32 values. Adam moments remain FP32 and are counted separately.
-        master_bytes = (
-            int(parameters)
-            + (int(parameters) + 1) // 2
-            + ((int(parameters) + 31) // 32) * 4
-        )
-    else:
-        master_bytes = int(parameters) * 4 if parameter_dtype != "fp32" else 0
     if optimizer_state == "cpu_offload":
         gpu = weights_and_grads
-        # CPUOffloadAdamW always owns an offloaded master, including when the
-        # accelerator parameter itself is FP32.
-        ram = adam_bytes + (master_bytes or int(parameters) * 4)
+        # CPUOffloadAdamW always owns an FP32 CPU master plus FP32 moments.
+        ram = adam_bytes + int(parameters) * 4
     elif optimizer_state == "cpu_paged":
         gpu = weights_and_grads + int(parameters) * 2
         ram = adam_bytes
     else:
-        gpu = weights_and_grads + adam_bytes + master_bytes
+        gpu = weights_and_grads + adam_bytes
         ram = 0
     return gpu / 2**30, ram / 2**30

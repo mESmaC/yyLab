@@ -6,8 +6,7 @@ import torch
 import torch.nn.functional as F
 
 NATIVE_MXFP8_BACKEND = "torchao_native_mxfp8"
-EMULATED_MXFP8_BACKEND = "torchao_emulated_mxfp8"
-MXFP8_BACKENDS = {"auto", "native", "emulated"}
+MXFP8_BACKENDS = {"auto", "native"}
 
 
 class MXFP8Error(RuntimeError):
@@ -20,15 +19,37 @@ def _ceil_multiple(value: int, multiple: int) -> int:
 
 def _canonical_backend(backend: str) -> str:
     normalized = str(backend or "auto").strip().lower()
+    # Runtime resolution persists the concrete provider identifier. Accepting
+    # that identifier here lets callers pass the verified receipt all the way
+    # to execution instead of widening it back to the generic request token.
+    if normalized == NATIVE_MXFP8_BACKEND:
+        return "native"
     if normalized not in MXFP8_BACKENDS:
         raise ValueError(f"unknown MXFP8 backend: {backend}")
     return normalized
 
 
-def _native_prerequisites() -> tuple[bool, str]:
+def _resolved_cuda_index(
+    device: str | torch.device | None = None,
+) -> tuple[int | None, str]:
     if not torch.cuda.is_available():
-        return False, "CUDA is unavailable"
-    capability = torch.cuda.get_device_capability()
+        return None, "CUDA is unavailable"
+    resolved = torch.device(device if device is not None else "cuda")
+    if resolved.type != "cuda":
+        return None, f"native MXFP8 requires CUDA, got {resolved}"
+    index = torch.cuda.current_device() if resolved.index is None else int(resolved.index)
+    if index < 0 or index >= torch.cuda.device_count():
+        return None, f"CUDA device index {index} is unavailable"
+    return index, ""
+
+
+def _native_prerequisites(
+    device: str | torch.device | None = None,
+) -> tuple[bool, str]:
+    index, unavailable = _resolved_cuda_index(device)
+    if index is None:
+        return False, unavailable
+    capability = torch.cuda.get_device_capability(index)
     if capability[0] < 10:
         return False, (
             "native MXFP8 block-scaled GEMM requires Blackwell or newer, "
@@ -43,26 +64,25 @@ def _native_prerequisites() -> tuple[bool, str]:
     return True, f"SM{capability[0]}{capability[1]} TorchAO block-scaled MXFP8"
 
 
-def resolve_mxfp8_backend(backend: str = "auto") -> tuple[str, str]:
-    """Resolve a recipe request without claiming that a smoke test was run.
+def resolve_mxfp8_backend(
+    backend: str = "auto",
+    device: str | torch.device | None = None,
+) -> tuple[str, str]:
+    """Resolve to native MXFP8 or fail closed.
 
-    Strict/native callers should additionally call :func:`native_mxfp8_status`
-    in worker preflight.  The split keeps UI capability inspection from
-    allocating a CUDA context while still making execution failures explicit.
+    ``auto`` means "select the native backend supported by this GPU". It never
+    means emulation. Strict callers should additionally run
+    :func:`native_mxfp8_status` during worker preflight.
     """
 
-    requested = _canonical_backend(backend)
-    if requested == "emulated":
-        return EMULATED_MXFP8_BACKEND, "portable TorchAO MXFP8 emulation"
-    available, note = _native_prerequisites()
+    _canonical_backend(backend)
+    available, note = _native_prerequisites(device)
     if available:
         return NATIVE_MXFP8_BACKEND, note
-    if requested == "native":
-        raise MXFP8Error(f"native MXFP8 requested but unavailable: {note}")
-    return EMULATED_MXFP8_BACKEND, f"native MXFP8 unavailable; using emulation: {note}"
+    raise MXFP8Error(f"native MXFP8 requested but unavailable: {note}")
 
 
-def _mx_quantize_rows(value: torch.Tensor, *, native: bool):
+def _mx_quantize_rows(value: torch.Tensor):
     """Quantize contiguous matrix rows in 32-value MXFP8 blocks.
 
     Explicitly transposing the second operand before this function avoids
@@ -80,19 +100,13 @@ def _mx_quantize_rows(value: torch.Tensor, *, native: bool):
         KernelPreference,
     )
 
-    preference = KernelPreference.AUTO if native else KernelPreference.EMULATED
-    cast_kernel = (
-        MXFP8Dim0CastKernelChoice.TRITON
-        if native
-        else MXFP8Dim0CastKernelChoice.TORCH
-    )
     return MXTensor.to_mx(
         value.contiguous(),
         torch.float8_e4m3fn,
         32,
         ScaleCalculationMode.RCEIL,
-        preference,
-        mxfp8_dim0_cast_kernel_choice=cast_kernel,
+        KernelPreference.AUTO,
+        mxfp8_dim0_cast_kernel_choice=MXFP8Dim0CastKernelChoice.TRITON,
     )
 
 
@@ -124,17 +138,15 @@ def mxfp8_mm_nt(
     if left.numel() == 0 or right_rows.numel() == 0:
         return left.new_zeros((left.shape[0], right_rows.shape[0]))
 
-    resolved, _ = resolve_mxfp8_backend(backend)
-    native = resolved == NATIVE_MXFP8_BACKEND
-    if native:
-        if not left.is_cuda:
-            raise MXFP8Error("native MXFP8 requires CUDA operands")
-        if left.dtype != torch.bfloat16:
-            raise MXFP8Error("native MXFP8 backward currently requires BF16 operands")
+    resolve_mxfp8_backend(backend, left.device)
+    if not left.is_cuda:
+        raise MXFP8Error("native MXFP8 requires CUDA operands")
+    if left.dtype != torch.bfloat16:
+        raise MXFP8Error("native MXFP8 backward currently requires BF16 operands")
 
     m, contraction = left.shape
     n = right_rows.shape[0]
-    alignment = 128 if native else 32
+    alignment = 128
     padded_m = _ceil_multiple(m, alignment)
     padded_n = _ceil_multiple(n, alignment)
     padded_k = _ceil_multiple(contraction, alignment)
@@ -144,8 +156,8 @@ def mxfp8_mm_nt(
         (0, padded_k - contraction, 0, padded_n - n),
     )
 
-    left_mx = _mx_quantize_rows(left_padded, native=native)
-    right_mx = _mx_quantize_rows(right_padded, native=native)
+    left_mx = _mx_quantize_rows(left_padded)
+    right_mx = _mx_quantize_rows(right_padded)
     output = torch.mm(left_mx, right_mx.t())
     return output[:m, :n].to(dtype=left.dtype).contiguous()
 
@@ -157,7 +169,7 @@ def mxfp8_linear_backward(
     *,
     backend: str = "auto",
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return Linear dgrad and wgrad using native or emulated MXFP8 GEMMs."""
+    """Return Linear dgrad and wgrad using native MXFP8 Tensor Core GEMMs."""
 
     if input.ndim < 1 or grad_output.ndim != input.ndim:
         raise ValueError("input and grad_output must have matching, non-empty ranks")
@@ -185,9 +197,10 @@ def mxfp8_linear_backward(
     return grad_input, grad_weight
 
 
-@lru_cache(maxsize=1)
-def _smoke_native_mxfp8() -> tuple[bool, str]:
-    available, note = _native_prerequisites()
+@lru_cache(maxsize=8)
+def _smoke_native_mxfp8(device_index: int) -> tuple[bool, str]:
+    device = torch.device("cuda", int(device_index))
+    available, note = _native_prerequisites(device)
     if not available:
         return False, note
     try:
@@ -195,10 +208,10 @@ def _smoke_native_mxfp8() -> tuple[bool, str]:
         input_cpu = torch.randn((37, 79), generator=generator)
         weight_cpu = torch.randn((113, 79), generator=generator)
         grad_cpu = torch.randn((37, 113), generator=generator)
-        input = input_cpu.to(device="cuda", dtype=torch.bfloat16)
-        weight = weight_cpu.to(device="cuda", dtype=torch.bfloat16)
-        grad_output = grad_cpu.to(device="cuda", dtype=torch.bfloat16)
-        with torch.no_grad():
+        input = input_cpu.to(device=device, dtype=torch.bfloat16)
+        weight = weight_cpu.to(device=device, dtype=torch.bfloat16)
+        grad_output = grad_cpu.to(device=device, dtype=torch.bfloat16)
+        with torch.cuda.device(device), torch.no_grad():
             grad_input, grad_weight = mxfp8_linear_backward(
                 input,
                 weight,
@@ -232,25 +245,33 @@ def _smoke_native_mxfp8() -> tuple[bool, str]:
         return False, f"native MXFP8 dgrad/wgrad smoke failed: {exc}"
 
 
-def native_mxfp8_status(*, force_refresh: bool = False) -> tuple[bool, str]:
+def native_mxfp8_status(
+    device: str | torch.device | None = None,
+    *,
+    force_refresh: bool = False,
+) -> tuple[bool, str]:
     """Report native MXFP8 only after both gradient GEMMs execute successfully."""
 
     if force_refresh:
         _smoke_native_mxfp8.cache_clear()
-    return _smoke_native_mxfp8()
+    index, unavailable = _resolved_cuda_index(device)
+    if index is None:
+        return False, unavailable
+    return _smoke_native_mxfp8(index)
 
 
-def mxfp8_capability_status() -> tuple[bool, str]:
+def mxfp8_capability_status(
+    device: str | torch.device | None = None,
+) -> tuple[bool, str]:
     """Cheap UI preflight that leaves real dgrad/wgrad validation to a worker."""
 
-    available, note = _native_prerequisites()
+    available, note = _native_prerequisites(device)
     if not available:
         return available, note
     return True, f"{note} is configured; the training worker requires both GEMM smokes"
 
 
 __all__ = [
-    "EMULATED_MXFP8_BACKEND",
     "MXFP8Error",
     "NATIVE_MXFP8_BACKEND",
     "mxfp8_linear_backward",

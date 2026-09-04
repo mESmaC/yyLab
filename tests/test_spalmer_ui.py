@@ -1,8 +1,29 @@
 from __future__ import annotations
 
 import pytest
+import spalmer.precision as spalmer_precision
 
 from yylab.ui.pages import train_spalmer
+
+
+def test_native_precision_capabilities_probes_exact_yylab_device(monkeypatch) -> None:
+    seen: list[object] = []
+
+    monkeypatch.setattr(train_spalmer, "model_execution_device", lambda: "cuda:7")
+    monkeypatch.setattr(
+        spalmer_precision,
+        "detect_precision_capabilities",
+        lambda device: seen.append(device)
+        or {"expert_precisions": [], "selectable_pairs": [], "detail": "test"},
+    )
+    train_spalmer.native_precision_capabilities.cache_clear()
+    try:
+        report = train_spalmer.native_precision_capabilities()
+    finally:
+        train_spalmer.native_precision_capabilities.cache_clear()
+
+    assert seen == ["cuda:7"]
+    assert report["detail"] == "test"
 
 
 def _resolved_plan() -> dict:
@@ -13,7 +34,9 @@ def _resolved_plan() -> dict:
         "fingerprint": "a" * 64,
         "config": {
             "vocab_size": 4096,
-            "expert_weight_format": "mxfp4",
+            "expert_weight_format": "bfloat16",
+            "expert_activation_format": "bfloat16",
+            "ple_backend": "qr",
             "d_model": 128,
             "n_layers": 8,
         },
@@ -23,6 +46,8 @@ def _resolved_plan() -> dict:
 
 
 def _run_config(monkeypatch, **overrides):
+    capability_available = bool(overrides.pop("_capability_available", True))
+    grouped_available = bool(overrides.pop("_grouped_available", True))
     monkeypatch.setattr(
         train_spalmer,
         "attention_backend_status",
@@ -36,12 +61,16 @@ def _run_config(monkeypatch, **overrides):
     monkeypatch.setattr(
         train_spalmer,
         "qat_backend_status",
-        lambda weight_format, backend: {
+        lambda weight_format, backend, activation_format=None: {
             "requested_backend": backend,
-            "selected_backend": "reference",
-            "native_w4a8_available": False,
-            "emulated": True,
-            "torchao_available": False,
+            "selected_backend": "bf16_torch" if capability_available else None,
+            "native_available": capability_available,
+            "verified": capability_available,
+            "selectable": capability_available,
+            "forward_available": capability_available,
+            "backward_available": capability_available,
+            "grouped_available": capability_available and grouped_available,
+            "emulated": False,
             "detail": f"test {weight_format} capability",
         },
     )
@@ -79,8 +108,9 @@ def _run_config(monkeypatch, **overrides):
         "log_every": 10,
         "save_every": 100,
         "activation_checkpointing": False,
-        "expert_weight_format": "mxfp4",
-        "attention_backend": "auto",
+        "expert_weight_format": "bfloat16",
+        "expert_activation_format": "bfloat16",
+        "attention_backend": "fla",
         "expert_qat_backend": "auto",
         "directional": {
             "enabled": True,
@@ -101,7 +131,7 @@ def test_spalmer_ui_config_preserves_canonical_architecture_and_budget(monkeypat
     normalized = normalize_spalmer_config(config, require_runtime=True)
 
     assert config["architecture_type"] == "spalmer_v1"
-    assert config["recipe_version"] == 5
+    assert config["recipe_version"] == 6
     assert config["model_family"] == "spalmer"
     assert config["initialization"] == {
         "mode": "scratch",
@@ -135,6 +165,37 @@ def test_spalmer_ui_budget_requires_exactly_one_limit() -> None:
             micro_batch=1,
             gradient_accumulation=1,
         )
+
+
+def test_native_precision_options_hide_unverified_or_incomplete_pairs() -> None:
+    report = {
+        "expert_precisions": [
+            {
+                "provider_id": "bf16_torch",
+                "weight_format": "bfloat16",
+                "activation_format": "bfloat16",
+                "forward_available": True,
+                "backward_available": True,
+                "grouped_available": True,
+                "verified": True,
+                "selectable": True,
+            },
+            {
+                "provider_id": "cutlass_mxfp4",
+                "weight_format": "mxfp4",
+                "activation_format": "mxfp8",
+                "forward_available": True,
+                "backward_available": False,
+                "grouped_available": False,
+                "verified": True,
+                "selectable": False,
+            },
+        ]
+    }
+
+    assert train_spalmer.native_expert_precision_options(report) == {
+        "bfloat16:bfloat16": "BF16 weights / BF16 activations · bf16_torch · grouped"
+    }
     with pytest.raises(ValueError, match="enter"):
         train_spalmer._resolve_budget(
             token_budget=0,
@@ -145,9 +206,71 @@ def test_spalmer_ui_budget_requires_exactly_one_limit() -> None:
         )
 
 
+def test_qat_status_skips_an_unavailable_duplicate_provider(monkeypatch) -> None:
+    monkeypatch.setattr(
+        train_spalmer,
+        "native_precision_capabilities",
+        lambda: {
+            "expert_precisions": [
+                {
+                    "provider_id": "native_broken",
+                    "weight_format": "nvfp4",
+                    "activation_format": "nvfp4",
+                    "forward_available": True,
+                    "backward_available": False,
+                    "verified": True,
+                    "selectable": False,
+                    "detail": "no backward",
+                },
+                {
+                    "provider_id": "native_working",
+                    "weight_format": "nvfp4",
+                    "activation_format": "nvfp4",
+                    "forward_available": True,
+                    "backward_available": True,
+                    "grouped_available": False,
+                    "verified": True,
+                    "selectable": True,
+                    "detail": "native dense",
+                },
+            ]
+        },
+    )
+
+    status = train_spalmer.qat_backend_status("nvfp4", "auto", "nvfp4")
+    assert status["native_available"] is True
+    assert status["selected_backend"] == "native_working"
+
+
 def test_spalmer_ui_strict_native_qat_fails_closed(monkeypatch) -> None:
-    with pytest.raises(ValueError, match="test mxfp4 capability"):
-        _run_config(monkeypatch, expert_qat_backend="native")
+    with pytest.raises(ValueError, match="test bfloat16 capability"):
+        _run_config(
+            monkeypatch,
+            expert_qat_backend="native",
+            _capability_available=False,
+        )
+
+
+def test_spalmer_ui_uses_loop_dispatch_for_native_dense_provider(monkeypatch) -> None:
+    plan = _resolved_plan()
+    plan["config"].update(
+        expert_weight_format="nvfp4",
+        expert_activation_format="nvfp4",
+    )
+    config = _run_config(
+        monkeypatch,
+        resolved_plan=plan,
+        expert_weight_format="nvfp4",
+        expert_activation_format="nvfp4",
+        _grouped_available=False,
+    )
+
+    assert config["spalmer"]["experts"]["expert_execution"] == "loop"
+    assert config["spalmer"]["experts"]["potentiation_budget"] == 2
+    assert config["spalmer"]["experts"]["expert_promotion_format"] == "bfloat16"
+    assert "expert_stochastic_rounding" not in config["spalmer"]["experts"]
+    assert config["precision"]["expert_weight_format"] == "nvfp4"
+    assert config["precision"]["expert_activation_format"] == "nvfp4"
 
 
 def test_spalmer_ui_rejects_unimplemented_activation_checkpointing(monkeypatch) -> None:
@@ -158,7 +281,7 @@ def test_spalmer_ui_rejects_unimplemented_activation_checkpointing(monkeypatch) 
 def test_spalmer_ui_config_carries_epochs_for_scratch_runs(monkeypatch) -> None:
     config = _run_config(monkeypatch, epochs=3)
 
-    assert config["recipe_version"] == 5
+    assert config["recipe_version"] == 6
     assert config["epochs"] == 3
     assert config["initialization"] == {"mode": "scratch", "tokenizer_ref": "tok_4096"}
 
@@ -182,7 +305,7 @@ def test_spalmer_ui_config_continues_from_checkpoint(monkeypatch) -> None:
         tokenizer_registry_id=None,
         resolved_plan={},
         target_parameters=0,
-        attention_backend="reference",
+        attention_backend="fla",
         epochs=2,
     )
 
@@ -190,9 +313,8 @@ def test_spalmer_ui_config_continues_from_checkpoint(monkeypatch) -> None:
     assert set(config["spalmer"]) <= {
         "attention_backend",
         "require_fla",
-        "allow_reference_attention",
     }
-    assert config["spalmer"]["attention_backend"] == "reference"
+    assert config["spalmer"]["attention_backend"] == "fla"
     assert "architecture" not in config
     assert "precision" not in config
     assert config["tokenizer"] == {
@@ -236,13 +358,13 @@ def test_spalmer_ui_checkpoint_mode_normalizes(monkeypatch, tmp_path) -> None:
         tokenizer_registry_id=None,
         resolved_plan={},
         target_parameters=0,
-        attention_backend="reference",
+        attention_backend="fla",
     )
 
     normalized = normalize_spalmer_config(config, require_runtime=True)
 
     assert normalized["initialization"]["checkpoint_ref"] == str(bundle.resolve())
-    assert normalized["spalmer"] == {"attention_backend": "reference", "require_fla": False}
+    assert normalized["spalmer"] == {"attention_backend": "fla", "require_fla": True}
 
 
 def test_spalmer_checkpoint_rows_filter_by_family(monkeypatch) -> None:
@@ -305,7 +427,7 @@ def test_spalmer_ui_config_emits_recurrence_recipe(monkeypatch) -> None:
     config = _recurrent_run_config(monkeypatch)
     normalized = normalize_spalmer_config(config, require_runtime=True)
 
-    assert config["recipe_version"] == 5
+    assert config["recipe_version"] == 6
     assert config["spalmer"]["recurrence"] == {
         "enabled": True,
         "prelude_layers": 1,
@@ -363,7 +485,7 @@ def test_spalmer_ui_checkpoint_mode_recurrence_keys_follow_parent(monkeypatch) -
         "tokenizer_registry_id": None,
         "resolved_plan": {},
         "target_parameters": 0,
-        "attention_backend": "reference",
+        "attention_backend": "fla",
         "mean_recurrence": 6.0,
         "backprop_depth": 3,
         "recurrence_sigma": 0.25,
@@ -391,7 +513,7 @@ def test_spalmer_ui_checkpoint_mode_rejects_a_new_recurrent_core(monkeypatch) ->
             tokenizer_registry_id=None,
             resolved_plan={},
             target_parameters=0,
-            attention_backend="reference",
+            attention_backend="fla",
             recurrence={"enabled": True, "prelude_layers": 1, "coda_layers": 1},
         )
 
@@ -407,7 +529,8 @@ def test_plan_preview_cache_key_includes_recurrence(monkeypatch) -> None:
     train_spalmer.plan_spalmer_configuration(
         target_parameters=10_000_000,
         vocab_size=4096,
-        expert_weight_format="mxfp4",
+        expert_weight_format="bfloat16",
+        expert_activation_format="bfloat16",
         directional={"enabled": False},
         atxy={"enabled": False},
         recurrence={
@@ -421,7 +544,8 @@ def test_plan_preview_cache_key_includes_recurrence(monkeypatch) -> None:
     train_spalmer.plan_spalmer_configuration(
         target_parameters=10_000_000,
         vocab_size=4096,
-        expert_weight_format="mxfp4",
+        expert_weight_format="bfloat16",
+        expert_activation_format="bfloat16",
         directional={"enabled": False},
         atxy={"enabled": False},
     )
@@ -452,8 +576,8 @@ def test_spalmer_base_recipe_mentions_recurrence() -> None:
 
     registry_receipt = {
         "precision": {
-            "expert_weights": "mxfp4",
-            "expert_activations": "mxfp8",
+            "expert_weights": "nvfp4",
+            "expert_activations": "nvfp4",
             "master_weights": "bfloat16",
         },
         "recurrence": {
@@ -467,7 +591,7 @@ def test_spalmer_base_recipe_mentions_recurrence() -> None:
     }
     scanned_bundle = {
         "experts_config": {
-            "expert_weight_format": "nvfp4",
+            "expert_weight_format": "mxfp8",
             "expert_activation_format": "mxfp8",
             "expert_master_dtype": "bfloat16",
         },
@@ -479,7 +603,13 @@ def test_spalmer_base_recipe_mentions_recurrence() -> None:
         },
         "effective_depth": 28,
     }
-    flat = {"precision": {"expert_weights": "mxfp4"}}
+    flat = {
+        "precision": {
+            "expert_weights": "bfloat16",
+            "expert_activations": "bfloat16",
+            "master_weights": "bfloat16",
+        }
+    }
 
     assert "recurrent 1/2/1 × 8" in checkpoints._spalmer_base_recipe(registry_receipt)
     assert "recurrent 2/4/2 × 6" in checkpoints._spalmer_base_recipe(scanned_bundle)
