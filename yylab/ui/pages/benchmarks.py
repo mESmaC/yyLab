@@ -12,6 +12,7 @@ from ...benchmark.models import BenchmarkSuite, load_suite
 from ...hw import best_gpu
 from ...infer.engine import ENGINE
 from ...models.families import checkpoint_family
+from ...models.spalmer import recurrence_metadata
 from ...workers.launch import launch_worker
 from ..components import empty_state, field_grid, form_section, hint, status_badge
 from ..shell import ACCENT, panel, shell, stat_card
@@ -35,6 +36,24 @@ QUALITY_CONTEXT_MODES = {
     "yarn_2x": ("yarn", 2.0, 65_536),
     "yarn_4x": ("yarn", 4.0, 131_072),
 }
+SPALMER_ADAPTIVE_EXIT_LABELS = {
+    "none": "Fixed depth",
+    "latent_diff": "Adaptive · latent change",
+    "kl": "Adaptive · output KL",
+}
+SPALMER_ADAPTIVE_EXITS = frozenset(SPALMER_ADAPTIVE_EXIT_LABELS)
+
+
+def _checkpoint_is_recurrent(row: dict | None) -> bool:
+    """Return whether a registry row records a recurrent SPALMER core."""
+
+    if not row:
+        return False
+    try:
+        meta = json.loads(row.get("meta_json") or "{}")
+    except (TypeError, ValueError):
+        return False
+    return recurrence_metadata(meta if isinstance(meta, dict) else None) is not None
 
 
 class ActiveRunError(RuntimeError):
@@ -86,6 +105,10 @@ def _quality_job_config(
     context_mode: str = "native",
     continue_on_error: bool = True,
     spalmer_expert_cache_size: int | None = None,
+    spalmer_recurrence_steps: int | None = None,
+    spalmer_adaptive_exit: str = "none",
+    spalmer_exit_threshold: float | None = None,
+    spalmer_warm_start: bool = False,
 ) -> dict[str, Any]:
     """Build the stable worker contract without training-artifact status fields."""
 
@@ -130,6 +153,18 @@ def _quality_job_config(
     if model_family == "spalmer":
         if spalmer_expert_cache_size is not None and spalmer_expert_cache_size <= 0:
             raise ValueError("spalmer_expert_cache_size must be positive")
+        if spalmer_recurrence_steps is not None and spalmer_recurrence_steps <= 0:
+            raise ValueError("spalmer_recurrence_steps must be positive")
+        if spalmer_adaptive_exit not in SPALMER_ADAPTIVE_EXITS:
+            raise ValueError(f"unknown SPALMER adaptive exit: {spalmer_adaptive_exit}")
+        if spalmer_exit_threshold is not None and spalmer_exit_threshold <= 0:
+            raise ValueError("spalmer_exit_threshold must be positive")
+        config.update(
+            spalmer_recurrence_steps=spalmer_recurrence_steps,
+            spalmer_adaptive_exit=spalmer_adaptive_exit,
+            spalmer_exit_threshold=spalmer_exit_threshold,
+            spalmer_warm_start=bool(spalmer_warm_start),
+        )
         config.update(
             spalmer_expert_offload=True,
             # The stable "base" policy now means the checkpoint's trained
@@ -306,6 +341,13 @@ def _quality_contract_text(config: dict[str, Any]) -> str:
             else "legacy request-global (experimental)"
         )
         text += f" · {mode} expert offload ({cap} cap)"
+        steps = config.get("spalmer_recurrence_steps")
+        text += f" · depth {int(steps) if steps else 'checkpoint'}"
+        criterion = str(config.get("spalmer_adaptive_exit") or "none")
+        if criterion != "none":
+            text += f" adaptive {criterion}"
+        if config.get("spalmer_warm_start"):
+            text += " warm"
     return text
 
 
@@ -797,6 +839,43 @@ def benchmarks_page() -> None:
                         .classes("w-full")
                     )
                     spalmer_cache_size.visible = False
+                    spalmer_recurrence_steps = (
+                        ui.number(
+                            "SPALMER recurrence steps (0 = checkpoint default)",
+                            value=0,
+                            min=0,
+                            max=256,
+                            step=1,
+                        )
+                        .props("dense outlined")
+                        .classes("w-full")
+                    )
+                    spalmer_recurrence_steps.visible = False
+                    spalmer_adaptive_exit = (
+                        ui.select(
+                            SPALMER_ADAPTIVE_EXIT_LABELS,
+                            value="none",
+                            label="Recurrence exit",
+                        )
+                        .props("dense outlined")
+                        .classes("w-full")
+                    )
+                    spalmer_adaptive_exit.visible = False
+                    spalmer_exit_threshold = (
+                        ui.number(
+                            "Exit threshold (0 = criterion default)",
+                            value=0,
+                            min=0,
+                            step=1e-4,
+                        )
+                        .props("dense outlined")
+                        .classes("w-full")
+                    )
+                    spalmer_exit_threshold.visible = False
+                    spalmer_warm_start = ui.checkbox(
+                        "Warm-start latent from previous token", value=False
+                    )
+                    spalmer_warm_start.visible = False
                     thinking_budget.visible = False
                     baselines = {"": "(none)"}
                     for row in db.q(
@@ -1026,6 +1105,11 @@ def benchmarks_page() -> None:
                     "expert": "One forced expert",
                 }
             spalmer_cache_size.visible = spalmer
+            recurrent = spalmer and _checkpoint_is_recurrent(selected_checkpoint)
+            spalmer_recurrence_steps.visible = recurrent
+            spalmer_adaptive_exit.visible = recurrent
+            spalmer_exit_threshold.visible = recurrent
+            spalmer_warm_start.visible = recurrent
             policy.update()
             update_quality_controls()
 
@@ -1107,6 +1191,18 @@ def benchmarks_page() -> None:
                 spalmer_expert_cache_size=(
                     int(spalmer_cache_size.value)
                     if int(spalmer_cache_size.value or 0) > 0
+                    else None
+                ),
+                spalmer_recurrence_steps=(
+                    int(spalmer_recurrence_steps.value)
+                    if int(spalmer_recurrence_steps.value or 0) > 0
+                    else None
+                ),
+                spalmer_adaptive_exit=str(spalmer_adaptive_exit.value or "none"),
+                spalmer_warm_start=bool(spalmer_warm_start.value),
+                spalmer_exit_threshold=(
+                    float(spalmer_exit_threshold.value)
+                    if float(spalmer_exit_threshold.value or 0) > 0
                     else None
                 ),
             )

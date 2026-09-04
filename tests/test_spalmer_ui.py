@@ -101,7 +101,7 @@ def test_spalmer_ui_config_preserves_canonical_architecture_and_budget(monkeypat
     normalized = normalize_spalmer_config(config, require_runtime=True)
 
     assert config["architecture_type"] == "spalmer_v1"
-    assert config["recipe_version"] == 3
+    assert config["recipe_version"] == 4
     assert config["model_family"] == "spalmer"
     assert config["initialization"] == {
         "mode": "scratch",
@@ -158,7 +158,7 @@ def test_spalmer_ui_rejects_unimplemented_activation_checkpointing(monkeypatch) 
 def test_spalmer_ui_config_carries_epochs_for_scratch_runs(monkeypatch) -> None:
     config = _run_config(monkeypatch, epochs=3)
 
-    assert config["recipe_version"] == 3
+    assert config["recipe_version"] == 4
     assert config["epochs"] == 3
     assert config["initialization"] == {"mode": "scratch", "tokenizer_ref": "tok_4096"}
 
@@ -266,3 +266,224 @@ def test_parent_plan_reads_nested_and_flat_metadata() -> None:
     assert train_spalmer._parent_plan(flat)["fingerprint"] == "f"
     assert train_spalmer._parent_plan(nested)["fingerprint"] == "n"
     assert train_spalmer._parent_plan({}) == {}
+
+
+def _recurrent_plan() -> dict:
+    plan = _resolved_plan()
+    plan["recurrence"] = {
+        "prelude_layers": 1,
+        "core_layers": 6,
+        "coda_layers": 1,
+        "default_steps": 8,
+        "effective_depth": 50,
+        "core_mixers": {"kda": 5, "mla": 1},
+    }
+    return plan
+
+
+def _recurrent_run_config(monkeypatch, **overrides):
+    values = {
+        "resolved_plan": _recurrent_plan(),
+        "recurrence": {
+            "enabled": True,
+            "prelude_layers": 1,
+            "coda_layers": 1,
+            "default_steps": 8,
+            "latent_init_std": 1.0,
+        },
+        "mean_recurrence": 8.0,
+        "backprop_depth": 4,
+        "recurrence_sigma": 0.5,
+    }
+    values.update(overrides)
+    return _run_config(monkeypatch, **values)
+
+
+def test_spalmer_ui_config_emits_recurrence_recipe(monkeypatch) -> None:
+    from yylab.train.spalmer import normalize_spalmer_config
+
+    config = _recurrent_run_config(monkeypatch)
+    normalized = normalize_spalmer_config(config, require_runtime=True)
+
+    assert config["recipe_version"] == 4
+    assert config["spalmer"]["recurrence"] == {
+        "enabled": True,
+        "prelude_layers": 1,
+        "coda_layers": 1,
+        "default_steps": 8,
+        "latent_init_std": 1.0,
+    }
+    assert config["training"]["mean_recurrence"] == 8.0
+    assert config["training"]["mean_backprop_depth"] == 4
+    assert config["training"]["recurrence_sigma"] == 0.5
+    assert config["training"]["recurrence_sampling"] == "poisson_lognormal"
+    assert config["mean_recurrence"] == 8.0
+    assert config["mean_backprop_depth"] == 4
+    assert config["recurrence_sigma"] == 0.5
+    assert normalized["spalmer"]["recurrence"]["enabled"] is True
+    assert normalized["recurrence_sampling"] == "poisson_lognormal"
+
+
+def test_spalmer_ui_config_omits_recurrence_when_disabled(monkeypatch) -> None:
+    config = _run_config(monkeypatch)
+
+    assert config["spalmer"]["recurrence"] == {"enabled": False}
+    assert "mean_recurrence" not in config
+    assert "mean_recurrence" not in config["training"]
+
+
+def test_spalmer_ui_config_rejects_inconsistent_recurrence(monkeypatch) -> None:
+    with pytest.raises(ValueError, match="plan is not recurrent"):
+        _recurrent_run_config(monkeypatch, resolved_plan=_resolved_plan())
+    with pytest.raises(ValueError, match="at least one layer beyond"):
+        _recurrent_run_config(
+            monkeypatch,
+            recurrence={
+                "enabled": True,
+                "prelude_layers": 4,
+                "coda_layers": 4,
+                "default_steps": 8,
+            },
+        )
+    with pytest.raises(ValueError, match="at least one block each"):
+        _recurrent_run_config(
+            monkeypatch,
+            recurrence={"enabled": True, "prelude_layers": 0, "coda_layers": 1},
+        )
+    with pytest.raises(ValueError, match="recurrent-depth architecture"):
+        _run_config(monkeypatch, mean_recurrence=8.0)
+
+
+def test_spalmer_ui_checkpoint_mode_recurrence_keys_follow_parent(monkeypatch) -> None:
+    checkpoint_values = {
+        "initialization_mode": "checkpoint",
+        "parent_checkpoint_id": "ckpt_parent",
+        "tokenizer_ref": "",
+        "tokenizer_source": "checkpoint",
+        "tokenizer_registry_id": None,
+        "resolved_plan": {},
+        "target_parameters": 0,
+        "attention_backend": "reference",
+        "mean_recurrence": 6.0,
+        "backprop_depth": 3,
+        "recurrence_sigma": 0.25,
+    }
+    inherited = _run_config(monkeypatch, parent_recurrent=True, **checkpoint_values)
+    flat = _run_config(monkeypatch, parent_recurrent=False, **checkpoint_values)
+
+    assert inherited["training"]["mean_recurrence"] == 6.0
+    assert inherited["training"]["mean_backprop_depth"] == 3
+    assert inherited["training"]["recurrence_sigma"] == 0.25
+    assert inherited["mean_recurrence"] == 6.0
+    assert "recurrence" not in inherited["spalmer"]
+    assert "mean_recurrence" not in flat["training"]
+    assert "mean_recurrence" not in flat
+
+
+def test_spalmer_ui_checkpoint_mode_rejects_a_new_recurrent_core(monkeypatch) -> None:
+    with pytest.raises(ValueError, match="inherits the recurrent core"):
+        _run_config(
+            monkeypatch,
+            initialization_mode="checkpoint",
+            parent_checkpoint_id="ckpt_parent",
+            tokenizer_ref="",
+            tokenizer_source="checkpoint",
+            tokenizer_registry_id=None,
+            resolved_plan={},
+            target_parameters=0,
+            attention_backend="reference",
+            recurrence={"enabled": True, "prelude_layers": 1, "coda_layers": 1},
+        )
+
+
+def test_plan_preview_cache_key_includes_recurrence(monkeypatch) -> None:
+    seen: list[tuple] = []
+    monkeypatch.setattr(
+        train_spalmer,
+        "_cached_plan_json",
+        lambda *args: seen.append(args) or "{}",
+    )
+
+    train_spalmer.plan_spalmer_configuration(
+        target_parameters=10_000_000,
+        vocab_size=4096,
+        expert_weight_format="mxfp4",
+        directional={"enabled": False},
+        atxy={"enabled": False},
+        recurrence={
+            "enabled": True,
+            "prelude_layers": 2,
+            "coda_layers": 3,
+            "default_steps": 5,
+            "latent_init_std": 0.0,
+        },
+    )
+    train_spalmer.plan_spalmer_configuration(
+        target_parameters=10_000_000,
+        vocab_size=4096,
+        expert_weight_format="mxfp4",
+        directional={"enabled": False},
+        atxy={"enabled": False},
+    )
+
+    assert seen[0][-5:] == (True, 2, 3, 5, 0.0)
+    assert seen[1][-5:] == (False, 1, 1, 8, 1.0)
+
+
+def test_checkpoint_recurrence_reads_every_metadata_shape() -> None:
+    run_row = {"meta_json": '{"recurrence": {"prelude_layers": 1, "core_layers": 2}}'}
+    scanned_row = {"meta_json": '{"recurrence_config": {"core_layers": 4}}'}
+    nested_row = {"meta_json": '{"metadata": {"recurrence": {"core_layers": 6}}}'}
+
+    assert train_spalmer._checkpoint_recurrence(run_row)["core_layers"] == 2
+    assert train_spalmer._checkpoint_recurrence(scanned_row)["core_layers"] == 4
+    assert train_spalmer._checkpoint_recurrence(nested_row)["core_layers"] == 6
+    assert train_spalmer._checkpoint_recurrence({"meta_json": "{}"}) is None
+    assert train_spalmer._checkpoint_recurrence({"meta_json": "not json"}) is None
+    # A scratch recipe records the disabled block verbatim; it is not a core.
+    assert (
+        train_spalmer._checkpoint_recurrence({"meta_json": '{"recurrence": {"enabled": false}}'})
+        is None
+    )
+
+
+def test_spalmer_base_recipe_mentions_recurrence() -> None:
+    from yylab.ui.pages import checkpoints
+
+    registry_receipt = {
+        "precision": {
+            "expert_weights": "mxfp4",
+            "expert_activations": "mxfp8",
+            "master_weights": "bfloat16",
+        },
+        "recurrence": {
+            "prelude_layers": 1,
+            "core_layers": 2,
+            "coda_layers": 1,
+            "default_steps": 8,
+            "effective_depth": 18,
+        },
+        "effective_depth": 18,
+    }
+    scanned_bundle = {
+        "experts_config": {
+            "expert_weight_format": "nvfp4",
+            "expert_activation_format": "mxfp8",
+            "expert_master_dtype": "bfloat16",
+        },
+        "recurrence_config": {
+            "prelude_layers": 2,
+            "core_layers": 4,
+            "coda_layers": 2,
+            "default_steps": 6,
+        },
+        "effective_depth": 28,
+    }
+    flat = {"precision": {"expert_weights": "mxfp4"}}
+
+    assert "recurrent 1/2/1 × 8" in checkpoints._spalmer_base_recipe(registry_receipt)
+    assert "recurrent 2/4/2 × 6" in checkpoints._spalmer_base_recipe(scanned_bundle)
+    assert "recurrent" not in checkpoints._spalmer_base_recipe(flat)
+    assert checkpoints._spalmer_effective_depth(registry_receipt) == 18
+    assert checkpoints._spalmer_effective_depth(scanned_bundle) == 28
+    assert checkpoints._spalmer_effective_depth(flat) is None

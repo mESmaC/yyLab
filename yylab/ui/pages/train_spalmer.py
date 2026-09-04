@@ -26,7 +26,7 @@ from ..shell import ACCENT, panel, shell
 from .train_mole import corpus_options
 
 SPALMER_RUN_KIND = "spalmer_base"
-SPALMER_RECIPE_VERSION = 3
+SPALMER_RECIPE_VERSION = 4
 DEFAULT_SOURCE_SPLITS = ("train", "unspecified")
 PARAMETER_TARGETS = {
     "10M": 10_000_000,
@@ -89,6 +89,38 @@ def _parent_plan(meta: Mapping[str, Any]) -> dict[str, Any]:
     return dict(plan) if isinstance(plan, Mapping) else {}
 
 
+def _checkpoint_recurrence(row: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Read a checkpoint's recurrent-core block from either metadata shape.
+
+    Run-produced rows carry ``recurrence`` at the top of ``meta_json``; a bundle
+    registered through the scanner carries ``recurrence_config`` there and the
+    original block under the bundle's own ``metadata``.
+    """
+
+    meta: Any = row.get("meta_json", row) if isinstance(row, Mapping) else None
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta or "{}")
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(meta, Mapping):
+        return None
+    nested = meta.get("metadata")
+    candidates = (
+        meta.get("recurrence"),
+        meta.get("recurrence_config"),
+        nested.get("recurrence") if isinstance(nested, Mapping) else None,
+    )
+    for block in candidates:
+        if not isinstance(block, Mapping) or not block:
+            continue
+        # A scratch recipe carries `{"enabled": False}` for a flat model.
+        if block.get("enabled") is False:
+            continue
+        return dict(block)
+    return None
+
+
 def _resolve_budget(
     *,
     token_budget: int,
@@ -140,6 +172,11 @@ def _cached_plan_json(
     atxy_x_cardinality: int,
     atxy_y_cardinality: int,
     atxy_injection_layer: int,
+    recurrence_enabled: bool,
+    recurrence_prelude: int,
+    recurrence_coda: int,
+    recurrence_default_steps: int,
+    recurrence_latent_init_std: float,
 ) -> str:
     """Run the construction-free SPALMER planner behind a lazy import."""
 
@@ -147,6 +184,7 @@ def _cached_plan_json(
         from spalmer.experiment.planning import (
             ATXYScaleConfig,
             DirectionalScaleConfig,
+            RecurrenceScaleConfig,
             plan_configuration,
         )
     except (ImportError, ModuleNotFoundError) as exc:
@@ -175,12 +213,23 @@ def _cached_plan_json(
         if atxy_enabled
         else None
     )
+    recurrence = (
+        RecurrenceScaleConfig(
+            prelude_layers=recurrence_prelude,
+            coda_layers=recurrence_coda,
+            default_steps=recurrence_default_steps,
+            latent_init_std=recurrence_latent_init_std,
+        )
+        if recurrence_enabled
+        else None
+    )
     plan = plan_configuration(
         target_parameters,
         vocab_size,
         expert_weight_format=expert_weight_format,
         directional=directional,
         atxy=atxy,
+        recurrence=recurrence,
     )
     return json.dumps(plan.to_dict(), sort_keys=True, separators=(",", ":"))
 
@@ -192,6 +241,7 @@ def plan_spalmer_configuration(
     expert_weight_format: str,
     directional: dict[str, Any],
     atxy: dict[str, Any],
+    recurrence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return a JSON-safe plan without constructing a model or allocating weights."""
 
@@ -205,6 +255,8 @@ def plan_spalmer_configuration(
         raise ValueError("expert weights must use MXFP4 or NVFP4")
     directional_enabled = bool(directional.get("enabled"))
     atxy_enabled = bool(atxy.get("enabled"))
+    recurrence_values = dict(recurrence or {})
+    recurrence_enabled = bool(recurrence_values.get("enabled"))
     payload = _cached_plan_json(
         target,
         vocabulary,
@@ -219,6 +271,15 @@ def plan_spalmer_configuration(
         int(atxy.get("x_cardinality") or 0) if atxy_enabled else 1,
         int(atxy.get("y_cardinality") or 0) if atxy_enabled else 1,
         int(atxy.get("injection_layer") or 0),
+        recurrence_enabled,
+        int(recurrence_values.get("prelude_layers") or 1),
+        int(recurrence_values.get("coda_layers") or 1),
+        int(recurrence_values.get("default_steps") or 8),
+        float(
+            1.0
+            if recurrence_values.get("latent_init_std") is None
+            else recurrence_values["latent_init_std"]
+        ),
     )
     return json.loads(payload)
 
@@ -342,6 +403,11 @@ def build_spalmer_run_config(
     initialization_mode: str = "scratch",
     parent_checkpoint_id: str | None = None,
     epochs: int = 1,
+    recurrence: dict[str, Any] | None = None,
+    mean_recurrence: float | None = None,
+    backprop_depth: int | None = None,
+    recurrence_sigma: float | None = None,
+    parent_recurrent: bool = False,
 ) -> dict[str, Any]:
     """Build the durable UI/worker boundary for one SPALMER scratch or continued run."""
 
@@ -425,6 +491,59 @@ def build_spalmer_run_config(
         if expert_qat_backend == "native" and not qat_status["native_w4a8_available"]:
             raise ValueError(str(qat_status["detail"]))
 
+    recurrence_payload = dict(recurrence or {})
+    recurrence_requested = bool(recurrence_payload.get("enabled"))
+    training_recurrence_requested = any(
+        value is not None
+        for value in (mean_recurrence, backprop_depth, recurrence_sigma)
+    )
+    if continuing:
+        if recurrence_requested:
+            raise ValueError(
+                "continued SPALMER training inherits the recurrent core from the "
+                "parent checkpoint"
+            )
+        recurrent = bool(parent_recurrent)
+    else:
+        recurrent = recurrence_requested
+        if not recurrent and training_recurrence_requested:
+            raise ValueError(
+                "recurrence training values require the recurrent-depth architecture"
+            )
+        if recurrent:
+            prelude_layers = int(recurrence_payload.get("prelude_layers") or 0)
+            coda_layers = int(recurrence_payload.get("coda_layers") or 0)
+            default_steps = int(recurrence_payload.get("default_steps") or 0)
+            if prelude_layers < 1 or coda_layers < 1:
+                raise ValueError(
+                    "the recurrent prelude and coda need at least one block each"
+                )
+            if default_steps < 1:
+                raise ValueError("default inference steps must be positive")
+            planned_layers = int(dict(resolved_plan.get("config") or {}).get("n_layers") or 0)
+            if planned_layers <= prelude_layers + coda_layers:
+                raise ValueError(
+                    "the recurrent core needs at least one layer beyond the prelude "
+                    "and coda"
+                )
+            if not isinstance(resolved_plan.get("recurrence"), Mapping):
+                raise ValueError("resolved SPALMER plan is not recurrent")
+    resolved_mean_recurrence: float | None = None
+    resolved_backprop_depth: int | None = None
+    resolved_recurrence_sigma: float | None = None
+    if recurrent:
+        resolved_mean_recurrence = float(8.0 if mean_recurrence is None else mean_recurrence)
+        resolved_backprop_depth = int(4 if backprop_depth is None else backprop_depth)
+        resolved_recurrence_sigma = float(
+            0.5 if recurrence_sigma is None else recurrence_sigma
+        )
+        if resolved_mean_recurrence < 1:
+            raise ValueError("mean recurrence must be at least 1")
+        if resolved_backprop_depth < 1:
+            raise ValueError("backprop depth must be at least 1")
+        if resolved_recurrence_sigma < 0:
+            raise ValueError("recurrence sigma cannot be negative")
+
     atxy_payload = dict(atxy)
     if atxy_payload.get("enabled"):
         for field in (
@@ -478,6 +597,17 @@ def build_spalmer_run_config(
         "expert_qat_backend": expert_qat_backend,
         "directional": dict(directional),
         "atxy": atxy_payload,
+        "recurrence": (
+            {
+                "enabled": True,
+                "prelude_layers": int(recurrence_payload.get("prelude_layers") or 1),
+                "coda_layers": int(recurrence_payload.get("coda_layers") or 1),
+                "default_steps": int(recurrence_payload.get("default_steps") or 8),
+                "latent_init_std": 1.0,
+            }
+            if recurrence_requested
+            else {"enabled": False}
+        ),
         "experts": experts,
         "plan_fingerprint": fingerprint,
         "resolved_plan": resolved_plan,
@@ -518,6 +648,15 @@ def build_spalmer_run_config(
         "checkpoint_interval_steps": int(save_every),
         "telemetry_interval_steps": int(log_every),
     }
+    recurrence_training: dict[str, Any] = {}
+    if recurrent:
+        recurrence_training = {
+            "mean_recurrence": resolved_mean_recurrence,
+            "mean_backprop_depth": resolved_backprop_depth,
+            "recurrence_sigma": resolved_recurrence_sigma,
+            "recurrence_sampling": "poisson_lognormal",
+        }
+        training.update(recurrence_training)
     if continuing:
         initialization = {"mode": "checkpoint", "checkpoint_id": parent_id}
         tokenizer = {
@@ -599,6 +738,17 @@ def build_spalmer_run_config(
         "log_every": int(log_every),
         "save_every": int(save_every),
         "activation_checkpointing": False,
+        # Root aliases so a replayed recipe keeps the depth policy even when
+        # only the flat keys are read.
+        **(
+            {
+                "mean_recurrence": resolved_mean_recurrence,
+                "mean_backprop_depth": resolved_backprop_depth,
+                "recurrence_sigma": resolved_recurrence_sigma,
+            }
+            if recurrent
+            else {}
+        ),
         **budget,
     }
 
@@ -850,6 +1000,35 @@ def train_spalmer_page() -> None:
                             "This allocates the native ATXY component. Training only exercises it when the "
                             "worker receives numeric addresses, a mask, and a versioned ATXY store."
                         )
+                    recurrence_enabled = ui.switch(
+                        "Recurrent depth (Huginn-style latent reasoning)", value=False
+                    )
+                    with ui.column().classes("w-full gap-2") as recurrence_controls:
+                        with field_grid(3):
+                            recurrence_prelude = (
+                                ui.number("Prelude blocks", value=1, min=1, precision=0)
+                                .props("dense outlined")
+                                .classes("w-full")
+                            )
+                            recurrence_coda = (
+                                ui.number("Coda blocks", value=1, min=1, precision=0)
+                                .props("dense outlined")
+                                .classes("w-full")
+                            )
+                            recurrence_default_steps = (
+                                ui.number(
+                                    "Default inference steps", value=8, min=1, precision=0
+                                )
+                                .props("dense outlined")
+                                .classes("w-full")
+                            )
+                        hint(
+                            "The blocks between the prelude and the coda become one core that is "
+                            "iterated r times per forward, so compute scales with r while the "
+                            "parameter count only grows by the latent adapter. The checkpoint "
+                            "records the default inference depth, and the paged expert cache is "
+                            "re-staged every iteration — size it to the union of the core routes."
+                        )
                     ui.label(
                         "Canonical expert policy: 200 coherent identities · training top-k 2 · "
                         "request residency 2–20 · grouped execution · BF16 master / "
@@ -1016,6 +1195,29 @@ def train_spalmer_page() -> None:
                         .props("dense outlined")
                         .classes("w-full")
                     )
+                with ui.column().classes("w-full gap-2") as recurrence_training_controls:
+                    with field_grid(3):
+                        mean_recurrence = (
+                            ui.number("Mean recurrence r̄", value=8.0, min=1, step=0.5)
+                            .props("dense outlined")
+                            .classes("w-full")
+                        )
+                        backprop_depth = (
+                            ui.number("Backprop depth k", value=4, min=1, precision=0)
+                            .props("dense outlined")
+                            .classes("w-full")
+                        )
+                        recurrence_sigma = (
+                            ui.number("Recurrence sigma", value=0.5, min=0, step=0.1)
+                            .props("dense outlined")
+                            .classes("w-full")
+                        )
+                    hint(
+                        "Each optimizer step samples one iteration count r from a log-normal "
+                        "Poisson with mean r̄, and backpropagates through only the last k "
+                        "iterations, so activation memory stays bounded while the model learns "
+                        "to keep iterating. r̄ = 1 degenerates to a plain stack."
+                    )
                 with ui.expansion("Advanced optimizer and losses", icon="tune").classes(
                     "w-full"
                 ):
@@ -1104,6 +1306,15 @@ def train_spalmer_page() -> None:
                 "injection_layer": int(atxy_layer.value or 0),
             }
 
+        def current_recurrence() -> dict[str, Any]:
+            return {
+                "enabled": bool(recurrence_enabled.value),
+                "prelude_layers": int(recurrence_prelude.value or 1),
+                "coda_layers": int(recurrence_coda.value or 1),
+                "default_steps": int(recurrence_default_steps.value or 8),
+                "latent_init_std": 1.0,
+            }
+
         def requested_target() -> int:
             return _resolve_target(str(target_scale.value or "10M"), custom_target.value)
 
@@ -1122,11 +1333,26 @@ def train_spalmer_page() -> None:
         def selected_parent() -> dict[str, Any] | None:
             return parent_rows.get(str(parent_checkpoint.value or ""))
 
+        def parent_recurrence() -> dict[str, Any] | None:
+            parent = selected_parent()
+            return None if parent is None else _checkpoint_recurrence(parent)
+
+        def recurrent_run() -> bool:
+            if continuing():
+                return parent_recurrence() is not None
+            return bool(recurrence_enabled.value)
+
         def update_initialization_controls() -> None:
             parent_checkpoint.visible = continuing()
             parent_hint.visible = continuing()
             tokenizer_controls.visible = not continuing()
             architecture_section.visible = not continuing()
+            recurrence_training_controls.visible = recurrent_run()
+            update_plan_preview()
+
+        def update_recurrence_controls() -> None:
+            recurrence_controls.visible = bool(recurrence_enabled.value)
+            recurrence_training_controls.visible = recurrent_run()
             update_plan_preview()
 
         def set_corpora_selection(value: str | Iterable[str] | None) -> None:
@@ -1218,6 +1444,17 @@ def train_spalmer_page() -> None:
                         f"parameters · d={int(parent.get('hidden_size') or 0):,} · "
                         f"{int(parent.get('num_layers') or 0)} layers"
                     ).classes("text-sm text-gray-200")
+                    inherited_recurrence = _checkpoint_recurrence(parent)
+                    if inherited_recurrence:
+                        steps = int(inherited_recurrence.get("default_steps") or 0)
+                        prelude = int(inherited_recurrence.get("prelude_layers") or 0)
+                        core = int(inherited_recurrence.get("core_layers") or 0)
+                        coda = int(inherited_recurrence.get("coda_layers") or 0)
+                        ui.label(
+                            f"recurrent: prelude {prelude} · core {core} · coda {coda} · "
+                            f"effective depth {prelude}+{core}×{steps}+{coda} = "
+                            f"{prelude + core * steps + coda} at {steps} steps"
+                        ).classes("text-sm text-teal-200")
                     ui.label(
                         f"Plan {str(parent_plan.get('fingerprint') or '')[:16]}… · tokenizer and "
                         "expert numerics come from the bundle."
@@ -1230,6 +1467,7 @@ def train_spalmer_page() -> None:
                         expert_weight_format=str(expert_weight_format.value or "mxfp4"),
                         directional=current_directional(),
                         atxy=current_atxy(),
+                        recurrence=current_recurrence(),
                     )
                 except (RuntimeError, TypeError, ValueError) as exc:
                     ui.label(str(exc)).classes("text-sm text-red-300")
@@ -1259,6 +1497,29 @@ def train_spalmer_page() -> None:
                     f"{int(config['shared_width']):,} · KDA {int(config['n_layers']) * 3 // 4} / "
                     f"MLA {int(config['n_layers']) // 4}"
                 ).classes("text-sm text-gray-300")
+                recurrence_plan = plan.get("recurrence")
+                if isinstance(recurrence_plan, Mapping):
+                    core_mixers = dict(recurrence_plan.get("core_mixers") or {})
+                    prelude = int(recurrence_plan.get("prelude_layers") or 0)
+                    core = int(recurrence_plan.get("core_layers") or 0)
+                    coda = int(recurrence_plan.get("coda_layers") or 0)
+                    steps = int(recurrence_plan.get("default_steps") or 0)
+                    depth = int(
+                        recurrence_plan.get("effective_depth")
+                        or prelude + core * steps + coda
+                    )
+                    adapter = int(
+                        parameters.get("recurrence")
+                        or parameters.get("recurrence_adapter")
+                        or 0
+                    )
+                    ui.label(
+                        f"recurrent: prelude {prelude} · core {core} "
+                        f"({int(core_mixers.get('kda') or 0)} KDA / "
+                        f"{int(core_mixers.get('mla') or 0)} MLA) · coda {coda} · "
+                        f"effective depth {prelude}+{core}×{steps}+{coda} = {depth} "
+                        f"at {steps} steps · adapter {_format_parameters(adapter)}"
+                    ).classes("text-sm text-teal-200")
                 ui.label(
                     f"BF16-master reference persistent state: "
                     f"{float(memory['reference_training_gib']):.3f} GiB; activations are not included."
@@ -1392,6 +1653,7 @@ def train_spalmer_page() -> None:
             if data_check["errors"]:
                 ui.notify("; ".join(data_check["errors"]), type="negative", multi_line=True)
                 return
+            inherited_recurrence = parent_recurrence() if continuing() else None
             try:
                 if continuing():
                     plan = _parent_plan(json.loads(parent.get("meta_json") or "{}"))
@@ -1402,6 +1664,7 @@ def train_spalmer_page() -> None:
                         expert_weight_format=str(expert_weight_format.value or "mxfp4"),
                         directional=current_directional(),
                         atxy=current_atxy(),
+                        recurrence=current_recurrence(),
                     )
                 checkpoint_id = db.new_id("ckpt")
                 config = build_spalmer_run_config(
@@ -1450,6 +1713,19 @@ def train_spalmer_page() -> None:
                     initialization_mode="checkpoint" if continuing() else "scratch",
                     parent_checkpoint_id=str(parent["id"]) if parent else None,
                     epochs=int(epochs.value or 1),
+                    recurrence=(
+                        {"enabled": False} if continuing() else current_recurrence()
+                    ),
+                    mean_recurrence=(
+                        float(mean_recurrence.value or 0) if recurrent_run() else None
+                    ),
+                    backprop_depth=(
+                        int(backprop_depth.value or 0) if recurrent_run() else None
+                    ),
+                    recurrence_sigma=(
+                        float(recurrence_sigma.value or 0) if recurrent_run() else None
+                    ),
+                    parent_recurrent=bool(inherited_recurrence),
                 )
             except (RuntimeError, TypeError, ValueError) as exc:
                 ui.notify(str(exc), type="negative", multi_line=True)
@@ -1472,6 +1748,11 @@ def train_spalmer_page() -> None:
                 "plan_fingerprint": str(plan.get("fingerprint") or ""),
                 "tokenizer": config["tokenizer"],
                 "spalmer": config["spalmer"],
+                "recurrence": (
+                    inherited_recurrence
+                    if continuing()
+                    else config["spalmer"].get("recurrence")
+                ),
             }
             run_id = db.new_id("run")
             now = db.now_iso()
@@ -1533,6 +1814,7 @@ def train_spalmer_page() -> None:
         expert_qat_backend.on_value_change(lambda _: update_backend_status())
         directional_enabled.on_value_change(lambda _: update_directional_controls())
         atxy_enabled.on_value_change(lambda _: update_atxy_controls())
+        recurrence_enabled.on_value_change(lambda _: update_recurrence_controls())
         for element in (
             custom_target,
             directional_groups,
@@ -1543,6 +1825,9 @@ def train_spalmer_page() -> None:
             atxy_x,
             atxy_y,
             atxy_layer,
+            recurrence_prelude,
+            recurrence_coda,
+            recurrence_default_steps,
         ):
             element.on_value_change(lambda _: update_plan_preview())
         corpora_select.on_value_change(lambda _: update_mix_controls())
@@ -1555,12 +1840,13 @@ def train_spalmer_page() -> None:
             element.on_value_change(lambda _: update_budget_summary())
         start_button.on_click(on_start)
         initialization_mode.on_value_change(lambda _: update_initialization_controls())
-        parent_checkpoint.on_value_change(lambda _: update_plan_preview())
+        parent_checkpoint.on_value_change(lambda _: update_initialization_controls())
         epochs.on_value_change(lambda _: update_budget_summary())
 
         update_target_controls()
         update_directional_controls()
         update_atxy_controls()
+        update_recurrence_controls()
         update_backend_status()
         update_mix_controls()
         update_budget_summary()

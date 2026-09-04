@@ -631,6 +631,62 @@ legacy batch-4 router step used 2.47 GB allocated / 2.77 GB reserved. The older
 RTX 2050 (4 GB) validation remains Qwen2.5-0.5B-Instruct NF4 with sequential
 E4/r8/k2 expert training followed by shared-prompt stage 2.
 
+### SPALMER recurrent depth
+
+The `spalmer_base` run kind can allocate a depth-recurrent core (Huginn-style
+latent reasoning). The physical block stack is split into a prelude of `P`
+blocks, a core of `C` blocks that is iterated `r` times per forward, and a coda
+of `K` blocks; `P + C + K == n_layers` and SPALMER rejects any other split. The
+core carries a latent `s` between iterations through a `Linear(2d → d)` adapter
+over `cat[s, prelude_output]`, so depth costs compute, not parameters — the only
+new weights are that adapter plus two RMSNorms.
+
+Recipe (`spalmer.recurrence`, plan-driving, scratch runs only; the parent bundle
+owns it for continued runs):
+
+```json
+{"enabled": true, "prelude_layers": 1, "coda_layers": 1,
+ "default_steps": 8, "latent_init_std": 1.0}
+```
+
+`core_layers` is never submitted: the authoritative plan derives it from the
+selected `n_layers`, and a shape that leaves no core block is refused. Training
+keys live under `training` and are mirrored to the recipe root like every other
+alias: `mean_recurrence` (r̄, required whenever a core exists),
+`mean_backprop_depth` (k, default 4), `recurrence_sigma` (default 0.5),
+`recurrence_sampling` (`poisson_lognormal` | `uniform` | `fixed`), and the
+optional `max_recurrence` cap. Each optimizer step samples one `r` from a
+log-normal Poisson with expectation r̄ and backpropagates through only the last
+`k` iterations, so activation memory stays bounded. Setting any of these keys
+without a recurrent core — or omitting `mean_recurrence` with one — fails
+closed, in `normalize_spalmer_config` for scratch runs and in
+`_prepare_checkpoint_run` (after the parent is loaded) for continued ones.
+Continued training accepts bundle format versions 5 and 6; a v5 bundle simply
+has no recurrence block and loads as a flat stack.
+
+Telemetry: `progress.json` and `metrics.jsonl` rows carry `recurrence_steps`,
+`backprop_steps`, `effective_depth`, `latent_delta_final`, and
+`latent_position_correlation` (all `None` for a flat model), and the printed
+progress line appends `· r=… k=… Δ=… ρ=…`.
+
+Inference policy is per-load, not part of the checkpoint: the engine's
+`LoadSpec.settings` accept `spalmer_recurrence_steps` (0 or absent = the
+checkpoint's `default_steps`), `spalmer_adaptive_exit` (`none` |
+`latent_diff` | `kl`), `spalmer_exit_threshold` (0 = the criterion default),
+and `spalmer_warm_start`, and the resolved values are written back into the
+spec so chat and benchmarks report the effective depth. Adaptive exit is
+decode-only; prefill always runs the full budget so every iteration's KDA/MLA
+state covers the whole prompt.
+
+Registry semantics: the `checkpoints.num_layers` column stays **physical**
+(`plan.config.n_layers`) so every existing consumer keeps its meaning. The
+walked depth lives in `meta_json` as `effective_depth` (`P + r × C + K` at the
+checkpoint's default steps) alongside the full `recurrence` block; the
+checkpoints page shows it as `N layers (effective M)`. A bundle registered
+through the scanner records the same information as `recurrence_config` and
+`effective_depth`, and readers look for `recurrence`, then `recurrence_config`,
+then `metadata.recurrence`.
+
 ## Benchmarks
 
 The Benchmarks page uses the same detached worker, SQLite run history, live

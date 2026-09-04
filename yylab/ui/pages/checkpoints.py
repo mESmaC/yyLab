@@ -40,6 +40,42 @@ def _precision_label(value: object, fallback: str) -> str:
     return aliases.get(normalized, normalized.upper())
 
 
+def _spalmer_recurrence(metadata: dict) -> dict | None:
+    """Locate a recurrent-core block in a registry receipt or a scanned bundle."""
+
+    nested = metadata.get("metadata")
+    nested = nested if isinstance(nested, dict) else {}
+    for block in (
+        metadata.get("recurrence"),
+        metadata.get("recurrence_config"),
+        nested.get("recurrence"),
+        nested.get("recurrence_config"),
+    ):
+        if isinstance(block, dict) and block and block.get("enabled") is not False:
+            return block
+    return None
+
+
+def _spalmer_effective_depth(metadata: dict) -> int | None:
+    """Physical layers stay in the registry column; this is the walked depth."""
+
+    nested = metadata.get("metadata")
+    nested = nested if isinstance(nested, dict) else {}
+    recurrence = _spalmer_recurrence(metadata) or {}
+    for value in (
+        metadata.get("effective_depth"),
+        nested.get("effective_depth"),
+        recurrence.get("effective_depth"),
+    ):
+        try:
+            depth = int(value)
+        except (TypeError, ValueError):
+            continue
+        if depth > 0:
+            return depth
+    return None
+
+
 def _spalmer_base_recipe(metadata: dict) -> str:
     """Describe either a yyLab registry receipt or a directly scanned bundle."""
 
@@ -74,11 +110,20 @@ def _spalmer_base_recipe(metadata: dict) -> str:
         or native_precision.get("expert_master_dtype")
         or experts.get("expert_master_dtype")
     )
-    return (
+    recipe = (
         f"SPALMER · {_precision_label(weight_format, 'fp4')}/"
         f"{_precision_label(activation_format, 'mxfp8')} · "
         f"{_precision_label(master_dtype, 'bfloat16')} master"
     )
+    recurrence = _spalmer_recurrence(metadata)
+    if recurrence is not None:
+        recipe += (
+            f" · recurrent {int(recurrence.get('prelude_layers') or 0)}/"
+            f"{int(recurrence.get('core_layers') or 0)}/"
+            f"{int(recurrence.get('coda_layers') or 0)} × "
+            f"{int(recurrence.get('default_steps') or 0)}"
+        )
+    return recipe
 
 
 def _adapter_metadata(adapter: dict) -> dict:
@@ -249,9 +294,21 @@ def checkpoints_page():
                         icon="delete",
                         on_click=lambda cid=cid, name=c["name"]: ask_remove(cid, name),
                     ).props("flat dense no-caps color=negative")
+                try:
+                    detail_metadata = json.loads(c.get("meta_json") or "{}")
+                except (TypeError, ValueError):
+                    detail_metadata = {}
+                effective_depth = (
+                    _spalmer_effective_depth(detail_metadata)
+                    if isinstance(detail_metadata, dict)
+                    else None
+                )
+                layers_label = f'{c["num_layers"]} layers'
+                if effective_depth and effective_depth != c["num_layers"]:
+                    layers_label += f" (effective {effective_depth})"
                 ui.label(
                     f'arch: {c["arch"]} · hidden {c["hidden_size"]} · '
-                    f'{c["num_layers"]} layers · {_parameter_label(c["params_b"])} params'
+                    f'{layers_label} · {_parameter_label(c["params_b"])} params'
                 )
                 ui.label(f'source: {c["source"]} → {c["ref"]}')
                 ui.label(f"base recipe: {base_recipe(c)}").classes("text-sm text-gray-400")

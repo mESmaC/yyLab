@@ -24,6 +24,7 @@ from yylab.benchmark.quality import (
     _fingerprint,
     _generation_comparison_fingerprint,
     _oracle_records,
+    _stack_lock,
     _workload_contract,
     compare_summaries,
     policies_for_config,
@@ -1553,3 +1554,104 @@ def test_training_performance_skips_a_busy_gpu_without_loading_the_model(
     assert (tmp_path / "output" / "benchmark-receipt.json").is_file()
     assert (tmp_path / "output" / "summary.json").is_file()
     assert "BUSY_GPU" in (tmp_path / "output" / "report.md").read_text(encoding="utf-8")
+
+
+def test_recurrence_depth_separates_comparison_fingerprints() -> None:
+    """Depth changes the computation, so two depths are not one workload."""
+
+    suite = load_suite(SUITE)
+    cases = suite.select(profile="smoke", limit=2)
+    args = {"profile": "smoke", "repetitions": 1, "categories": (), "limit": 2}
+    base_cfg = {
+        "model_family": "spalmer",
+        "checkpoint_ref": "spalmer.pt",
+        "spalmer_expert_offload": True,
+        "spalmer_expert_paging": True,
+        "spalmer_expert_cache_size": None,
+    }
+
+    flat = _workload_contract(suite, cases, ["base"], base_cfg, **args)
+    inert = _workload_contract(
+        suite,
+        cases,
+        ["base"],
+        {
+            **base_cfg,
+            "spalmer_recurrence_steps": None,
+            "spalmer_adaptive_exit": "none",
+            "spalmer_exit_threshold": None,
+            "spalmer_warm_start": False,
+        },
+        **args,
+    )
+    shallow = _workload_contract(
+        suite, cases, ["base"], {**base_cfg, "spalmer_recurrence_steps": 4}, **args
+    )
+    deep = _workload_contract(
+        suite, cases, ["base"], {**base_cfg, "spalmer_recurrence_steps": 8}, **args
+    )
+    adaptive = _workload_contract(
+        suite,
+        cases,
+        ["base"],
+        {**base_cfg, "spalmer_recurrence_steps": 8, "spalmer_adaptive_exit": "latent_diff"},
+        **args,
+    )
+
+    # Inert recurrence keys must not perturb an existing spalmer fingerprint.
+    assert "spalmer_recurrence" not in flat
+    assert "spalmer_recurrence" not in inert
+    assert _fingerprint(flat) == _fingerprint(inert)
+    assert _generation_comparison_fingerprint(flat) == _generation_comparison_fingerprint(
+        inert
+    )
+
+    assert shallow["spalmer_recurrence"]["recurrence_steps"] == 4
+    fingerprints = {
+        _generation_comparison_fingerprint(contract)
+        for contract in (flat, shallow, deep, adaptive)
+    }
+    assert len(fingerprints) == 4
+
+
+def test_stack_lock_and_identity_only_grow_for_active_recurrence(tmp_path) -> None:
+    checkpoint = tmp_path / "spalmer.pt"
+    checkpoint.write_bytes(b"static fixture")
+    base = {
+        "checkpoint_ref": str(checkpoint),
+        "quant": "checkpoint",
+        "model_family": "spalmer",
+    }
+
+    flat = _stack_lock(base)
+    inert = _stack_lock({**base, "spalmer_recurrence_steps": None, "spalmer_adaptive_exit": "none"})
+    deep = _stack_lock({**base, "spalmer_recurrence_steps": 6})
+
+    assert "spalmer_recurrence" not in flat
+    assert flat["stack_fingerprint"] == inert["stack_fingerprint"]
+    assert deep["spalmer_recurrence"]["recurrence_steps"] == 6
+    assert deep["stack_fingerprint"] != flat["stack_fingerprint"]
+
+    backend = YyLabBenchmarkBackend(
+        checkpoint_ref=str(checkpoint),
+        quant="checkpoint",
+        adapter_path=None,
+        adapter_arch="",
+        model_family="spalmer",
+        settings={"spalmer_recurrence_steps": 6, "spalmer_warm_start": True},
+    )
+    assert backend.identity()["recurrence"] == {
+        "recurrence_steps": 6,
+        "adaptive_exit": "none",
+        "exit_threshold": None,
+        "warm_start": True,
+    }
+    plain = YyLabBenchmarkBackend(
+        checkpoint_ref=str(checkpoint),
+        quant="checkpoint",
+        adapter_path=None,
+        adapter_arch="",
+        model_family="spalmer",
+        settings={},
+    )
+    assert "recurrence" not in plain.identity()

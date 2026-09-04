@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -19,6 +20,43 @@ class GenerationResponse:
     thinking_tokens: int = 0
     answer_tokens: int | None = None
     thinking_budget_exhausted: bool = False
+
+
+SPALMER_RECURRENCE_KEYS = (
+    "spalmer_recurrence_steps",
+    "spalmer_adaptive_exit",
+    "spalmer_exit_threshold",
+    "spalmer_warm_start",
+)
+
+
+def spalmer_recurrence_settings(cfg: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Return the active recurrent-depth policy, or ``None`` when unset.
+
+    Depth changes the computation, so it belongs in the stack lock and in the
+    comparison fingerprint.  Returning ``None`` unless a recurrence setting is
+    actually active keeps every fingerprint recorded before recurrent depth
+    existed byte-identical.
+    """
+
+    steps = cfg.get("spalmer_recurrence_steps")
+    criterion = cfg.get("spalmer_adaptive_exit")
+    threshold = cfg.get("spalmer_exit_threshold")
+    warm_start = cfg.get("spalmer_warm_start")
+    active = (
+        (steps is not None and int(steps) > 0)
+        or (criterion is not None and str(criterion) != "none")
+        or (threshold is not None and float(threshold) > 0)
+        or bool(warm_start)
+    )
+    if not active:
+        return None
+    return {
+        "recurrence_steps": int(steps) if steps is not None else None,
+        "adaptive_exit": str(criterion or "none"),
+        "exit_threshold": float(threshold) if threshold else None,
+        "warm_start": bool(warm_start),
+    }
 
 
 def _subsequence_index(values: list[int], needle: list[int]) -> int | None:
@@ -306,6 +344,9 @@ class YyLabBenchmarkBackend:
                 "requested_cache_size": self.settings.get("spalmer_expert_cache_size"),
                 "actual_placement": "reported per generation in routing telemetry",
             }
+            recurrence = spalmer_recurrence_settings(self.settings)
+            if recurrence is not None:
+                value["recurrence"] = recurrence
         return value
 
     def configure_policy(self, policy: str) -> list[str]:

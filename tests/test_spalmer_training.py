@@ -337,7 +337,31 @@ class _FakeBatches:
         }
 
 
+def _step_metric(**updates):
+    values = {
+        "step": 1,
+        "tokens_seen": 8,
+        "objective": 2.5,
+        "model_loss": 2.4,
+        "auxiliary_loss": 0.1,
+        "surprise_calibration_loss": 0.05,
+        "predictive_entropy": 1.7,
+        "learning_rate": 3e-4,
+        "gradient_norm": 0.8,
+        "elapsed_seconds": 0.1,
+        "promoted_experts": (3,),
+        "average_surprise": 2.3,
+        "max_expert_group_load": 17,
+        "max_expert_group_padding_amplification": 1.375,
+        "max_expert_group_global_max_counterfactual_padding_amplification": 13.625,
+    }
+    values.update(updates)
+    return SimpleNamespace(**values)
+
+
 class _FakeTrainer:
+    metric_updates: dict = {}
+
     def __init__(self, model, batches, config, *, on_checkpoint, on_telemetry):
         self.model = model
         self.batches = batches
@@ -363,30 +387,24 @@ class _FakeTrainer:
         )
 
     def run(self):
-        metric = SimpleNamespace(
-            step=1,
-            tokens_seen=8,
-            objective=2.5,
-            model_loss=2.4,
-            auxiliary_loss=0.1,
-            surprise_calibration_loss=0.05,
-            predictive_entropy=1.7,
-            learning_rate=3e-4,
-            gradient_norm=0.8,
-            elapsed_seconds=0.1,
-            promoted_experts=(3,),
-            average_surprise=2.3,
-            max_expert_group_load=17,
-            max_expert_group_padding_amplification=1.375,
-            max_expert_group_global_max_counterfactual_padding_amplification=13.625,
-        )
+        metric = _step_metric(**type(self).metric_updates)
         self.progress.completed_steps = 1
         self.progress.tokens_seen = 8
         self.on_checkpoint(self, metric)
         yield metric
 
 
-def test_run_writes_native_artifact_metadata_without_real_training(tmp_path, monkeypatch):
+def _native_run(
+    tmp_path,
+    monkeypatch,
+    *,
+    recurrence=None,
+    training_updates=None,
+    metric_updates=None,
+    api_updates=None,
+):
+    """Drive one fake run and hand back everything it wrote."""
+
     output = tmp_path / "checkpoint"
     batches = _FakeBatches()
     training = _ConfigObject(
@@ -396,15 +414,19 @@ def test_run_writes_native_artifact_metadata_without_real_training(tmp_path, mon
         deterministic_algorithms=False,
         device="cpu",
         optimizer_update_chunk_size=1_048_576,
+        **(training_updates or {}),
     )
     experts = _ConfigObject(
         expert_activation_format="mxfp8",
         expert_master_dtype="bfloat16",
         expert_qat_backend="reference",
     )
+    model_config = _ConfigObject(vocab_size=4096, d_model=64, n_layers=4)
+    if recurrence is not None:
+        model_config.recurrence = recurrence
     bundle = SimpleNamespace(
         build=lambda: _FakeModel(),
-        model=_ConfigObject(vocab_size=4096, d_model=64, n_layers=4),
+        model=model_config,
         kda=_ConfigObject(backend="reference"),
         mla=_ConfigObject(num_heads=4),
         experts=experts,
@@ -414,21 +436,25 @@ def test_run_writes_native_artifact_metadata_without_real_training(tmp_path, mon
     prepared = bridge.PreparedSpalmerRun(
         _config(), _FakeTokenizer(), _FakePlan(), bundle, training
     )
-    saved = []
+    saved = {}
 
-    def save_checkpoint(path, *_args, **_kwargs):
+    def save_checkpoint(path, *_args, **kwargs):
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"mock-spalmer-checkpoint")
-        saved.append(path)
+        saved[path] = kwargs.get("metadata")
         return path
 
+    trainer = type(
+        "_ScopedFakeTrainer", (_FakeTrainer,), {"metric_updates": dict(metric_updates or {})}
+    )
     api = SimpleNamespace(
         CausalBatch=_CausalBatch,
-        ExperimentTrainer=_FakeTrainer,
+        ExperimentTrainer=trainer,
         assert_accounting_matches_plan=lambda *_args: None,
         save_checkpoint=save_checkpoint,
         seed_everything=lambda *_args, **_kwargs: None,
+        **(api_updates or {}),
     )
     database_calls = []
     monkeypatch.setattr(bridge, "_load_spalmer_api", lambda: api)
@@ -451,19 +477,51 @@ def test_run_writes_native_artifact_metadata_without_real_training(tmp_path, mon
     )
 
     summary = bridge.run_spalmer_base(_config(), tmp_path / "run")
+    run_directory = tmp_path / "run"
+    return {
+        "output": output,
+        "saved": saved,
+        "summary": summary,
+        "database_calls": database_calls,
+        "manifest": json.loads((output / "spalmer_manifest.json").read_text("utf-8")),
+        "recipe": json.loads((output / "yylab_recipe.json").read_text("utf-8")),
+        "token_view": json.loads(
+            (output / "tokenized_view_manifest.json").read_text("utf-8")
+        ),
+        "progress": json.loads((run_directory / "progress.json").read_text("utf-8")),
+        "telemetry": [
+            json.loads(line)
+            for line in (run_directory / "metrics.jsonl")
+            .read_text("utf-8")
+            .splitlines()
+        ],
+        "placement_receipt": json.loads(
+            (run_directory / "optimizer_state_placement.json").read_text("utf-8")
+        ),
+    }
+
+
+def test_run_writes_native_artifact_metadata_without_real_training(tmp_path, monkeypatch):
+    artifacts = _native_run(tmp_path, monkeypatch, api_updates={"FORMAT_VERSION": 6})
+
+    output = artifacts["output"]
+    saved = artifacts["saved"]
+    summary = artifacts["summary"]
+    database_calls = artifacts["database_calls"]
+    manifest = artifacts["manifest"]
+    recipe = artifacts["recipe"]
+    token_view = artifacts["token_view"]
+    progress = artifacts["progress"]
+    telemetry = artifacts["telemetry"][-1]
+    placement_receipt = artifacts["placement_receipt"]
 
     assert output / "spalmer.pt" in saved
     assert output / "steps" / "step-00000001" / "spalmer.pt" in saved
-    manifest = json.loads((output / "spalmer_manifest.json").read_text("utf-8"))
-    recipe = json.loads((output / "yylab_recipe.json").read_text("utf-8"))
-    token_view = json.loads((output / "tokenized_view_manifest.json").read_text("utf-8"))
-    progress = json.loads((tmp_path / "run" / "progress.json").read_text("utf-8"))
-    telemetry = json.loads(
-        (tmp_path / "run" / "metrics.jsonl").read_text("utf-8").splitlines()[-1]
-    )
-    placement_receipt = json.loads(
-        (tmp_path / "run" / "optimizer_state_placement.json").read_text("utf-8")
-    )
+    assert manifest["checkpoint_format"] == "spalmer.prototype.checkpoint.v6"
+    assert manifest["recurrence"] is None
+    assert manifest["effective_depth"] == 4
+    assert saved[output / "spalmer.pt"]["recurrence"] is None
+    assert telemetry["recurrence_steps"] is None
     assert manifest["model_family"] == "spalmer"
     assert manifest["checkpoint_file"] == "spalmer.pt"
     assert manifest["plan_fingerprint"] == "plan-fingerprint"
@@ -579,14 +637,19 @@ def test_normalize_spalmer_config_rejects_unknown_initialization_mode():
         bridge.normalize_spalmer_config(_config(initialization={"mode": "lora"}))
 
 
-def _parent_bundle(path: Path, *, tokenizer_source: str) -> Path:
+def _parent_bundle(
+    path: Path, *, tokenizer_source: str, format_version: int = 5, recurrence=None
+) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
+    model_config = {"vocab_size": 32, "d_model": 8, "n_layers": 4}
+    if recurrence is not None:
+        model_config["recurrence"] = recurrence
     torch.save(
         {
             "format": "spalmer.prototype.checkpoint",
-            "format_version": 5,
+            "format_version": format_version,
             "model_parameter_dtype": "bfloat16",
-            "model_config": {"vocab_size": 32, "d_model": 8, "n_layers": 4},
+            "model_config": model_config,
             "kda_config": {"hidden_size": 8, "num_heads": 2},
             "mla_config": {"hidden_size": 8, "num_heads": 2},
             "experts_config": {"num_experts": 200, "expert_weight_format": "mxfp4"},
@@ -824,3 +887,281 @@ def test_run_uses_loaded_model_and_records_parent(tmp_path, monkeypatch):
     assert registry_meta["initialization"] == "checkpoint"
     assert registry_meta["parent_checkpoint_id"] == "ckpt_parent"
     assert summary["parent_checkpoint"] == parent
+
+
+def _recurrent_config(**updates):
+    config = _config()
+    config["spalmer"] = {
+        **config["spalmer"],
+        "recurrence": {"enabled": True, "prelude_layers": 1, "coda_layers": 1},
+    }
+    config["training"] = {"mean_recurrence": 8, "mean_backprop_depth": 4}
+    config.update(updates)
+    return config
+
+
+def test_normalize_scratch_recurrence_block_and_training_keys():
+    normalized = bridge.normalize_spalmer_config(_recurrent_config(), require_runtime=True)
+
+    assert normalized["spalmer"]["recurrence"] == {
+        "enabled": True,
+        "prelude_layers": 1,
+        "coda_layers": 1,
+        "default_steps": 8,
+        "latent_init_std": 1.0,
+    }
+    # The training keys are hoisted to the root exactly like every other alias.
+    assert normalized["mean_recurrence"] == 8.0
+    assert normalized["mean_backprop_depth"] == 4
+    assert normalized["recurrence_sigma"] == 0.5
+    assert normalized["recurrence_sampling"] == "poisson_lognormal"
+    assert normalized["max_recurrence"] is None
+
+
+def test_normalize_scratch_recurrence_defaults_to_disabled():
+    normalized = bridge.normalize_spalmer_config(_config())
+
+    assert normalized["spalmer"]["recurrence"] == {"enabled": False}
+    assert "mean_recurrence" not in normalized
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"training": {"mean_recurrence": 4}},
+        {"mean_recurrence": 4},
+    ],
+)
+def test_normalize_rejects_recurrence_training_keys_without_a_core(updates):
+    with pytest.raises(ValueError, match="spalmer.recurrence.enabled"):
+        bridge.normalize_spalmer_config(_config(**updates))
+
+
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    [
+        ({"training": {}}, "requires training.mean_recurrence"),
+        ({"training": {"mean_recurrence": 0.5}}, "mean_recurrence must be at least 1"),
+        (
+            {"training": {"mean_recurrence": 4, "mean_backprop_depth": 0}},
+            "mean_backprop_depth must be positive",
+        ),
+        (
+            {"training": {"mean_recurrence": 4, "recurrence_sigma": -1}},
+            "recurrence_sigma must be at least 0",
+        ),
+        (
+            {"training": {"mean_recurrence": 4, "recurrence_sampling": "beta"}},
+            "recurrence_sampling must be one of",
+        ),
+        (
+            {"training": {"mean_recurrence": 4.5, "recurrence_sampling": "fixed"}},
+            "integer mean_recurrence",
+        ),
+        (
+            {"training": {"mean_recurrence": 8, "max_recurrence": 4}},
+            "max_recurrence must be at least",
+        ),
+    ],
+)
+def test_normalize_rejects_bad_recurrence_training_ranges(updates, message):
+    with pytest.raises(ValueError, match=message):
+        bridge.normalize_spalmer_config(_recurrent_config(**updates))
+
+
+def test_normalize_rejects_unknown_recurrence_architecture_keys():
+    config = _config()
+    config["spalmer"] = {
+        **config["spalmer"],
+        "recurrence": {"enabled": True, "core_layers": 2},
+    }
+    with pytest.raises(ValueError, match="unsupported SPALMER recurrence keys: core_layers"):
+        bridge.normalize_spalmer_config(config)
+
+
+def test_planner_passes_recurrence_scale_config():
+    calls = {}
+
+    class Recurrence:
+        def __init__(self, **kwargs):
+            self.values = kwargs
+
+    def plan_configuration(target, vocab, **kwargs):
+        calls.update(kwargs)
+        return SimpleNamespace(fingerprint="plan")
+
+    api = SimpleNamespace(
+        DirectionalScaleConfig=lambda **_kwargs: object(),
+        ATXYScaleConfig=lambda **_kwargs: object(),
+        RecurrenceScaleConfig=Recurrence,
+        ScaleSearchSpace=lambda **_kwargs: object(),
+        plan_configuration=plan_configuration,
+    )
+
+    bridge.plan_spalmer_configuration(_recurrent_config(), 4096, api=api)
+    assert calls["recurrence"].values == {
+        "prelude_layers": 1,
+        "coda_layers": 1,
+        "default_steps": 8,
+        "latent_init_std": 1.0,
+    }
+
+    calls.clear()
+    bridge.plan_spalmer_configuration(_config(), 4096, api=api)
+    assert calls["recurrence"] is None
+
+
+def test_training_config_carries_recurrence_fields():
+    api = SimpleNamespace(TrainingConfig=lambda **values: SimpleNamespace(**values))
+
+    recurrent = bridge.build_spalmer_training_config(_recurrent_config(), api=api)
+    flat = bridge.build_spalmer_training_config(_config(), api=api)
+
+    assert recurrent.mean_recurrence == 8.0
+    assert recurrent.mean_backprop_depth == 4
+    assert recurrent.recurrence_sigma == 0.5
+    assert recurrent.recurrence_sampling == "poisson_lognormal"
+    assert recurrent.max_recurrence is None
+    assert flat.mean_recurrence is None
+
+
+@pytest.mark.parametrize("format_version", [5, 6])
+def test_prepare_checkpoint_run_accepts_supported_bundle_versions(
+    tmp_path, monkeypatch, format_version
+):
+    bundle = _parent_bundle(
+        tmp_path / "parent" / "spalmer.pt",
+        tokenizer_source=str(tmp_path / "gone"),
+        format_version=format_version,
+    )
+    monkeypatch.setattr(bridge.db, "q1", lambda sql, args=(): _parent_row(bundle))
+    monkeypatch.setattr("yylab.models.spalmer.relocated_spalmer_tokenizer", lambda binding: None)
+    api = _checkpoint_api(
+        lambda path, **kwargs: (
+            _FakeModel(),
+            _FakeTokenizer(),
+            {"run_id": "parent", "plan": {"fingerprint": "parent-plan"}},
+        )
+    )
+
+    prepared = bridge.prepare_spalmer_run(_checkpoint_config(), api=api)
+
+    assert prepared.training.mean_recurrence is None
+
+
+def test_prepare_checkpoint_run_rejects_unsupported_bundle_version(tmp_path, monkeypatch):
+    bundle = _parent_bundle(
+        tmp_path / "parent" / "spalmer.pt",
+        tokenizer_source=str(tmp_path / "gone"),
+        format_version=7,
+    )
+    monkeypatch.setattr(bridge.db, "q1", lambda sql, args=(): _parent_row(bundle))
+    monkeypatch.setattr("yylab.models.spalmer.relocated_spalmer_tokenizer", lambda binding: None)
+    api = _checkpoint_api(lambda path, **kwargs: pytest.fail("must not load"))
+
+    with pytest.raises(ValueError, match="format-version 5 or 6"):
+        bridge.prepare_spalmer_run(_checkpoint_config(), api=api)
+
+
+def _recurrent_parent_api(recurrence):
+    model = _FakeModel()
+    model.config = SimpleNamespace(recurrence=recurrence)
+    return _checkpoint_api(
+        lambda path, **kwargs: (
+            model,
+            _FakeTokenizer(),
+            {"run_id": "parent", "plan": {"fingerprint": "parent-plan"}},
+        )
+    )
+
+
+def test_prepare_checkpoint_run_checks_parent_recurrence(tmp_path, monkeypatch):
+    bundle = _parent_bundle(
+        tmp_path / "parent" / "spalmer.pt",
+        tokenizer_source=str(tmp_path / "gone"),
+        format_version=6,
+        recurrence={
+            "prelude_layers": 1,
+            "core_layers": 2,
+            "coda_layers": 1,
+            "default_steps": 8,
+            "latent_init_std": 1.0,
+        },
+    )
+    monkeypatch.setattr(bridge.db, "q1", lambda sql, args=(): _parent_row(bundle))
+    monkeypatch.setattr("yylab.models.spalmer.relocated_spalmer_tokenizer", lambda binding: None)
+    recurrent_api = _recurrent_parent_api(SimpleNamespace(prelude_layers=1, core_layers=2))
+    flat_api = _recurrent_parent_api(None)
+
+    with pytest.raises(ValueError, match="parent checkpoint is recurrent"):
+        bridge.prepare_spalmer_run(_checkpoint_config(), api=recurrent_api)
+    with pytest.raises(ValueError, match="no recurrent core"):
+        bridge.prepare_spalmer_run(
+            _checkpoint_config(training={"mean_recurrence": 8}), api=flat_api
+        )
+
+    prepared = bridge.prepare_spalmer_run(
+        _checkpoint_config(training={"mean_recurrence": 8}), api=recurrent_api
+    )
+    assert prepared.training.mean_recurrence == 8.0
+
+
+def test_metric_payload_and_checkpoint_metadata_include_recurrence(tmp_path, monkeypatch):
+    artifacts = _native_run(
+        tmp_path,
+        monkeypatch,
+        recurrence={
+            "prelude_layers": 1,
+            "core_layers": 2,
+            "coda_layers": 1,
+            "default_steps": 8,
+            "latent_init_std": 1.0,
+        },
+        training_updates={
+            "mean_recurrence": 8.0,
+            "mean_backprop_depth": 4,
+            "recurrence_sigma": 0.5,
+            "recurrence_sampling": "poisson_lognormal",
+            "max_recurrence": None,
+        },
+        metric_updates={
+            "recurrence_steps": 6,
+            "backprop_steps": 4,
+            "effective_depth": 14,
+            "latent_delta_final": 0.125,
+            "latent_position_correlation": 0.5,
+        },
+        api_updates={"FORMAT_VERSION": 6},
+    )
+    manifest = artifacts["manifest"]
+    telemetry = artifacts["telemetry"][-1]
+    expected_block = {
+        "prelude_layers": 1,
+        "core_layers": 2,
+        "coda_layers": 1,
+        "default_steps": 8,
+        "latent_init_std": 1.0,
+        "effective_depth": 18,
+        "mean_recurrence": 8.0,
+        "mean_backprop_depth": 4,
+        "recurrence_sigma": 0.5,
+        "recurrence_sampling": "poisson_lognormal",
+        "max_recurrence": None,
+    }
+
+    assert manifest["checkpoint_format"] == "spalmer.prototype.checkpoint.v6"
+    assert manifest["recurrence"] == expected_block
+    assert manifest["effective_depth"] == 18
+    assert artifacts["saved"][artifacts["output"] / "spalmer.pt"]["recurrence"] == expected_block
+    assert telemetry["recurrence_steps"] == 6
+    assert telemetry["backprop_steps"] == 4
+    assert telemetry["effective_depth"] == 14
+    assert telemetry["latent_delta_final"] == pytest.approx(0.125)
+    assert telemetry["latent_position_correlation"] == pytest.approx(0.5)
+    assert "· r=6 k=4 Δ=0.125 ρ=0.50" in telemetry["msg"]
+    _, update_args = artifacts["database_calls"][-1]
+    registry_metadata = json.loads(update_args[-2])
+    assert registry_metadata["recurrence"] == expected_block
+    assert registry_metadata["effective_depth"] == 18
+    # The registry column stays physical; the walked depth lives in meta_json.
+    assert update_args[5] == 4

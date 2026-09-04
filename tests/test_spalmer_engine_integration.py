@@ -10,11 +10,26 @@ from yylab.ui.pages.checkpoints import _spalmer_base_recipe
 
 
 class _Facade:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        recurrent: bool = False,
+        recurrence_steps: int | None = None,
+        adaptive_exit: str = "none",
+        exit_threshold: float | None = None,
+        warm_start: bool = False,
+    ) -> None:
         self.tokenizer = SimpleNamespace(eos_token_id=2, model_max_length=4096)
         self.notes = ["native SPALMER"]
         self.cuda_available = False
         self.config = SimpleNamespace(max_position_embeddings=4096)
+        self.recurrent = recurrent
+        # The facade resolves "0/None means checkpoint default" before the
+        # engine writes the effective policy back into the load spec.
+        self.recurrence_steps = (recurrence_steps or 8) if recurrent else None
+        self.adaptive_exit = adaptive_exit if recurrent else "none"
+        self.exit_threshold = exit_threshold if recurrent else None
+        self.warm_start = bool(warm_start) and recurrent
 
     def routing_telemetry(self):
         return {"routing_mode": "adaptive_surprise", "active_experts": 4}
@@ -224,3 +239,140 @@ def test_stack_lock_infers_spalmer_family_for_direct_configs(tmp_path):
     lock = _stack_lock({"checkpoint_ref": str(checkpoint), "quant": "checkpoint"})
 
     assert lock["model_family"] == "spalmer"
+
+
+def test_engine_omits_recurrence_kwargs_when_no_depth_setting_is_present(monkeypatch):
+    """A load without recurrence settings must not widen the runtime call."""
+
+    facade = _Facade()
+    calls = []
+
+    def load(
+        ref,
+        *,
+        dynamic_residency,
+        max_context_tokens,
+        expert_offload,
+        expert_cache_size,
+        expert_paging,
+    ):
+        calls.append(ref)
+        return facade
+
+    monkeypatch.setattr("yylab.models.spalmer.load_spalmer_runtime", load)
+    engine = Engine()
+
+    engine.load(
+        LoadSpec(
+            ref="fixture.pt",
+            quant="checkpoint",
+            model_family="spalmer",
+            settings={"spalmer_expert_cache_size": 4},
+        )
+    )
+
+    assert calls == ["fixture.pt"]
+    assert "spalmer_recurrence_steps" not in engine.spec.settings
+    assert "spalmer_recurrent" not in engine.spec.settings
+
+
+def test_engine_maps_recurrence_settings_and_writes_back_resolved_values(monkeypatch):
+    facade = _Facade(
+        recurrent=True,
+        recurrence_steps=None,
+        adaptive_exit="latent_diff",
+        exit_threshold=0.05,
+        warm_start=True,
+    )
+    calls = []
+
+    def load(_ref, **kwargs):
+        calls.append(kwargs)
+        return facade
+
+    monkeypatch.setattr("yylab.models.spalmer.load_spalmer_runtime", load)
+    engine = Engine()
+
+    engine.load(
+        LoadSpec(
+            ref="fixture.pt",
+            quant="checkpoint",
+            model_family="spalmer",
+            settings={
+                # 0 and None both mean "use the checkpoint default".
+                "spalmer_recurrence_steps": 0,
+                "spalmer_adaptive_exit": "latent_diff",
+                "spalmer_exit_threshold": 0.05,
+                "spalmer_warm_start": True,
+            },
+        )
+    )
+
+    assert calls[0]["recurrence_steps"] is None
+    assert calls[0]["adaptive_exit"] == "latent_diff"
+    assert calls[0]["exit_threshold"] == 0.05
+    assert calls[0]["warm_start"] is True
+    settings = engine.spec.settings
+    assert settings["spalmer_recurrent"] is True
+    assert settings["spalmer_recurrence_steps"] == 8
+    assert settings["spalmer_adaptive_exit"] == "latent_diff"
+    assert settings["spalmer_exit_threshold"] == 0.05
+    assert settings["spalmer_warm_start"] is True
+
+
+def test_engine_leaves_flat_checkpoint_settings_untouched(monkeypatch):
+    facade = _Facade(recurrent=False)
+    calls = []
+
+    def load(_ref, **kwargs):
+        calls.append(kwargs)
+        return facade
+
+    monkeypatch.setattr("yylab.models.spalmer.load_spalmer_runtime", load)
+    engine = Engine()
+
+    engine.load(
+        LoadSpec(
+            ref="fixture.pt",
+            quant="checkpoint",
+            model_family="spalmer",
+            settings={
+                "spalmer_recurrence_steps": None,
+                "spalmer_adaptive_exit": "none",
+                "spalmer_exit_threshold": None,
+                "spalmer_warm_start": False,
+            },
+        )
+    )
+
+    assert calls[0]["recurrence_steps"] is None
+    assert calls[0]["adaptive_exit"] == "none"
+    assert "spalmer_recurrent" not in engine.spec.settings
+    assert engine.spec.settings["spalmer_recurrence_steps"] is None
+
+
+def test_engine_rejects_negative_recurrence_settings(monkeypatch):
+    monkeypatch.setattr(
+        "yylab.models.spalmer.load_spalmer_runtime",
+        lambda *_args, **_kwargs: pytest.fail("runtime should not load"),
+    )
+    engine = Engine()
+
+    with pytest.raises(ValueError, match="spalmer_recurrence_steps cannot be negative"):
+        engine.load(
+            LoadSpec(
+                ref="fixture.pt",
+                quant="checkpoint",
+                model_family="spalmer",
+                settings={"spalmer_recurrence_steps": -1},
+            )
+        )
+    with pytest.raises(ValueError, match="spalmer_exit_threshold cannot be negative"):
+        engine.load(
+            LoadSpec(
+                ref="fixture.pt",
+                quant="checkpoint",
+                model_family="spalmer",
+                settings={"spalmer_exit_threshold": -0.5},
+            )
+        )

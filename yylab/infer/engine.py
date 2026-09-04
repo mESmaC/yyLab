@@ -1004,6 +1004,28 @@ class Engine:
         if raw_cache_size < 0:
             raise ValueError("spalmer_expert_cache_size cannot be negative")
         expert_cache_size = raw_cache_size if raw_cache_size > 0 else None
+        # Recurrence kwargs are only forwarded when the caller actually asked
+        # for a depth policy, so flat checkpoints and pre-recurrence runtimes
+        # keep their original ``load_spalmer_runtime`` signature.
+        recurrence_requested = any(
+            key.startswith("spalmer_recurrence")
+            or key in {"spalmer_adaptive_exit", "spalmer_exit_threshold", "spalmer_warm_start"}
+            for key in settings
+        )
+        recurrence_kwargs: dict = {}
+        if recurrence_requested:
+            raw_steps = int(settings.get("spalmer_recurrence_steps") or 0)
+            if raw_steps < 0:
+                raise ValueError("spalmer_recurrence_steps cannot be negative")
+            raw_threshold = float(settings.get("spalmer_exit_threshold") or 0.0)
+            if raw_threshold < 0:
+                raise ValueError("spalmer_exit_threshold cannot be negative")
+            recurrence_kwargs = {
+                "recurrence_steps": raw_steps or None,
+                "adaptive_exit": str(settings.get("spalmer_adaptive_exit") or "none"),
+                "exit_threshold": raw_threshold or None,
+                "warm_start": bool(settings.get("spalmer_warm_start", False)),
+            }
         settings.update(
             context_mode="native",
             rope_scaling="none",
@@ -1030,7 +1052,19 @@ class Engine:
                 expert_offload=expert_offload,
                 expert_cache_size=expert_cache_size,
                 expert_paging=expert_paging,
+                **recurrence_kwargs,
             )
+            if recurrence_requested and bool(getattr(facade, "recurrent", False)):
+                # Publish the resolved policy so chat badges and benchmark
+                # receipts report effective depth, not the request.
+                settings.update(
+                    spalmer_recurrence_steps=facade.recurrence_steps,
+                    spalmer_adaptive_exit=facade.adaptive_exit,
+                    spalmer_exit_threshold=facade.exit_threshold,
+                    spalmer_warm_start=facade.warm_start,
+                    spalmer_recurrent=True,
+                )
+                spec = replace(spec, settings=settings)
             self.model = facade
             self.tokenizer = facade.tokenizer
             self.spec = spec

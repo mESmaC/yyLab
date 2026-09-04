@@ -386,3 +386,73 @@ def test_benchmarks_page_is_registered_and_bundled_suite_loads():
     assert len(suite.profiles["smoke"]) == 10
     assert len(suite.profiles["quick"]) == 30
     assert len(suite.profiles["full"]) == 64
+
+
+def test_quality_job_config_carries_recurrence_and_validates_it():
+    checkpoint = {
+        **_checkpoint(),
+        "ref": "spalmer.pt",
+        "meta_json": '{"model_family":"spalmer"}',
+    }
+    common = {
+        "quant": "checkpoint",
+        "policy": "base",
+        "profile": "smoke",
+        "repetitions": 1,
+        "label": "spalmer-recurrent",
+    }
+
+    default = benchmarks._quality_job_config(checkpoint, None, **common)
+    assert default["spalmer_recurrence_steps"] is None
+    assert default["spalmer_adaptive_exit"] == "none"
+    assert default["spalmer_exit_threshold"] is None
+    assert default["spalmer_warm_start"] is False
+    assert "depth checkpoint" in benchmarks._quality_contract_text(default)
+
+    deep = benchmarks._quality_job_config(
+        checkpoint,
+        None,
+        spalmer_recurrence_steps=12,
+        spalmer_adaptive_exit="latent_diff",
+        spalmer_exit_threshold=0.02,
+        spalmer_warm_start=True,
+        **common,
+    )
+    assert deep["spalmer_recurrence_steps"] == 12
+    assert deep["spalmer_adaptive_exit"] == "latent_diff"
+    assert deep["spalmer_exit_threshold"] == 0.02
+    assert deep["spalmer_warm_start"] is True
+    text = benchmarks._quality_contract_text(deep)
+    assert "depth 12 adaptive latent_diff warm" in text
+
+    with pytest.raises(ValueError, match="spalmer_recurrence_steps must be positive"):
+        benchmarks._quality_job_config(
+            checkpoint, None, spalmer_recurrence_steps=0, **common
+        )
+    with pytest.raises(ValueError, match="unknown SPALMER adaptive exit"):
+        benchmarks._quality_job_config(
+            checkpoint, None, spalmer_adaptive_exit="entropy", **common
+        )
+    with pytest.raises(ValueError, match="spalmer_exit_threshold must be positive"):
+        benchmarks._quality_job_config(
+            checkpoint, None, spalmer_exit_threshold=0.0, **common
+        )
+
+    # A non-SPALMER checkpoint never grows the keys.
+    hf = benchmarks._quality_job_config(_checkpoint(), None, **{**common, "quant": "bf16"})
+    assert "spalmer_recurrence_steps" not in hf
+
+
+def test_checkpoint_recurrence_detection_reads_every_metadata_shape():
+    assert benchmarks._checkpoint_is_recurrent(None) is False
+    assert benchmarks._checkpoint_is_recurrent({"meta_json": "not json"}) is False
+    assert benchmarks._checkpoint_is_recurrent({"meta_json": "{}"}) is False
+    assert benchmarks._checkpoint_is_recurrent(
+        {"meta_json": '{"recurrence": {"prelude_layers": 1}}'}
+    )
+    assert benchmarks._checkpoint_is_recurrent(
+        {"meta_json": '{"recurrence_config": {"prelude_layers": 1}}'}
+    )
+    assert benchmarks._checkpoint_is_recurrent(
+        {"meta_json": '{"metadata": {"recurrence": {"prelude_layers": 1}}}'}
+    )

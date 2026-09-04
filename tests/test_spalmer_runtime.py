@@ -229,6 +229,85 @@ class _RankedFakeSpalmerModel(_FakeSpalmerModel):
         )
 
 
+class _RecurrentFakeSpalmerModel(_FakeSpalmerModel):
+    """A flat fake that also advertises and records a recurrent core."""
+
+    def __init__(
+        self,
+        next_tokens: list[int] | None = None,
+        *,
+        default_steps: int = 4,
+        decode_steps: list[int] | None = None,
+    ) -> None:
+        super().__init__(next_tokens)
+        self.config = SimpleNamespace(
+            vocab_size=8,
+            d_model=4,
+            n_layers=4,
+            recurrence=SimpleNamespace(
+                prelude_layers=1,
+                core_layers=2,
+                coda_layers=1,
+                default_steps=default_steps,
+            ),
+        )
+        self.decode_steps = list(decode_steps or [])
+        self.forward_kwargs: list[dict] = []
+        self.default_calls: list[tuple] = []
+
+    def set_recurrence_defaults(self, steps, adaptive_exit=None) -> None:
+        self.default_calls.append((steps, adaptive_exit))
+
+    def forward(self, input_ids, **kwargs):
+        decode = kwargs.get("execution_mode") == "decode"
+        self.forward_kwargs.append(dict(kwargs))
+        base = super().forward(input_ids, **kwargs)
+        steps = kwargs.get("recurrence_steps")
+        if decode and self.decode_steps:
+            index = sum(
+                1 for call in self.forward_kwargs if call.get("execution_mode") == "decode"
+            ) - 1
+            steps = self.decode_steps[min(index, len(self.decode_steps) - 1)]
+        return SimpleNamespace(
+            logits=base.logits,
+            token_mixer_states=base.token_mixer_states,
+            channel_mixer_states=base.channel_mixer_states,
+            recurrence_steps=steps,
+            latent_states=torch.zeros(1, input_ids.shape[1], self.config.d_model),
+        )
+
+    @property
+    def prefill_kwargs(self) -> dict:
+        return next(
+            call for call in self.forward_kwargs if call.get("execution_mode") != "decode"
+        )
+
+    @property
+    def decode_kwargs(self) -> list[dict]:
+        return [
+            call for call in self.forward_kwargs if call.get("execution_mode") == "decode"
+        ]
+
+
+class _FakeAdaptiveExit:
+    def __init__(self, *, criterion, threshold=None, min_steps=2, state_policy="fill") -> None:
+        self.criterion = criterion
+        self.threshold = threshold
+        self.min_steps = min_steps
+        self.state_policy = state_policy
+
+
+def _install_fake_modeling(monkeypatch) -> None:
+    """Expose ``spalmer.modeling.AdaptiveExit`` without the real package."""
+
+    package = types.ModuleType("spalmer")
+    package.__path__ = []
+    modeling = types.ModuleType("spalmer.modeling")
+    modeling.AdaptiveExit = _FakeAdaptiveExit
+    monkeypatch.setitem(sys.modules, "spalmer", package)
+    monkeypatch.setitem(sys.modules, "spalmer.modeling", modeling)
+
+
 def _facade(
     model: nn.Module,
     *,
@@ -236,6 +315,7 @@ def _facade(
     dynamic: bool = False,
     full_pool: bool = False,
     paging: bool = False,
+    **recurrence,
 ) -> SpalmerCausalLMFacade:
     tokenizer = tokenizer or SimpleNamespace(eos_token_id=2)
     return SpalmerCausalLMFacade(
@@ -248,6 +328,7 @@ def _facade(
         full_pool_routing=full_pool or paging,
         max_context_tokens=64,
         cuda_available=False,
+        **recurrence,
     )
 
 
@@ -1020,3 +1101,288 @@ def test_load_spalmer_checkpoint_payload_reads_binding_without_building(tmp_path
     (tmp_path / "bad.pt").write_bytes(b"not a checkpoint")
     with pytest.raises(Exception):
         load_spalmer_checkpoint_payload(tmp_path / "bad.pt")
+
+
+def test_facade_defaults_recurrence_steps_from_checkpoint_and_threads_every_call() -> None:
+    model = _RecurrentFakeSpalmerModel([4, 5, 6], default_steps=4)
+    runtime = _facade(model)
+
+    assert runtime.recurrent is True
+    assert runtime.recurrence_steps == 4
+    # ``num_hidden_layers`` stays physical; the core multiplies the depth.
+    assert runtime.config.num_hidden_layers == 4
+    assert runtime.config.effective_depth == 1 + 4 * 2 + 1
+    assert runtime.config.recurrence_steps == 4
+    assert model.default_calls == [(4, None)]
+
+    generated = runtime.generate(torch.tensor([[1]]), max_new_tokens=3, eos_token_id=2)
+
+    assert generated.tolist() == [[1, 4, 5, 6]]
+    assert model.prefill_kwargs["recurrence_steps"] == 4
+    assert "adaptive_exit" not in model.prefill_kwargs
+    assert "latent_generator" not in model.prefill_kwargs
+    decode = model.decode_kwargs
+    assert len(decode) == 2
+    assert all(call["recurrence_steps"] == 4 for call in decode)
+    assert all("adaptive_exit" not in call for call in decode)
+    assert all("latent_init" not in call for call in decode)
+
+    telemetry = runtime.last_recurrence_telemetry
+    assert telemetry["recurrence_steps"] == 4
+    assert telemetry["adaptive_exit"] == "none"
+    assert telemetry["decode_tokens"] == 2
+    assert telemetry["prefill_steps"] == 4
+    assert telemetry["mean_decode_steps"] == 4.0
+    assert telemetry["early_exits"] == 0
+    assert telemetry["effective_depth_mean"] == 10.0
+    assert telemetry["per_token_steps"] == [4, 4]
+    assert runtime.routing_telemetry()["recurrence"]["decode_tokens"] == 2
+
+
+def test_facade_adaptive_exit_and_warm_start_kwargs(monkeypatch) -> None:
+    _install_fake_modeling(monkeypatch)
+    model = _RecurrentFakeSpalmerModel([4, 5, 6], default_steps=4, decode_steps=[2, 4])
+    runtime = _facade(
+        model,
+        adaptive_exit="latent_diff",
+        exit_threshold=0.05,
+        warm_start=True,
+    )
+
+    runtime.generate(torch.tensor([[1]]), max_new_tokens=3, eos_token_id=2, seed=7)
+
+    # Prefill always runs the full budget: adaptive exit is decode-only.
+    assert "adaptive_exit" not in model.prefill_kwargs
+    assert model.prefill_kwargs["latent_generator"] is not None
+    decode = model.decode_kwargs
+    exits = [call["adaptive_exit"] for call in decode]
+    assert all(isinstance(value, _FakeAdaptiveExit) for value in exits)
+    assert exits[0].criterion == "latent_diff"
+    assert exits[0].threshold == 0.05
+    assert exits[0].min_steps == 2
+    assert exits[0].state_policy == "fill"
+    assert [tuple(call["latent_init"].shape) for call in decode] == [(1, 1, 4), (1, 1, 4)]
+
+    telemetry = runtime.last_recurrence_telemetry
+    assert telemetry["adaptive_exit"] == "latent_diff"
+    assert telemetry["exit_threshold"] == 0.05
+    assert telemetry["warm_start"] is True
+    assert telemetry["per_token_steps"] == [2, 4]
+    assert telemetry["min_decode_steps"] == 2
+    assert telemetry["max_decode_steps"] == 4
+    assert telemetry["early_exits"] == 1
+    assert telemetry["mean_decode_steps"] == 3.0
+
+
+def test_facade_seeded_generation_reuses_one_latent_generator(monkeypatch) -> None:
+    _install_fake_modeling(monkeypatch)
+    model = _RecurrentFakeSpalmerModel([4, 5])
+    runtime = _facade(model)
+
+    runtime.generate(torch.tensor([[1]]), max_new_tokens=2, eos_token_id=2, seed=11)
+
+    generators = {
+        id(call["latent_generator"])
+        for call in model.forward_kwargs
+        if "latent_generator" in call
+    }
+    assert len(generators) == 1
+    assert len(model.forward_kwargs) == 2
+
+    unseeded = _RecurrentFakeSpalmerModel([4, 5])
+    _facade(unseeded).generate(torch.tensor([[1]]), max_new_tokens=2, eos_token_id=2)
+    assert all("latent_generator" not in call for call in unseeded.forward_kwargs)
+
+
+def test_facade_rejects_recurrence_settings_for_flat_checkpoints() -> None:
+    model = _FakeSpalmerModel()
+
+    for kwargs in (
+        {"recurrence_steps": 4},
+        {"adaptive_exit": "latent_diff"},
+        {"warm_start": True},
+        {"exit_threshold": 0.05},
+    ):
+        with pytest.raises(ValueError, match="no recurrent core"):
+            _facade(_FakeSpalmerModel(), **kwargs)
+
+    runtime = _facade(model)
+    assert runtime.recurrent is False
+    assert runtime.recurrence_steps is None
+    assert runtime.config.effective_depth == 4
+    assert runtime._native_recurrence_kwargs(decode=True) == {}
+    with pytest.raises(ValueError, match="no recurrent core"):
+        runtime.generate(torch.tensor([[1]]), max_new_tokens=1, recurrence_steps=2)
+
+
+def test_facade_per_call_overrides_validate(monkeypatch) -> None:
+    _install_fake_modeling(monkeypatch)
+    model = _RecurrentFakeSpalmerModel([4, 5])
+    runtime = _facade(model)
+
+    with pytest.raises(ValueError, match="recurrence_steps must be at least 1"):
+        runtime.generate(torch.tensor([[1]]), max_new_tokens=1, recurrence_steps=0)
+    with pytest.raises(ValueError, match="unknown SPALMER adaptive exit criterion"):
+        runtime.generate(torch.tensor([[1]]), max_new_tokens=1, adaptive_exit="entropy")
+    with pytest.raises(ValueError, match="exit_threshold must be positive"):
+        runtime.generate(torch.tensor([[1]]), max_new_tokens=1, exit_threshold=0.0)
+    with pytest.raises(ValueError, match="unsupported non-default"):
+        runtime.generate(torch.tensor([[1]]), max_new_tokens=1, recurrence_depth=3)
+
+    runtime.generate(
+        torch.tensor([[1]]),
+        max_new_tokens=2,
+        eos_token_id=2,
+        recurrence_steps=2,
+        adaptive_exit="kl",
+    )
+    assert model.prefill_kwargs["recurrence_steps"] == 2
+    assert model.decode_kwargs[0]["adaptive_exit"].criterion == "kl"
+    # Per-call overrides never mutate the loaded policy.
+    assert runtime.recurrence_steps == 4
+    assert runtime.adaptive_exit == "none"
+
+
+def test_facade_forward_injects_default_recurrence_steps() -> None:
+    model = _RecurrentFakeSpalmerModel(default_steps=6)
+    runtime = _facade(model)
+
+    runtime.forward(torch.tensor([[1, 2]]))
+    assert model.forward_kwargs[-1]["recurrence_steps"] == 6
+
+    runtime.forward(torch.tensor([[1, 2]]), recurrence_steps=2)
+    assert model.forward_kwargs[-1]["recurrence_steps"] == 2
+
+    flat = _FakeSpalmerModel()
+    _facade(flat).forward(torch.tensor([[1, 2]]))
+    assert flat.calls == 1
+
+
+def test_load_spalmer_runtime_recurrence_notes_and_config_fields(tmp_path, monkeypatch) -> None:
+    checkpoint = tmp_path / "spalmer.pt"
+    _write_checkpoint(checkpoint)
+    model = _RecurrentFakeSpalmerModel(default_steps=4)
+    tokenizer = _GenericTokenizer()
+    tokenizer.identity = SimpleNamespace(backend="spalmer-rpd-v2")
+    _fake_spalmer_module(monkeypatch, model, tokenizer, {"sequence_length": 512})
+
+    runtime = load_spalmer_runtime(
+        checkpoint,
+        expert_offload=False,
+        recurrence_steps=6,
+        adaptive_exit="latent_diff",
+        exit_threshold=0.02,
+        warm_start=True,
+    )
+
+    assert runtime.recurrent is True
+    assert runtime.recurrence_steps == 6
+    assert runtime.config.effective_depth == 1 + 6 * 2 + 1
+    assert runtime.config.spalmer_recurrence["core_layers"] == 2
+    assert runtime.config.spalmer_recurrence["default_steps"] == 4
+    notes = " ".join(runtime.notes)
+    assert "effective depth 14" in notes
+    assert "core 2 × 6" in notes
+    assert "adaptive exit latent_diff" in notes
+    assert "warm start on" in notes
+    assert "union of the routes" in notes
+
+
+def test_load_spalmer_runtime_rejects_recurrence_for_a_flat_bundle(tmp_path, monkeypatch) -> None:
+    checkpoint = tmp_path / "spalmer.pt"
+    _write_checkpoint(checkpoint)
+    model = _FakeSpalmerModel()
+    tokenizer = _GenericTokenizer()
+    tokenizer.identity = SimpleNamespace(backend="spalmer-rpd-v2")
+    _fake_spalmer_module(monkeypatch, model, tokenizer, {})
+
+    with pytest.raises(ValueError, match="no recurrent core"):
+        load_spalmer_runtime(checkpoint, expert_offload=False, recurrence_steps=4)
+
+    runtime = load_spalmer_runtime(checkpoint, expert_offload=False)
+    assert runtime.recurrent is False
+    assert all("Recurrent depth" not in note for note in runtime.notes)
+
+
+def test_dynamic_generation_passes_recurrence_steps_to_residency_controller(monkeypatch) -> None:
+    model = _RecurrentFakeSpalmerModel([4, 2])
+    runtime = _facade(model, dynamic=True)
+    initial = model(torch.tensor([[1]]), recurrence_steps=4)
+    model.calls = 0
+    model.forward_kwargs.clear()
+    decision = SimpleNamespace(
+        output=initial,
+        resident_ids=(0, 1),
+        active_experts=2,
+        effective_nll=None,
+        predictive_entropy=1.5,
+        average_surprise=1.0,
+        trace=(),
+        expansions=(),
+    )
+    seen: list[dict] = []
+
+    def choose(selected_model, prompt, *, recurrence_steps):
+        seen.append({"model": selected_model, "recurrence_steps": recurrence_steps})
+        return decision
+
+    experts = types.ModuleType("spalmer.experts")
+    experts.choose_inference_residency = choose
+    package = types.ModuleType("spalmer")
+    package.__path__ = []
+    monkeypatch.setitem(sys.modules, "spalmer", package)
+    monkeypatch.setitem(sys.modules, "spalmer.experts", experts)
+
+    runtime.generate(torch.tensor([[1]]), max_new_tokens=2, eos_token_id=2)
+
+    assert seen == [{"model": model, "recurrence_steps": 4}]
+
+    # A flat checkpoint must still work with a controller that predates the
+    # recurrence keyword entirely.
+    flat = _FakeSpalmerModel([4, 2])
+    flat_runtime = _facade(flat, dynamic=True)
+    flat_initial = flat(torch.tensor([[1]]))
+    flat.calls = 0
+    experts.choose_inference_residency = lambda selected_model, prompt: SimpleNamespace(
+        output=flat_initial,
+        resident_ids=(0, 1),
+        active_experts=2,
+        effective_nll=None,
+        predictive_entropy=1.5,
+        average_surprise=1.0,
+        trace=(),
+        expansions=(),
+    )
+    flat_runtime.generate(torch.tensor([[1]]), max_new_tokens=2, eos_token_id=2)
+    assert flat_runtime.last_recurrence_telemetry is None
+
+
+def test_scan_reports_recurrence_config_and_effective_depth(tmp_path: Path) -> None:
+    payload = _checkpoint_payload()
+    payload["format_version"] = 6
+    payload["model_config"]["recurrence"] = {
+        "prelude_layers": 1,
+        "core_layers": 2,
+        "coda_layers": 1,
+        "default_steps": 8,
+        "latent_init_std": 1.0,
+    }
+    recurrent = tmp_path / "recurrent" / "spalmer.pt"
+    recurrent.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(payload, recurrent)
+
+    result = scan_spalmer_checkpoint(recurrent)
+
+    assert result["recurrence_config"]["core_layers"] == 2
+    # ``num_layers`` stays physical so the registry keeps its meaning.
+    assert result["num_layers"] == 4
+    assert result["effective_depth"] == 1 + 8 * 2 + 1
+    assert result["base_cfg"]["spalmer_recurrence_config"]["default_steps"] == 8
+    assert result["base_cfg"]["effective_depth"] == 18
+    assert result["base_cfg"]["num_hidden_layers"] == 4
+
+    flat = _write_checkpoint(tmp_path / "flat" / "spalmer.pt")
+    flat_result = scan_spalmer_checkpoint(flat)
+    assert flat_result["recurrence_config"] is None
+    assert flat_result["effective_depth"] == 4
+    assert flat_result["num_layers"] == 4

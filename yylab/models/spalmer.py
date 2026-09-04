@@ -22,6 +22,121 @@ from ..config import PATHS
 SPALMER_FORMAT = "spalmer.prototype.checkpoint"
 SPALMER_FILENAME = "spalmer.pt"
 DEFAULT_CONTEXT_LIMIT = 8_192
+ADAPTIVE_EXIT_CRITERIA = ("none", "latent_diff", "kl")
+EXIT_STATE_POLICIES = ("fill", "skip")
+DEFAULT_RECURRENCE_STEPS = 8
+_PER_TOKEN_STEP_LIMIT = 4_096
+# Chat, the benchmark UI and the checkpoints page all read a bundle's recurrent
+# core through the same three metadata shapes: a run receipt written by the
+# training bridge, a registry row produced by ``scan_spalmer_checkpoint``, and a
+# scanned bundle whose native metadata is nested one level down.
+_RECURRENCE_METADATA_KEYS = ("recurrence", "recurrence_config")
+
+
+def recurrence_metadata(meta: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """Return a checkpoint's recurrence block from any recorded metadata shape."""
+
+    if not isinstance(meta, Mapping):
+        return None
+    for key in _RECURRENCE_METADATA_KEYS:
+        value = meta.get(key)
+        if isinstance(value, Mapping) and value:
+            return dict(value)
+    nested = meta.get("metadata")
+    if isinstance(nested, Mapping):
+        for key in _RECURRENCE_METADATA_KEYS:
+            value = nested.get(key)
+            if isinstance(value, Mapping) and value:
+                return dict(value)
+    return None
+
+
+def recurrence_effective_depth(
+    num_layers: int, recurrence: Mapping[str, Any] | None, steps: int | None = None
+) -> int:
+    """Return P + steps*C + K, or the physical depth when there is no core."""
+
+    if not isinstance(recurrence, Mapping) or not recurrence:
+        return int(num_layers)
+    try:
+        prelude = int(recurrence["prelude_layers"])
+        core = int(recurrence["core_layers"])
+        coda = int(recurrence["coda_layers"])
+        depth = int(steps if steps is not None else recurrence.get("default_steps", DEFAULT_RECURRENCE_STEPS))
+    except (KeyError, TypeError, ValueError):
+        # A malformed block must never make a registry scan fail; the physical
+        # depth stays the honest fallback.
+        return int(num_layers)
+    if min(prelude, core, coda, depth) < 1:
+        return int(num_layers)
+    return prelude + depth * core + coda
+
+
+def _recurrence_config_dict(value: object) -> dict[str, Any] | None:
+    """Normalize a native ``RecurrenceConfig`` (or mapping) into plain data."""
+
+    if value is None:
+        return None
+    if isinstance(value, Mapping):
+        return dict(value)
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        converted = to_dict()
+        if isinstance(converted, Mapping):
+            return dict(converted)
+    fields = (
+        "prelude_layers",
+        "core_layers",
+        "coda_layers",
+        "default_steps",
+        "latent_init_std",
+        "adapter",
+        "adapter_init",
+    )
+    collected = {
+        name: getattr(value, name) for name in fields if getattr(value, name, None) is not None
+    }
+    return collected or None
+
+
+def _validate_recurrence_policy(
+    *,
+    recurrent: bool,
+    recurrence_steps: int | None,
+    adaptive_exit: str | None,
+    exit_threshold: float | None,
+    min_steps: int | None,
+    warm_start: bool | None,
+    exit_state_policy: str | None,
+) -> None:
+    """Reject recurrence policies a checkpoint cannot honour, before placement."""
+
+    requested = (
+        recurrence_steps is not None
+        or (adaptive_exit is not None and adaptive_exit != "none")
+        or exit_threshold is not None
+        or bool(warm_start)
+    )
+    if requested and not recurrent:
+        raise ValueError(
+            "SPALMER checkpoint has no recurrent core; clear the recurrence settings"
+        )
+    if adaptive_exit is not None and adaptive_exit not in ADAPTIVE_EXIT_CRITERIA:
+        raise ValueError(
+            "unknown SPALMER adaptive exit criterion: "
+            f"{adaptive_exit!r} (expected one of {', '.join(ADAPTIVE_EXIT_CRITERIA)})"
+        )
+    if exit_state_policy is not None and exit_state_policy not in EXIT_STATE_POLICIES:
+        raise ValueError(
+            "unknown SPALMER exit state policy: "
+            f"{exit_state_policy!r} (expected one of {', '.join(EXIT_STATE_POLICIES)})"
+        )
+    if recurrence_steps is not None and int(recurrence_steps) < 1:
+        raise ValueError("recurrence_steps must be at least 1")
+    if exit_threshold is not None and float(exit_threshold) <= 0:
+        raise ValueError("exit_threshold must be positive")
+    if min_steps is not None and int(min_steps) < 1:
+        raise ValueError("min_steps must be at least 1")
 
 
 def resolve_spalmer_checkpoint(ref: str | Path) -> Path:
@@ -94,6 +209,10 @@ def scan_spalmer_checkpoint(ref: str | Path) -> dict[str, Any]:
     hidden_size = _positive_int(model_config.get("d_model"), "model_config.d_model")
     num_layers = _positive_int(model_config.get("n_layers"), "model_config.n_layers")
     vocab_size = _positive_int(model_config.get("vocab_size"), "model_config.vocab_size")
+    recurrence_config = _optional_plain_dict(
+        model_config.get("recurrence"), "model_config.recurrence"
+    )
+    effective_depth = recurrence_effective_depth(num_layers, recurrence_config)
     state_tensor_count = _unique_tensor_numel(model_state.values())
     planned_parameter_count = _metadata_parameter_count(metadata)
     parameter_count = planned_parameter_count or state_tensor_count
@@ -114,6 +233,9 @@ def scan_spalmer_checkpoint(ref: str | Path) -> dict[str, Any]:
         "spalmer_mla_config": mla_config,
         "spalmer_directional_config": directional_config,
         "spalmer_atxy_config": atxy_config,
+        # ``num_hidden_layers`` stays physical; recurrence multiplies the core.
+        "spalmer_recurrence_config": recurrence_config,
+        "effective_depth": effective_depth,
     }
     return {
         "family": "spalmer",
@@ -132,6 +254,8 @@ def scan_spalmer_checkpoint(ref: str | Path) -> dict[str, Any]:
         "hidden_size": hidden_size,
         "num_layers": num_layers,
         "vocab_size": vocab_size,
+        "recurrence_config": recurrence_config,
+        "effective_depth": effective_depth,
         "parameter_dtype": payload.get("model_parameter_dtype"),
         "trained_context_length": trained_context,
         "base_cfg": base_cfg,
@@ -317,6 +441,12 @@ class SpalmerCausalLMFacade(nn.Module):
         max_context_tokens: int,
         cuda_available: bool,
         notes: Sequence[str] = (),
+        recurrence_steps: int | None = None,
+        adaptive_exit: str = "none",
+        exit_threshold: float | None = None,
+        min_steps: int = 2,
+        warm_start: bool = False,
+        exit_state_policy: str = "fill",
     ) -> None:
         super().__init__()
         self.model = model
@@ -340,16 +470,136 @@ class SpalmerCausalLMFacade(nn.Module):
         self.cuda = self.cuda_available
         self.notes = list(notes)
         self.last_routing_telemetry: dict[str, object] | None = None
+
+        recurrence = _recurrence_config_dict(getattr(model.config, "recurrence", None))
+        self.recurrence_config = recurrence
+        self.recurrent = recurrence is not None
+        _validate_recurrence_policy(
+            recurrent=self.recurrent,
+            recurrence_steps=recurrence_steps,
+            adaptive_exit=adaptive_exit,
+            exit_threshold=exit_threshold,
+            min_steps=min_steps,
+            warm_start=warm_start,
+            exit_state_policy=exit_state_policy,
+        )
+        default_steps = (
+            int((recurrence or {}).get("default_steps") or DEFAULT_RECURRENCE_STEPS)
+            if self.recurrent
+            else None
+        )
+        self.recurrence_steps: int | None = (
+            None
+            if not self.recurrent
+            else int(recurrence_steps) if recurrence_steps is not None else default_steps
+        )
+        self.adaptive_exit = str(adaptive_exit or "none") if self.recurrent else "none"
+        self.exit_threshold = (
+            float(exit_threshold) if self.recurrent and exit_threshold is not None else None
+        )
+        self.min_steps = int(min_steps)
+        self.warm_start = bool(warm_start) and self.recurrent
+        self.exit_state_policy = str(exit_state_policy or "fill")
+        self.last_recurrence_telemetry: dict[str, object] | None = None
+        physical_layers = int(model.config.n_layers)
+        self.effective_depth = recurrence_effective_depth(
+            physical_layers, recurrence, self.recurrence_steps
+        )
+        if self.recurrent:
+            # Honour the loaded depth even for bare ``model(ids)`` calls made by
+            # native helpers yyLab does not thread kwargs through.
+            set_defaults = getattr(model, "set_recurrence_defaults", None)
+            if callable(set_defaults):
+                set_defaults(self.recurrence_steps)
+
         self.config = SimpleNamespace(
             model_type="spalmer",
             architectures=["SPALMERCausalLM"],
             vocab_size=int(model.config.vocab_size),
             hidden_size=int(model.config.d_model),
-            num_hidden_layers=int(model.config.n_layers),
+            # Physical blocks; ``effective_depth`` carries P + r*C + K.
+            num_hidden_layers=physical_layers,
             max_position_embeddings=int(max_context_tokens),
             use_cache=True,
             is_encoder_decoder=False,
+            spalmer_recurrence=recurrence,
+            effective_depth=self.effective_depth,
+            recurrence_steps=self.recurrence_steps,
         )
+
+    def _native_recurrence_kwargs(
+        self,
+        *,
+        decode: bool,
+        steps: int | None = None,
+        adaptive_exit: str | None = None,
+        exit_threshold: float | None = None,
+        min_steps: int | None = None,
+        exit_state_policy: str | None = None,
+    ) -> dict[str, Any]:
+        """Build the native depth kwargs; ``{}`` for a flat checkpoint."""
+
+        if not self.recurrent:
+            return {}
+        kwargs: dict[str, Any] = {
+            "recurrence_steps": self.recurrence_steps if steps is None else int(steps)
+        }
+        criterion = self.adaptive_exit if adaptive_exit is None else str(adaptive_exit)
+        if not decode or criterion == "none":
+            return kwargs
+        threshold = self.exit_threshold if exit_threshold is None else exit_threshold
+        from spalmer.modeling import AdaptiveExit
+
+        kwargs["adaptive_exit"] = AdaptiveExit(
+            criterion=criterion,
+            threshold=None if threshold is None else float(threshold),
+            min_steps=int(self.min_steps if min_steps is None else min_steps),
+            state_policy=str(
+                self.exit_state_policy if exit_state_policy is None else exit_state_policy
+            ),
+        )
+        return kwargs
+
+    def _recurrence_receipt(
+        self,
+        *,
+        steps: int | None,
+        criterion: str,
+        threshold: float | None,
+        min_steps: int,
+        warm_start: bool,
+        prefill_steps: int | None,
+        decode_steps: Sequence[int],
+    ) -> dict[str, object]:
+        """Summarize one request's realized depth for chat and benchmarks."""
+
+        observed = [int(value) for value in decode_steps]
+        mean_steps = (sum(observed) / len(observed)) if observed else None
+        recurrence = self.recurrence_config or {}
+        prelude = int(recurrence.get("prelude_layers") or 0)
+        core = int(recurrence.get("core_layers") or 0)
+        coda = int(recurrence.get("coda_layers") or 0)
+        return {
+            "recurrence_steps": steps,
+            "adaptive_exit": criterion,
+            "exit_threshold": threshold,
+            "min_steps": int(min_steps),
+            "warm_start": bool(warm_start),
+            "exit_state_policy": self.exit_state_policy,
+            "prefill_steps": prefill_steps,
+            "decode_tokens": len(observed),
+            "mean_decode_steps": mean_steps,
+            "min_decode_steps": min(observed) if observed else None,
+            "max_decode_steps": max(observed) if observed else None,
+            "early_exits": sum(
+                1 for value in observed if steps is not None and value < int(steps)
+            ),
+            "effective_depth_mean": (
+                None if mean_steps is None else prelude + mean_steps * core + coda
+            ),
+            # Bounded so a long generation never grows an unbounded receipt.
+            "per_token_steps": observed[:_PER_TOKEN_STEP_LIMIT],
+        }
 
     @property
     def device(self) -> torch.device:
@@ -374,13 +624,21 @@ class SpalmerCausalLMFacade(nn.Module):
             # Paging counters and layer-local identities change during decode,
             # so always read a fresh native snapshot instead of returning the
             # prefill receipt captured below.
-            return _full_pool_routing_telemetry(
+            value = _full_pool_routing_telemetry(
                 self.model,
                 expert_paging=self.expert_paging,
             )
-        if self.last_routing_telemetry is not None:
-            return dict(self.last_routing_telemetry)
-        return _fixed_residency_telemetry(self.model)
+        elif self.last_routing_telemetry is not None:
+            value = dict(self.last_routing_telemetry)
+        else:
+            value = _fixed_residency_telemetry(self.model)
+        if self.last_recurrence_telemetry is None:
+            return value
+        # A recurrent request always publishes its realized depth, even when a
+        # CPU/no-offload load has no expert-placement snapshot to report.
+        receipt = dict(value) if isinstance(value, dict) else {}
+        receipt["recurrence"] = dict(self.last_recurrence_telemetry)
+        return receipt
 
     def expert_offload_telemetry(self) -> dict[str, object] | None:
         """Return a serialization-safe physical placement snapshot."""
@@ -399,6 +657,10 @@ class SpalmerCausalLMFacade(nn.Module):
         **kwargs: Any,
     ) -> object:
         del use_cache, return_dict
+        if self.recurrent:
+            # NLL scoring and context compaction call the facade directly; they
+            # must run at the loaded depth rather than the checkpoint default.
+            kwargs.setdefault("recurrence_steps", self.recurrence_steps)
         if not output_hidden_states:
             return self.model(
                 input_ids,
@@ -451,6 +713,11 @@ class SpalmerCausalLMFacade(nn.Module):
         generator: torch.Generator | None = None,
         seed: int | None = None,
         dynamic_residency: bool | None = None,
+        recurrence_steps: int | None = None,
+        adaptive_exit: str | None = None,
+        exit_threshold: float | None = None,
+        min_steps: int | None = None,
+        warm_start: bool | None = None,
         use_cache: bool | None = None,
         **kwargs: Any,
     ) -> Tensor:
@@ -469,6 +736,34 @@ class SpalmerCausalLMFacade(nn.Module):
             raise ValueError("repetition_penalty must be positive")
         if not isinstance(no_repeat_ngram_size, int) or no_repeat_ngram_size < 0:
             raise ValueError("no_repeat_ngram_size must be a non-negative integer")
+        _validate_recurrence_policy(
+            recurrent=self.recurrent,
+            recurrence_steps=recurrence_steps,
+            adaptive_exit=adaptive_exit,
+            exit_threshold=exit_threshold,
+            min_steps=min_steps,
+            warm_start=warm_start,
+            exit_state_policy=None,
+        )
+        steps = self.recurrence_steps if recurrence_steps is None else int(recurrence_steps)
+        criterion = self.adaptive_exit if adaptive_exit is None else str(adaptive_exit)
+        threshold = self.exit_threshold if exit_threshold is None else float(exit_threshold)
+        exit_min_steps = int(self.min_steps if min_steps is None else min_steps)
+        use_warm_start = bool(self.warm_start if warm_start is None else warm_start)
+        prefill_kwargs = self._native_recurrence_kwargs(
+            decode=False,
+            steps=steps,
+            adaptive_exit=criterion,
+            exit_threshold=threshold,
+            min_steps=exit_min_steps,
+        )
+        decode_kwargs = self._native_recurrence_kwargs(
+            decode=True,
+            steps=steps,
+            adaptive_exit=criterion,
+            exit_threshold=threshold,
+            min_steps=exit_min_steps,
+        )
 
         generated = input_ids.to(device=self.device, dtype=torch.long)
         mask = None if attention_mask is None else attention_mask.to(device=self.device)
@@ -478,6 +773,13 @@ class SpalmerCausalLMFacade(nn.Module):
         if generator is None:
             generator = torch.Generator(device=self.device)
             generator.manual_seed(int(torch.initial_seed() if seed is None else seed))
+        # A seeded request must also reproduce the latent initialization; with
+        # no seed the native forward keeps using the global torch RNG.
+        if self.recurrent and seed is not None:
+            latent_generator = torch.Generator(device=self.device)
+            latent_generator.manual_seed(int(seed))
+            prefill_kwargs["latent_generator"] = latent_generator
+            decode_kwargs["latent_generator"] = latent_generator
 
         if self.full_pool_routing and dynamic_residency:
             raise ValueError(
@@ -493,6 +795,10 @@ class SpalmerCausalLMFacade(nn.Module):
         was_training = self.model.training
         decision = None
         self.last_routing_telemetry = None
+        self.last_recurrence_telemetry = None
+        decode_steps: list[int] = []
+        prefill_steps_run: int | None = None
+        ran_prefill = False
         self.model.eval()
         try:
             if streamer is not None:
@@ -504,7 +810,7 @@ class SpalmerCausalLMFacade(nn.Module):
                 # Native paging is a physical placement policy only.  The
                 # router must see the full trained pool, and the selected rows
                 # are materialized by the layer-local cache on demand.
-                output = self.model(generated, attention_mask=mask)
+                output = self.model(generated, attention_mask=mask, **prefill_kwargs)
                 self.last_routing_telemetry = _full_pool_routing_telemetry(
                     self.model,
                     expert_paging=self.expert_paging,
@@ -512,7 +818,13 @@ class SpalmerCausalLMFacade(nn.Module):
             elif use_dynamic:
                 from spalmer.experts import choose_inference_residency
 
-                decision = choose_inference_residency(self.model, generated)
+                # The kwarg is omitted for flat checkpoints so residency
+                # controllers that predate recurrence keep their signature.
+                decision = choose_inference_residency(
+                    self.model,
+                    generated,
+                    **({"recurrence_steps": steps} if self.recurrent else {}),
+                )
                 output = decision.output
                 request_open = True
                 # Publish the request receipt as soon as residency selection
@@ -520,8 +832,10 @@ class SpalmerCausalLMFacade(nn.Module):
                 # still streaming, rather than only after the final token.
                 self.last_routing_telemetry = _residency_telemetry(self.model, decision)
             else:
-                output = self.model(generated, attention_mask=mask)
+                output = self.model(generated, attention_mask=mask, **prefill_kwargs)
                 self.last_routing_telemetry = _fixed_residency_telemetry(self.model)
+            ran_prefill = True
+            prefill_steps_run = _output_recurrence_steps(output)
             token_states = output.token_mixer_states
             channel_states = output.channel_mixer_states
 
@@ -553,21 +867,54 @@ class SpalmerCausalLMFacade(nn.Module):
                 )
                 if reached_eos or externally_stopped or index + 1 == max_new_tokens:
                     break
+                step_kwargs = dict(decode_kwargs)
+                if use_warm_start:
+                    latent = getattr(output, "latent_states", None)
+                    if latent is not None:
+                        step_kwargs["latent_init"] = latent[:, -1:, :]
                 output = self.model(
                     next_token,
                     token_mixer_states=token_states,
                     channel_mixer_states=channel_states,
                     execution_mode="decode",
+                    **step_kwargs,
                 )
+                steps_run = _output_recurrence_steps(output)
+                if steps_run is not None:
+                    decode_steps.append(steps_run)
                 token_states = output.token_mixer_states
                 channel_states = output.channel_mixer_states
             return generated
         finally:
+            if self.recurrent and ran_prefill:
+                self.last_recurrence_telemetry = self._recurrence_receipt(
+                    steps=steps,
+                    criterion=criterion,
+                    threshold=threshold,
+                    min_steps=exit_min_steps,
+                    warm_start=use_warm_start,
+                    prefill_steps=(
+                        steps if prefill_steps_run is None else prefill_steps_run
+                    ),
+                    decode_steps=decode_steps,
+                )
             if request_open:
                 self.model.end_residency_request()
             self.model.train(was_training)
             if streamer is not None:
                 streamer.end()
+
+
+def _output_recurrence_steps(output: object) -> int | None:
+    """Read a native output's realized iteration count when it reports one."""
+
+    value = getattr(output, "recurrence_steps", None)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _checkpoint_tokenizer_binding(path: Path) -> dict[str, Any] | None:
@@ -647,6 +994,12 @@ def load_spalmer_runtime(
     expert_offload: bool = True,
     expert_cache_size: int | None = None,
     expert_paging: bool = True,
+    recurrence_steps: int | None = None,
+    adaptive_exit: str = "none",
+    exit_threshold: float | None = None,
+    min_steps: int = 2,
+    warm_start: bool = False,
+    exit_state_policy: str = "fill",
 ) -> SpalmerCausalLMFacade:
     """Load a native bundle and return an HF-shaped inference facade."""
 
@@ -669,6 +1022,18 @@ def load_spalmer_runtime(
     if tokenizer_override is not None:
         load_kwargs["tokenizer_override"] = tokenizer_override
     model, loaded_tokenizer, metadata = load_checkpoint(checkpoint_path, **load_kwargs)
+    # Validate the depth policy against the loaded architecture before any
+    # accelerator placement so a mismatch never costs a GPU transfer.
+    recurrence_config = _recurrence_config_dict(getattr(model.config, "recurrence", None))
+    _validate_recurrence_policy(
+        recurrent=recurrence_config is not None,
+        recurrence_steps=recurrence_steps,
+        adaptive_exit=adaptive_exit,
+        exit_threshold=exit_threshold,
+        min_steps=min_steps,
+        warm_start=warm_start,
+        exit_state_policy=exit_state_policy,
+    )
     cuda = torch.cuda.is_available()
     device = torch.device("cuda" if cuda else "cpu")
     offload: dict[str, object] | None = None
@@ -790,6 +1155,40 @@ def load_spalmer_runtime(
             "SPALMER is using the FP32 CPU fallback; all experts remain CPU-resident and "
             "an accelerator expert cache is not applicable."
         )
+    if recurrence_config is not None:
+        resolved_steps = int(
+            recurrence_steps
+            if recurrence_steps is not None
+            else (recurrence_config.get("default_steps") or DEFAULT_RECURRENCE_STEPS)
+        )
+        depth = recurrence_effective_depth(
+            int(model.config.n_layers), recurrence_config, resolved_steps
+        )
+        exit_text = (
+            "fixed depth"
+            if adaptive_exit == "none"
+            else (
+                f"adaptive exit {adaptive_exit}"
+                + (
+                    ""
+                    if exit_threshold is None
+                    else f" (threshold {float(exit_threshold):g})"
+                )
+                + f", minimum {int(min_steps)} steps, {exit_state_policy} state policy"
+            )
+        )
+        notes.extend(
+            (
+                "Recurrent depth: prelude "
+                f"{int(recurrence_config.get('prelude_layers') or 0)} · core "
+                f"{int(recurrence_config.get('core_layers') or 0)} × {resolved_steps} · coda "
+                f"{int(recurrence_config.get('coda_layers') or 0)} "
+                f"(effective depth {depth}); {exit_text}; warm start "
+                f"{'on' if warm_start else 'off'}.",
+                "The paged expert cache is re-staged on every core iteration; size it to "
+                "the union of the routes taken across iterations.",
+            )
+        )
     return SpalmerCausalLMFacade(
         model,
         tokenizer,
@@ -801,6 +1200,12 @@ def load_spalmer_runtime(
         max_context_tokens=context_limit,
         cuda_available=cuda,
         notes=notes,
+        recurrence_steps=recurrence_steps,
+        adaptive_exit=adaptive_exit,
+        exit_threshold=exit_threshold,
+        min_steps=min_steps,
+        warm_start=warm_start,
+        exit_state_policy=exit_state_policy,
     )
 
 

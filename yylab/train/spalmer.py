@@ -50,6 +50,27 @@ INITIALIZATION_CHECKPOINT = "checkpoint"
 CHECKPOINT_EXECUTION_KEYS = frozenset(
     {"attention_backend", "require_fla", "allow_reference_attention"}
 )
+# A v5 bundle has no recurrence block at all; a v6 bundle carries one that may
+# still be ``None``.  Both remain loadable starting points for continued runs.
+SUPPORTED_SPALMER_FORMAT_VERSIONS = frozenset({5, 6})
+RECURRENCE_SAMPLING_MODES = frozenset({"poisson_lognormal", "uniform", "fixed"})
+DEFAULT_RECURRENCE_SAMPLING = "poisson_lognormal"
+RECURRENCE_TRAINING_KEYS = (
+    "mean_recurrence",
+    "mean_backprop_depth",
+    "recurrence_sigma",
+    "recurrence_sampling",
+    "max_recurrence",
+)
+_RECURRENCE_ARCHITECTURE_KEYS = frozenset(
+    {
+        "enabled",
+        "prelude_layers",
+        "coda_layers",
+        "default_steps",
+        "latent_init_std",
+    }
+)
 
 _EXPERT_RUNTIME_FIELDS = frozenset(
     {
@@ -116,11 +137,13 @@ def _load_spalmer_api() -> SimpleNamespace:
         from spalmer import load_checkpoint, save_checkpoint
         from spalmer.attention import KDAConfig, MLAConfig
         from spalmer.attention.backends import fla_available
-        from spalmer.config import SPALMERConfig
+        from spalmer.checkpoint import FORMAT_VERSION
+        from spalmer.config import RecurrenceConfig, SPALMERConfig
         from spalmer.directional import DirectionalConfig
         from spalmer.experiment.planning import (
             ATXYScaleConfig,
             DirectionalScaleConfig,
+            RecurrenceScaleConfig,
             ScaleSearchSpace,
             plan_configuration,
         )
@@ -146,10 +169,13 @@ def _load_spalmer_api() -> SimpleNamespace:
         DirectionalConfig=DirectionalConfig,
         DirectionalScaleConfig=DirectionalScaleConfig,
         ExperimentTrainer=ExperimentTrainer,
+        FORMAT_VERSION=FORMAT_VERSION,
         HFTokenizerAdapter=HFTokenizerAdapter,
         KDAConfig=KDAConfig,
         MLAConfig=MLAConfig,
         MicroExpertsConfig=MicroExpertsConfig,
+        RecurrenceConfig=RecurrenceConfig,
+        RecurrenceScaleConfig=RecurrenceScaleConfig,
         SPALMERConfig=SPALMERConfig,
         ScaleSearchSpace=ScaleSearchSpace,
         TrainingConfig=TrainingConfig,
@@ -250,6 +276,53 @@ def _normalize_optional_component(
     return component
 
 
+def _config_value(container: object, name: str, default: Any = None) -> Any:
+    """Read one field from a dataclass config, a namespace, or a plain mapping."""
+
+    if container is None:
+        return default
+    if isinstance(container, Mapping):
+        return container.get(name, default)
+    return getattr(container, name, default)
+
+
+def _recurrence_metadata(prepared: PreparedSpalmerRun) -> dict[str, Any] | None:
+    """Join the bundle's recurrent geometry with the sampling policy that ran.
+
+    ``None`` for a flat model, which is what every pre-recurrence bundle and
+    every non-recurrent run keeps writing.
+    """
+
+    recurrence = _config_value(getattr(prepared.bundle, "model", None), "recurrence")
+    if recurrence is None:
+        return None
+    prelude = int(_config_value(recurrence, "prelude_layers", 0) or 0)
+    core = int(_config_value(recurrence, "core_layers", 0) or 0)
+    coda = int(_config_value(recurrence, "coda_layers", 0) or 0)
+    default_steps = int(_config_value(recurrence, "default_steps", 1) or 1)
+    latent_init_std = _config_value(recurrence, "latent_init_std", 1.0)
+    training = prepared.training
+    cap = _config_value(training, "max_recurrence")
+    mean = _config_value(training, "mean_recurrence")
+    sigma = _config_value(training, "recurrence_sigma")
+    depth = _config_value(training, "mean_backprop_depth")
+    return {
+        "prelude_layers": prelude,
+        "core_layers": core,
+        "coda_layers": coda,
+        "default_steps": default_steps,
+        "latent_init_std": (
+            1.0 if latent_init_std is None else float(latent_init_std)
+        ),
+        "effective_depth": prelude + default_steps * core + coda,
+        "mean_recurrence": None if mean is None else float(mean),
+        "mean_backprop_depth": None if depth is None else int(depth),
+        "recurrence_sigma": None if sigma is None else float(sigma),
+        "recurrence_sampling": _config_value(training, "recurrence_sampling"),
+        "max_recurrence": None if cap is None else int(cap),
+    }
+
+
 def _loads_json_object(value: object) -> dict[str, Any]:
     try:
         parsed = json.loads(str(value or "{}"))
@@ -306,6 +379,113 @@ def _normalize_checkpoint_execution(spalmer: Mapping[str, Any]) -> dict[str, Any
         ),
     )
     return {"attention_backend": attention_backend, "require_fla": require_fla}
+
+
+def _normalize_recurrence_architecture(value: object) -> dict[str, Any]:
+    """Canonicalize the plan-driving recurrent-core block of a scratch recipe.
+
+    ``prelude + core + coda == n_layers`` is the planner's business: yyLab only
+    submits the prelude/coda split it wants and lets the authoritative plan (and
+    ``SPALMERConfig``) reject a shape that leaves no core block.
+    """
+
+    recurrence = _normalize_optional_component(
+        value, name="spalmer.recurrence", default_enabled=False
+    )
+    unknown = sorted(set(recurrence) - _RECURRENCE_ARCHITECTURE_KEYS)
+    if unknown:
+        raise ValueError(
+            "unsupported SPALMER recurrence keys: " + ", ".join(unknown)
+        )
+    if not recurrence["enabled"]:
+        return {"enabled": False}
+    return {
+        "enabled": True,
+        "prelude_layers": _positive_int(
+            recurrence.get("prelude_layers", 1), "spalmer.recurrence.prelude_layers"
+        ),
+        "coda_layers": _positive_int(
+            recurrence.get("coda_layers", 1), "spalmer.recurrence.coda_layers"
+        ),
+        "default_steps": _positive_int(
+            recurrence.get("default_steps", 8), "spalmer.recurrence.default_steps"
+        ),
+        "latent_init_std": _finite_float(
+            1.0
+            if recurrence.get("latent_init_std") is None
+            else recurrence["latent_init_std"],
+            "spalmer.recurrence.latent_init_std",
+            minimum=0.0,
+        ),
+    }
+
+
+def _normalize_recurrence_training(cfg: dict[str, Any], *, mode: str) -> None:
+    """Validate the recurrent-depth training policy against the architecture.
+
+    In scratch mode the architecture is right here in the recipe.  In checkpoint
+    mode the parent bundle owns it, so the keys are only range-checked; the
+    parent-versus-recipe agreement is enforced in :func:`_prepare_checkpoint_run`
+    once the bundle is actually loaded.
+    """
+
+    present = sorted(
+        name for name in RECURRENCE_TRAINING_KEYS if cfg.get(name) is not None
+    )
+    if mode == INITIALIZATION_SCRATCH:
+        block = _mapping(
+            _mapping(cfg.get("spalmer"), "spalmer").get("recurrence"),
+            "spalmer.recurrence",
+        )
+        recurrent = bool(block.get("enabled"))
+        if not recurrent:
+            if present:
+                raise ValueError(
+                    "recurrence training keys require spalmer.recurrence.enabled: "
+                    + ", ".join(present)
+                )
+            return
+    else:
+        recurrent = bool(present)
+        if not recurrent:
+            return
+
+    if cfg.get("mean_recurrence") is None:
+        raise ValueError("recurrent SPALMER training requires training.mean_recurrence")
+    mean = _finite_float(cfg["mean_recurrence"], "mean_recurrence", minimum=1.0)
+    depth = _positive_int(
+        4 if cfg.get("mean_backprop_depth") is None else cfg["mean_backprop_depth"],
+        "mean_backprop_depth",
+    )
+    sigma = _finite_float(
+        0.5 if cfg.get("recurrence_sigma") is None else cfg["recurrence_sigma"],
+        "recurrence_sigma",
+        minimum=0.0,
+    )
+    sampling = str(
+        cfg.get("recurrence_sampling") or DEFAULT_RECURRENCE_SAMPLING
+    ).strip().casefold()
+    if sampling not in RECURRENCE_SAMPLING_MODES:
+        raise ValueError(
+            "recurrence_sampling must be one of "
+            + ", ".join(sorted(RECURRENCE_SAMPLING_MODES))
+        )
+    if sampling == "fixed" and mean != int(mean):
+        raise ValueError("fixed recurrence sampling requires an integer mean_recurrence")
+    cap = cfg.get("max_recurrence")
+    if cap in {None, "", 0, 0.0}:
+        cap = None
+    else:
+        cap = _positive_int(cap, "max_recurrence")
+        if cap < mean:
+            raise ValueError("max_recurrence must be at least mean_recurrence")
+    cfg.update(
+        mean_recurrence=mean,
+        mean_backprop_depth=depth,
+        recurrence_sigma=sigma,
+        recurrence_sampling=sampling,
+        max_recurrence=cap,
+    )
 
 
 def _normalize_scratch_architecture(cfg: dict[str, Any], spalmer: dict[str, Any]) -> None:
@@ -387,6 +567,10 @@ def _normalize_scratch_architecture(cfg: dict[str, Any], spalmer: dict[str, Any]
             allow_zero=True,
         )
     spalmer["atxy"] = atxy
+
+    spalmer["recurrence"] = _normalize_recurrence_architecture(
+        spalmer.get("recurrence", cfg.get("recurrence"))
+    )
 
     expert_plan_evidence = {
         field: raw_experts[field]
@@ -561,10 +745,16 @@ def normalize_spalmer_config(
         "grad_clip": "gradient_clip",
         "auxiliary_loss_weight": "auxiliary_loss_weight",
         "surprise_calibration_weight": "surprise_calibration_weight",
+        "mean_recurrence": "mean_recurrence",
+        "mean_backprop_depth": "mean_backprop_depth",
+        "recurrence_sigma": "recurrence_sigma",
+        "recurrence_sampling": "recurrence_sampling",
+        "max_recurrence": "max_recurrence",
     }
     for root_name, training_name in training_aliases.items():
         if root_name not in cfg and training_name in training:
             cfg[root_name] = training[training_name]
+    _normalize_recurrence_training(cfg, mode=mode)
     for name, expected in (
         ("compute_dtype", "bfloat16"),
         ("parameter_dtype", "bfloat16"),
@@ -662,7 +852,9 @@ def resolve_spalmer_tokenizer(
     )
 
 
-def _scale_components(config: Mapping[str, Any], api: SimpleNamespace) -> tuple[Any, Any]:
+def _scale_components(
+    config: Mapping[str, Any], api: SimpleNamespace
+) -> tuple[Any, Any, Any]:
     spalmer = _mapping(config.get("spalmer"), "spalmer")
     directional_values = _mapping(spalmer.get("directional"), "spalmer.directional")
     directional = None
@@ -682,7 +874,16 @@ def _scale_components(config: Mapping[str, Any], api: SimpleNamespace) -> tuple[
             y_cardinality=int(atxy_values["y_cardinality"]),
             injection_layer=int(atxy_values.get("injection_layer", 0)),
         )
-    return directional, atxy
+    recurrence_values = _mapping(spalmer.get("recurrence"), "spalmer.recurrence")
+    recurrence = None
+    if _bool(recurrence_values.get("enabled"), default=False):
+        recurrence = api.RecurrenceScaleConfig(
+            prelude_layers=int(recurrence_values.get("prelude_layers", 1)),
+            coda_layers=int(recurrence_values.get("coda_layers", 1)),
+            default_steps=int(recurrence_values.get("default_steps", 8)),
+            latent_init_std=float(recurrence_values.get("latent_init_std", 1.0)),
+        )
+    return directional, atxy, recurrence
 
 
 def plan_spalmer_configuration(
@@ -696,11 +897,12 @@ def plan_spalmer_configuration(
     cfg = normalize_spalmer_config(config)
     symbols = api or _load_spalmer_api()
     spalmer = cfg["spalmer"]
-    directional, atxy = _scale_components(cfg, symbols)
+    directional, atxy, recurrence = _scale_components(cfg, symbols)
     kwargs: dict[str, Any] = {
         "expert_weight_format": spalmer["expert_weight_format"],
         "directional": directional,
         "atxy": atxy,
+        "recurrence": recurrence,
     }
     if "num_experts" in spalmer:
         kwargs["search_space"] = symbols.ScaleSearchSpace(
@@ -798,6 +1000,21 @@ def build_spalmer_training_config(
         validation_interval_steps=max_steps + 1,
         checkpoint_interval_steps=(int(save_every) if save_every else max_steps + 1),
         telemetry_interval_steps=int(cfg["log_every"]),
+        mean_recurrence=(
+            None if cfg.get("mean_recurrence") is None else float(cfg["mean_recurrence"])
+        ),
+        mean_backprop_depth=int(
+            4 if cfg.get("mean_backprop_depth") is None else cfg["mean_backprop_depth"]
+        ),
+        recurrence_sigma=float(
+            0.5 if cfg.get("recurrence_sigma") is None else cfg["recurrence_sigma"]
+        ),
+        recurrence_sampling=str(
+            cfg.get("recurrence_sampling") or DEFAULT_RECURRENCE_SAMPLING
+        ),
+        max_recurrence=(
+            None if cfg.get("max_recurrence") is None else int(cfg["max_recurrence"])
+        ),
     )
 
 
@@ -1140,6 +1357,19 @@ def _metric_payload(metrics: Any, *, max_steps: int) -> dict[str, Any]:
             " · legacy global-max="
             f"{float(max_global_max_counterfactual_amplification):.3f}x"
         )
+    recurrence_steps = _metric_value(metrics, "recurrence_steps")
+    backprop_steps = _metric_value(metrics, "backprop_steps")
+    effective_depth = _metric_value(metrics, "effective_depth")
+    latent_delta_final = _metric_value(metrics, "latent_delta_final")
+    latent_position_correlation = _metric_value(metrics, "latent_position_correlation")
+    if recurrence_steps is not None:
+        message += f" · r={int(recurrence_steps)}"
+    if backprop_steps is not None:
+        message += f" k={int(backprop_steps)}"
+    if latent_delta_final is not None:
+        message += f" Δ={float(latent_delta_final):.3f}"
+    if latent_position_correlation is not None:
+        message += f" ρ={float(latent_position_correlation):.2f}"
     return {
         "schema_version": 1,
         "stage": "SPALMER base pretraining",
@@ -1181,6 +1411,19 @@ def _metric_payload(metrics: Any, *, max_steps: int) -> dict[str, Any]:
             if max_global_max_counterfactual_amplification is None
             else float(max_global_max_counterfactual_amplification)
         ),
+        "recurrence_steps": (
+            None if recurrence_steps is None else int(recurrence_steps)
+        ),
+        "backprop_steps": None if backprop_steps is None else int(backprop_steps),
+        "effective_depth": None if effective_depth is None else int(effective_depth),
+        "latent_delta_final": (
+            None if latent_delta_final is None else float(latent_delta_final)
+        ),
+        "latent_position_correlation": (
+            None
+            if latent_position_correlation is None
+            else float(latent_position_correlation)
+        ),
     }
 
 
@@ -1198,9 +1441,17 @@ class _TelemetryWriter:
         self.last_step = step
         _append_json_line(self.run_directory / "metrics.jsonl", payload)
         _write_json_atomic(self.run_directory / "progress.json", payload)
+        recurrence = ""
+        if payload.get("recurrence_steps") is not None:
+            recurrence = (
+                f"r={int(payload['recurrence_steps'])} "
+                f"k={int(payload.get('backprop_steps') or 0)} "
+                f"depth={int(payload.get('effective_depth') or 0)} "
+            )
         print(
             "SPALMER "
             f"step={step}/{self.max_steps} loss={float(payload['loss']):.4f} "
+            f"{recurrence}"
             f"tokens={int(payload['tokens_seen']):,} "
             f"surprise={float(payload.get('average_surprise') or 0.0):.4f} "
             f"group_max={payload.get('max_expert_group_load')} "
@@ -1380,9 +1631,9 @@ def _prepare_checkpoint_run(cfg: dict[str, Any], symbols: SimpleNamespace) -> Pr
     initialization = _mapping(cfg.get("initialization"), "initialization")
     checkpoint_path = Path(str(initialization["checkpoint_ref"]))
     payload = load_spalmer_checkpoint_payload(checkpoint_path)
-    if int(payload.get("format_version") or 0) != 5:
+    if int(payload.get("format_version") or 0) not in SUPPORTED_SPALMER_FORMAT_VERSIONS:
         raise ValueError(
-            "SPALMER continued training requires a format-version-5 bundle; "
+            "SPALMER continued training requires a format-version 5 or 6 bundle; "
             f"found {payload.get('format_version')!r}"
         )
     binding = payload.get("tokenizer_binding")
@@ -1391,6 +1642,17 @@ def _prepare_checkpoint_run(cfg: dict[str, Any], symbols: SimpleNamespace) -> Pr
     if override is not None:
         load_kwargs["tokenizer_override"] = override
     model, tokenizer, metadata = symbols.load_checkpoint(checkpoint_path, **load_kwargs)
+    parent_recurrent = (
+        _config_value(getattr(model, "config", None), "recurrence") is not None
+    )
+    if parent_recurrent and cfg.get("mean_recurrence") is None:
+        raise ValueError(
+            "parent checkpoint is recurrent; set training.mean_recurrence"
+        )
+    if not parent_recurrent and cfg.get("mean_recurrence") is not None:
+        raise ValueError(
+            "parent checkpoint has no recurrent core; remove recurrence training keys"
+        )
     metadata = dict(metadata or {})
     plan_payload = metadata.get("plan")
     if not isinstance(plan_payload, Mapping) or not plan_payload:
@@ -1463,6 +1725,7 @@ def _save_bundle_checkpoint(
         ),
         "batch_source": dict(trainer.batches.state_dict()),
         "data_provenance": dict(data_provenance),
+        "recurrence": _recurrence_metadata(prepared),
     }
     if prepared.parent:
         metadata["parent_checkpoint"] = dict(prepared.parent)
@@ -1505,6 +1768,12 @@ def run_spalmer_base(config: Mapping[str, Any], rd: Path) -> dict[str, Any]:
     api = _load_spalmer_api()
     prepared = prepare_spalmer_run(cfg, api=api)
     plan = prepared.plan
+    recurrence_metadata = _recurrence_metadata(prepared)
+    effective_depth = (
+        int(plan.config.n_layers)
+        if recurrence_metadata is None
+        else int(recurrence_metadata["effective_depth"])
+    )
     print(
         "SPALMER plan: "
         f"target={int(plan.target_parameters):,}; actual={int(plan.parameters.total):,}; "
@@ -1512,6 +1781,18 @@ def run_spalmer_base(config: Mapping[str, Any], rd: Path) -> dict[str, Any]:
         f"experts={plan.config.num_experts}; format={plan.config.expert_weight_format}",
         flush=True,
     )
+    if recurrence_metadata is not None:
+        print(
+            "SPALMER recurrent core: "
+            f"prelude={recurrence_metadata['prelude_layers']}; "
+            f"core={recurrence_metadata['core_layers']}; "
+            f"coda={recurrence_metadata['coda_layers']}; "
+            f"default_steps={recurrence_metadata['default_steps']}; "
+            f"effective_depth={effective_depth}; "
+            f"mean_recurrence={recurrence_metadata['mean_recurrence']}; "
+            f"backprop_depth={recurrence_metadata['mean_backprop_depth']}",
+            flush=True,
+        )
 
     api.seed_everything(
         int(prepared.training.seed),
@@ -1679,7 +1960,10 @@ def run_spalmer_base(config: Mapping[str, Any], rd: Path) -> dict[str, Any]:
     manifest = {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "model_family": MODEL_FAMILY,
-        "checkpoint_format": "spalmer.prototype.checkpoint.v5",
+        "checkpoint_format": (
+            "spalmer.prototype.checkpoint."
+            f"v{int(getattr(api, 'FORMAT_VERSION', 5))}"
+        ),
         "checkpoint_file": "spalmer.pt",
         "checkpoint_path": str(Path(checkpoint_path).resolve()),
         "plan": plan.to_dict(),
@@ -1696,6 +1980,8 @@ def run_spalmer_base(config: Mapping[str, Any], rd: Path) -> dict[str, Any]:
         "optimizer_state_placement": optimizer_placement,
         "parameter_accounting": accounting_payload,
         "data_provenance": data_provenance,
+        "recurrence": recurrence_metadata,
+        "effective_depth": effective_depth,
         "result": result,
         "exact_optimizer_resume": False,
     }
@@ -1723,6 +2009,10 @@ def run_spalmer_base(config: Mapping[str, Any], rd: Path) -> dict[str, Any]:
             "optimizer_moments": "float32_cpu_offload",
         },
         "training_sequence_length": int(prepared.training.sequence_length),
+        # ``num_layers`` in the registry stays physical; the recurrent depth a
+        # forward actually walks lives here.
+        "recurrence": recurrence_metadata,
+        "effective_depth": effective_depth,
         "data_provenance": data_provenance,
     }
     db.execute(
@@ -1761,6 +2051,7 @@ def run_spalmer_base(config: Mapping[str, Any], rd: Path) -> dict[str, Any]:
 __all__ = [
     "CorpusExhausted",
     "PreparedSpalmerRun",
+    "SUPPORTED_SPALMER_FORMAT_VERSIONS",
     "YYLabSPALMERBatchSource",
     "build_spalmer_batch_source",
     "build_spalmer_bundle",

@@ -14,6 +14,7 @@ from ...hw import best_gpu
 from ...infer.engine import ENGINE, LoadSpec
 from ...jobs import JOBS
 from ...models.families import checkpoint_family
+from ...models.spalmer import recurrence_metadata
 from ..components import empty_state
 from ..shell import ACCENT, PANEL, PANEL_EDGE, panel, shell
 
@@ -44,6 +45,24 @@ CHAT_PROMPT_MODES = {
     "chat": "Chat template",
     "raw": "Raw completion",
 }
+
+SPALMER_ADAPTIVE_EXITS = {
+    "none": "Fixed depth",
+    "latent_diff": "Adaptive · latent change",
+    "kl": "Adaptive · output KL",
+}
+
+
+def _checkpoint_recurrence(row: dict | None) -> dict | None:
+    """Read a registry row's recurrent-core block from its recorded metadata."""
+
+    if not row:
+        return None
+    try:
+        meta = json.loads(row.get("meta_json") or "{}")
+    except (TypeError, ValueError):
+        return None
+    return recurrence_metadata(meta if isinstance(meta, dict) else None)
 
 ASSISTANT_MARKDOWN_EXTRAS = ["fenced-code-blocks", "tables", "break-on-newline"]
 
@@ -155,6 +174,10 @@ def _routing_telemetry_text(telemetry: dict | None) -> str:
 
     if not telemetry:
         return ""
+    recurrence = telemetry.get("recurrence")
+    recurrence_text = (
+        _recurrence_telemetry_text(recurrence) if isinstance(recurrence, dict) else ""
+    )
     routing_mode = str(telemetry.get("routing_mode") or "")
     if routing_mode not in {
         "adaptive_surprise",
@@ -162,7 +185,9 @@ def _routing_telemetry_text(telemetry: dict | None) -> str:
         "paged_top_k",
         "unrestricted_top_k",
     }:
-        return ""
+        # A recurrent load without an expert-placement snapshot still reports
+        # the depth it actually ran.
+        return recurrence_text.removeprefix(" · ")
     active = int(telemetry.get("active_experts") or 0)
     minimum = int(telemetry.get("minimum_experts") or 0)
     maximum = int(telemetry.get("maximum_experts") or 0)
@@ -252,9 +277,30 @@ def _routing_telemetry_text(telemetry: dict | None) -> str:
         transfer_bytes = float(telemetry.get("expert_cache_transfer_bytes") or 0)
         stage_operations = int(telemetry.get("expert_cache_stage_operations") or 0)
         text += f" · stages {stage_operations} / transferred {transfer_bytes / 2**20:.1f} MiB"
+    text += recurrence_text
     reason = str(telemetry.get("stop_reason") or "").strip()
     if reason:
         text += f" · {reason}"
+    return text
+
+
+def _recurrence_telemetry_text(recurrence: dict) -> str:
+    """Render the realized latent-reasoning depth of the last request."""
+
+    steps = recurrence.get("recurrence_steps")
+    criterion = str(recurrence.get("adaptive_exit") or "none")
+    mode = "fixed" if criterion == "none" else criterion
+    text = f" · recurrence r≤{int(steps)} {mode}" if steps is not None else f" · recurrence {mode}"
+    mean_steps = recurrence.get("mean_decode_steps")
+    if mean_steps is not None:
+        text += f": mean {float(mean_steps):.1f} steps/token"
+        low = recurrence.get("min_decode_steps")
+        high = recurrence.get("max_decode_steps")
+        if low is not None and high is not None:
+            text += f" ({int(low)}–{int(high)})"
+        text += f", {int(recurrence.get('early_exits') or 0)} early exits"
+    if recurrence.get("warm_start"):
+        text += " · warm start"
     return text
 
 
@@ -339,6 +385,56 @@ def chat_page():
                     )
                 )
                 spalmer_cache_size.visible = False
+                spalmer_recurrence_steps = (
+                    ui.number(
+                        "SPALMER recurrence steps (0 = checkpoint default)",
+                        value=0,
+                        min=0,
+                        max=256,
+                        step=1,
+                    )
+                    .props("dense outlined")
+                    .classes("w-64")
+                    .tooltip(
+                        "Latent-reasoning iterations of the recurrent core. Compute per "
+                        "token scales with this; the paged expert cache is re-staged on "
+                        "every iteration."
+                    )
+                )
+                spalmer_recurrence_steps.visible = False
+                spalmer_adaptive_exit = (
+                    ui.select(
+                        SPALMER_ADAPTIVE_EXITS,
+                        value="none",
+                        label="Recurrence exit",
+                    )
+                    .props("dense outlined")
+                    .classes("w-56")
+                    .tooltip(
+                        "Stop iterating early once the latent (or the predicted "
+                        "distribution) stops changing. Decode only; prefill always runs "
+                        "the full budget."
+                    )
+                )
+                spalmer_adaptive_exit.visible = False
+                spalmer_exit_threshold = (
+                    ui.number(
+                        "Exit threshold (0 = criterion default)",
+                        value=0,
+                        min=0,
+                        step=1e-4,
+                    )
+                    .props("dense outlined")
+                    .classes("w-56")
+                )
+                spalmer_exit_threshold.visible = False
+                spalmer_warm_start = ui.checkbox(
+                    "Warm-start latent from previous token", value=False
+                ).tooltip(
+                    "Reuse the previous token's final latent instead of fresh noise; "
+                    "usually saves one or two iterations."
+                )
+                spalmer_warm_start.visible = False
             with ui.row().classes("w-full gap-3 mt-2 items-end"):
                 prompt_mode = (
                     ui.select(
@@ -503,6 +599,17 @@ def chat_page():
             adp_sel.update()
             spalmer_dynamic.visible = spalmer
             spalmer_cache_size.visible = spalmer
+            recurrence = _checkpoint_recurrence(selected_checkpoint) if spalmer else None
+            recurrent = recurrence is not None
+            spalmer_recurrence_steps.visible = recurrent
+            spalmer_adaptive_exit.visible = recurrent
+            spalmer_exit_threshold.visible = recurrent
+            spalmer_warm_start.visible = recurrent
+            default_steps = int((recurrence or {}).get("default_steps") or 0)
+            if recurrent and default_steps > 0:
+                spalmer_recurrence_steps.props(
+                    f'placeholder="checkpoint default {default_steps}"'
+                )
             if spalmer:
                 adp_sel.disable()
                 rtr_sel.disable()
@@ -604,6 +711,23 @@ def chat_page():
             load_settings["spalmer_expert_cache_size"] = int(
                 spalmer_cache_size.value or 0
             )
+            recurrent_checkpoint = _checkpoint_recurrence(ckpt_row) is not None
+            requested_steps = int(spalmer_recurrence_steps.value or 0)
+            requested_threshold = float(spalmer_exit_threshold.value or 0.0)
+            load_settings["spalmer_recurrence_steps"] = (
+                requested_steps if recurrent_checkpoint and requested_steps > 0 else None
+            )
+            load_settings["spalmer_adaptive_exit"] = (
+                str(spalmer_adaptive_exit.value or "none") if recurrent_checkpoint else "none"
+            )
+            load_settings["spalmer_exit_threshold"] = (
+                requested_threshold
+                if recurrent_checkpoint and requested_threshold > 0
+                else None
+            )
+            load_settings["spalmer_warm_start"] = bool(
+                recurrent_checkpoint and spalmer_warm_start.value
+            )
             spec = LoadSpec(
                 ref=ckpt_row["ref"],
                 quant=resolve_quant(ckpt_row, adapter_row),
@@ -646,10 +770,18 @@ def chat_page():
                     else:
                         routing_mode = "legacy fixed resident route (experimental)"
                     cache_cap = resolved.get("spalmer_expert_cache_size") or "checkpoint cap"
+                    depth_text = ""
+                    if resolved.get("spalmer_recurrent"):
+                        depth_text = f" · depth {resolved.get('spalmer_recurrence_steps')}"
+                        criterion = str(resolved.get("spalmer_adaptive_exit") or "none")
+                        if criterion != "none":
+                            depth_text += f" adaptive {criterion}"
+                        if resolved.get("spalmer_warm_start"):
+                            depth_text += " warm"
                     engine_badge.text = (
                         f"SPALMER · recurrent KDA/NoPE MLA · {routing_mode} · "
                         f"CPU→GPU expert cache {cache_cap} · "
-                        f"ctx {ENGINE.context_limit():,}"
+                        f"ctx {ENGINE.context_limit():,}{depth_text}"
                     )
                 else:
                     engine_badge.text = (

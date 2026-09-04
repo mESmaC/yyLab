@@ -15,7 +15,11 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .backend import YyLabBenchmarkBackend
+from .backend import (
+    SPALMER_RECURRENCE_KEYS,
+    YyLabBenchmarkBackend,
+    spalmer_recurrence_settings,
+)
 from .models import BenchmarkCase, BenchmarkSuite, canonical_json, load_suite
 from .scoring import (
     SCORER_VERSION,
@@ -149,6 +153,11 @@ def _stack_lock(cfg: Mapping[str, object]) -> dict[str, object]:
             ),
             "expert_cache_size": cfg.get("spalmer_expert_cache_size"),
         }
+        # Only an active depth policy joins the lock, so stacks recorded before
+        # recurrent depth existed keep their fingerprint.
+        recurrence = spalmer_recurrence_settings(cfg)
+        if recurrence is not None:
+            value["spalmer_recurrence"] = recurrence
     value["stack_fingerprint"] = hashlib.sha256(canonical_json(value).encode()).hexdigest()
     return value
 
@@ -330,7 +339,7 @@ def _workload_contract(
         for cell in cells
         if isinstance(cell.get("request"), Mapping)
     )
-    return {
+    contract: dict[str, object] = {
         "suite_fingerprint": suite.fingerprint,
         "profile": profile,
         "categories": list(categories),
@@ -366,6 +375,12 @@ def _workload_contract(
         "spalmer_expert_cache_size": cfg.get("spalmer_expert_cache_size"),
         "cells": cells,
     }
+    recurrence = spalmer_recurrence_settings(cfg)
+    if recurrence is not None:
+        # Added conditionally so every workload fingerprint (and therefore every
+        # resumable cell) recorded before recurrent depth stays valid.
+        contract["spalmer_recurrence"] = recurrence
+    return contract
 
 
 def _generation_comparison_fingerprint(workload_contract: Mapping[str, object]) -> str:
@@ -417,6 +432,11 @@ def _generation_comparison_fingerprint(workload_contract: Mapping[str, object]) 
             "expert_paging": workload_contract.get("spalmer_expert_paging"),
             "expert_cache_size": workload_contract.get("spalmer_expert_cache_size"),
         }
+    recurrence = workload_contract.get("spalmer_recurrence")
+    if isinstance(recurrence, Mapping):
+        # Latent-reasoning depth changes the computation just like expert
+        # placement, so two depths are not comparable runs of one workload.
+        fingerprint_value["spalmer_recurrence"] = dict(recurrence)
     return _fingerprint(fingerprint_value)
 
 
@@ -1290,6 +1310,10 @@ def run_quality_benchmark(
                 ),
                 spalmer_expert_cache_size=cfg.get("spalmer_expert_cache_size"),
             )
+            if spalmer_recurrence_settings(cfg) is not None:
+                backend_settings.update(
+                    {key: cfg.get(key) for key in SPALMER_RECURRENCE_KEYS}
+                )
         if str(cfg.get("rope_scaling") or "none") != "none":
             backend_settings.update(
                 rope_scaling=str(cfg["rope_scaling"]),

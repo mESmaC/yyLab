@@ -7,8 +7,10 @@ from yylab.ui.pages.chat import (
     ASSISTANT_MARKDOWN_EXTRAS,
     _assistant_markdown_content,
     _chat_load_settings,
+    _checkpoint_recurrence,
     _context_telemetry_text,
     _generation_snapshot,
+    _routing_telemetry_text,
     _user_message,
 )
 
@@ -132,3 +134,65 @@ def test_raw_context_telemetry_names_the_literal_prompt() -> None:
 
     assert text.startswith("Raw prompt 2/1,536 tokens")
     assert "completion reserved 512" in text
+
+
+def test_routing_telemetry_text_renders_recurrence_line() -> None:
+    recurrence = {
+        "recurrence_steps": 8,
+        "adaptive_exit": "latent_diff",
+        "mean_decode_steps": 5.5,
+        "min_decode_steps": 3,
+        "max_decode_steps": 8,
+        "early_exits": 4,
+        "warm_start": True,
+    }
+    text = _routing_telemetry_text(
+        {
+            "routing_mode": "paged_top_k",
+            "active_experts": 4,
+            "minimum_experts": 4,
+            "maximum_experts": 4,
+            "active_fraction": 0.02,
+            "recurrence": recurrence,
+        }
+    )
+
+    assert "Paged full-pool top-k 4" in text
+    assert "recurrence r≤8 latent_diff: mean 5.5 steps/token (3–8), 4 early exits" in text
+    assert "warm start" in text
+
+    # A recurrent load with no expert-placement snapshot still reports depth.
+    assert _routing_telemetry_text({"recurrence": recurrence}).startswith(
+        "recurrence r≤8 latent_diff"
+    )
+    # Fixed depth and an untouched non-recurrent payload keep the old text.
+    fixed = _routing_telemetry_text(
+        {"routing_mode": "paged_top_k", "recurrence": {"recurrence_steps": 4}}
+    )
+    assert "recurrence r≤4 fixed" in fixed
+    assert "steps/token" not in fixed
+    assert _routing_telemetry_text({"routing_mode": "unknown"}) == ""
+
+
+def test_checkpoint_recurrence_reads_the_documented_lookup_order() -> None:
+    assert _checkpoint_recurrence(None) is None
+    assert _checkpoint_recurrence({"meta_json": "{}"}) is None
+    assert _checkpoint_recurrence({"meta_json": "not json"}) is None
+    assert _checkpoint_recurrence(
+        {"meta_json": '{"recurrence": {"default_steps": 8}}'}
+    ) == {"default_steps": 8}
+    assert _checkpoint_recurrence(
+        {"meta_json": '{"recurrence_config": {"default_steps": 4}}'}
+    ) == {"default_steps": 4}
+    assert _checkpoint_recurrence(
+        {"meta_json": '{"metadata": {"recurrence": {"default_steps": 2}}}'}
+    ) == {"default_steps": 2}
+    # A run receipt wins over a scanned bundle block.
+    assert _checkpoint_recurrence(
+        {
+            "meta_json": (
+                '{"recurrence": {"default_steps": 8},'
+                ' "metadata": {"recurrence": {"default_steps": 2}}}'
+            )
+        }
+    ) == {"default_steps": 8}
