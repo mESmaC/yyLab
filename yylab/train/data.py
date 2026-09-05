@@ -434,7 +434,10 @@ def corpus_data_provenance(
             )
             kind = str(row.get("kind") or "ingested")
             verdict = str(row.get("verdict") or "")
-            if cdas_catalog:
+            gccf_catalog = dict(stats.get("gccf") or {})
+            if gccf_catalog:
+                catalog_status = "gccf_catalogued"
+            elif cdas_catalog:
                 catalog_status = "cdas_catalogued"
             elif kind == "approved":
                 catalog_status = "approved_store"
@@ -454,6 +457,7 @@ def corpus_data_provenance(
                 selection_profile=selection_profile,
                 catalog_status=catalog_status,
                 cdas_catalog=cdas_catalog,
+                gccf=gccf_catalog,
             )
             total_docs += docs
             total_chars += chars
@@ -522,7 +526,7 @@ def corpus_training_preflight(
             warnings.append(
                 f"Corpus {name!r} has no CDAS intake catalog ({catalog_status.replace('_', ' ')})"
             )
-        if corpus.get("selection_profile") == "preserve":
+        if corpus.get("selection_profile") == "preserve" and not corpus.get("gccf"):
             warnings.append(f"Corpus {name!r} used the preserve profile; no artifact policy was applied")
         issues = int((corpus.get("cdas_catalog") or {}).get("issues") or 0)
         if issues:

@@ -53,14 +53,8 @@ def test_round_robin_mixes_documents_after_filtering_and_deduplicates(monkeypatc
 
 def test_round_robin_is_deterministic_and_preserves_single_corpus_seed(monkeypatch):
     documents = {
-        "alpha": [
-            {"text": f"alpha {index}", "domain": "code", "origin": f"a{index}"}
-            for index in range(12)
-        ],
-        "beta": [
-            {"text": f"beta {index}", "domain": "code", "origin": f"b{index}"}
-            for index in range(7)
-        ],
+        "alpha": [{"text": f"alpha {index}", "domain": "code", "origin": f"a{index}"} for index in range(12)],
+        "beta": [{"text": f"beta {index}", "domain": "code", "origin": f"b{index}"} for index in range(7)],
     }
     _fake_corpus_streams(monkeypatch, documents)
 
@@ -103,18 +97,14 @@ def test_iter_corpus_docs_filters_splits_and_canonicalizes_legacy_lines(monkeypa
     )
 
     train = list(data.iter_corpus_docs("alpha", splits="train", shuffle_buffer=1))
-    unspecified = list(
-        data.iter_corpus_docs("alpha", splits=["unspecified"], shuffle_buffer=1)
-    )
+    unspecified = list(data.iter_corpus_docs("alpha", splits=["unspecified"], shuffle_buffer=1))
     all_docs = list(data.iter_corpus_docs("alpha", shuffle_buffer=1))
 
     assert [(doc["origin"], doc["split"]) for doc in train] == [
         ("train", "train"),
         ("sourced-train", "train"),
     ]
-    assert [(doc["origin"], doc["split"]) for doc in unspecified] == [
-        ("legacy", "unspecified")
-    ]
+    assert [(doc["origin"], doc["split"]) for doc in unspecified] == [("legacy", "unspecified")]
     assert [(doc["origin"], doc["split"]) for doc in all_docs] == [
         ("train", "train"),
         ("test", "test"),
@@ -230,16 +220,12 @@ def test_corpus_provenance_snapshots_order_sources_and_filtered_totals(monkeypat
             "name": "Alpha approved",
             "source_path": "D:/datasets/alpha",
             "status": "ready",
-            "stats_json": json.dumps(
-                {"domains": {"code": {"docs": 7, "chars": 900}}}
-            ),
+            "stats_json": json.dumps({"domains": {"code": {"docs": 7, "chars": 900}}}),
         },
     }
     monkeypatch.setattr(data.db, "q1", lambda _query, params: rows.get(params[0]))
 
-    provenance = data.corpus_data_provenance(
-        ["beta", "alpha", "beta"], ["code"], corpus_mix="round_robin"
-    )
+    provenance = data.corpus_data_provenance(["beta", "alpha", "beta"], ["code"], corpus_mix="round_robin")
     assert provenance["corpus_ids"] == ["beta", "alpha"]
     assert provenance["corpus_mix"] == "round_robin"
     assert provenance["domains"] == ["code"]
@@ -296,9 +282,7 @@ def test_corpus_provenance_and_preflight_classify_cdas_and_legacy_sources(monkey
     assert corpora[0]["selection_profile"] == "dataset"
     assert corpora[1]["catalog_status"] == "legacy_reviewed"
     assert report["errors"] == []
-    assert report["warnings"] == [
-        "Corpus 'Legacy' has no CDAS intake catalog (legacy reviewed)"
-    ]
+    assert report["warnings"] == ["Corpus 'Legacy' has no CDAS intake catalog (legacy reviewed)"]
 
     missing = data.corpus_training_preflight(["missing"])
     assert missing["errors"] == ["Missing corpus: missing"]
@@ -347,12 +331,8 @@ def test_corpus_provenance_estimates_selected_split_and_legacy_unspecified(monke
     }
     monkeypatch.setattr(data.db, "q1", lambda _query, params: rows.get(params[0]))
 
-    test_only = data.corpus_data_provenance(
-        ["modern", "legacy"], ["code"], splits=["test"]
-    )
-    legacy_only = data.corpus_data_provenance(
-        ["modern", "legacy"], ["code"], splits=["unspecified"]
-    )
+    test_only = data.corpus_data_provenance(["modern", "legacy"], ["code"], splits=["test"])
+    legacy_only = data.corpus_data_provenance(["modern", "legacy"], ["code"], splits=["unspecified"])
 
     assert test_only["schema_version"] == 3
     assert test_only["splits"] == ["test"]
@@ -373,7 +353,7 @@ class _SavedModel:
         self.weight = torch.nn.Parameter(torch.zeros(1))
 
     def parameters(self):
-        return [self.weight]
+        return iter([self.weight])
 
     def save_pretrained(self, destination: Path) -> None:
         Path(destination, "weights.bin").write_bytes(b"weights")
@@ -423,7 +403,18 @@ def test_run_base_persists_multi_corpus_provenance(tmp_path, monkeypatch):
         "load_base",
         lambda _ref, quant, **_options: (model, tokenizer, False, quant, []),
     )
-    monkeypatch.setattr(worker, "_make_base_optimizer", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        worker,
+        "_make_base_optimizer",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            _yylab_optimizer_resolution={
+                "implementation": "fixture",
+                "state": "fp32",
+                "state_precision": "fp32",
+                "master_weight_precision": "fp32",
+            }
+        ),
+    )
     monkeypatch.setattr(worker, "_make_base_scheduler", lambda *_args, **_kwargs: (object(), 0))
     batches = SimpleNamespace(docs_seen=5, tokens_seen=64)
     monkeypatch.setattr(worker, "build_batches", lambda *_args, **_kwargs: batches)
@@ -457,9 +448,7 @@ def test_run_base_persists_multi_corpus_provenance(tmp_path, monkeypatch):
         tmp_path / "run",
     )
 
-    metadata = json.loads(
-        db.q1("SELECT meta_json FROM checkpoints WHERE id=?", (output_id,))["meta_json"]
-    )
+    metadata = json.loads(db.q1("SELECT meta_json FROM checkpoints WHERE id=?", (output_id,))["meta_json"])
     assert summary["corpora"] == ["alpha", "beta"]
     assert summary["corpus_mix"] == "round_robin"
     assert summary["domains"] == ["code"]

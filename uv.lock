@@ -2117,7 +2117,7 @@ wheels = [
 [[package]]
 name = "spalmer"
 version = "0.1.0"
-source = { git = "https://github.com/mESmaC/spalmer.git?rev=b8fbe5c#b8fbe5c28f2c74d816eeee7bb69f1903d712790d" }
+source = { editable = "../spalmer" }
 dependencies = [
     { name = "torch" },
     { name = "zstandard" },
@@ -2127,6 +2127,17 @@ dependencies = [
 hf = [
     { name = "transformers" },
 ]
+
+[package.metadata]
+requires-dist = [
+    { name = "pyarrow", marker = "extra == 'corpora'", specifier = ">=20" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
+    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.11" },
+    { name = "torch", specifier = ">=2.6" },
+    { name = "transformers", marker = "extra == 'hf'", specifier = ">=4.46" },
+    { name = "zstandard", specifier = ">=0.23" },
+]
+provides-extras = ["corpora", "hf", "dev"]
 
 [[package]]
 name = "starlette"
@@ -2740,7 +2751,7 @@ requires-dist = [
     { name = "safetensors", specifier = ">=0.5" },
     { name = "sentence-transformers", specifier = ">=6.0.0" },
     { name = "sentencepiece", specifier = ">=0.2" },
-    { name = "spalmer", extras = ["hf"], git = "https://github.com/mESmaC/spalmer.git?rev=b8fbe5c" },
+    { name = "spalmer", extras = ["hf"], editable = "../spalmer" },
     { name = "tiktoken", specifier = ">=0.9" },
     { name = "tokenizers", specifier = ">=0.21" },
     { name = "torch", specifier = ">=2.8", index = "https://download.pytorch.org/whl/cu128" },

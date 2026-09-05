@@ -77,6 +77,7 @@ def corpora_page():
     with shell("Corpora", "/corpora"):
         with ui.row().classes("w-full items-center justify-between"):
             ui.label("Corpora").classes("text-xl font-semibold")
+            gccf_btn = ui.button("Import GCCF receipt", icon="fact_check").props("no-caps")
             ingest_btn = ui.button("Ingest folder", icon="add").props("no-caps")
 
         with ui.row().classes("w-full items-center gap-3"):
@@ -278,6 +279,12 @@ def corpora_page():
                             on_click=lambda cid=cid, name=c["name"]: ask_delete(cid, name),
                         ).props("flat dense no-caps color=negative")
                 ui.label(f'source: {c["source_path"]}').classes("text-xs text-gray-500")
+                gccf = stats.get("gccf") or {}
+                if gccf:
+                    coverage = "complete export" if gccf.get("complete_source_scan") else "partial sample export"
+                    ui.label(
+                        f"GCCF approved · {coverage} · source and receipt provenance retained"
+                    ).classes("text-xs text-teal-300")
                 if c["error"]:
                     ui.label(c["error"]).classes("text-xs text-red-400")
                 reimport_marker = stats.get("reimport") if isinstance(stats.get("reimport"), dict) else None
@@ -469,7 +476,10 @@ def corpora_page():
             if job.status == "done":
                 state["job"] = None
                 progress_row.visible = False
-                ui.notify("Corpus re-imported" if job.kind == "reimport" else "Corpus processed", type="positive")
+                message = "Corpus re-imported" if job.kind == "reimport" else "Corpus processed"
+                if job.kind == "gccf-ingest":
+                    message = f"Imported {len(job.result['corpora'])} classified corpora"
+                ui.notify(message, type="positive")
                 refresh_table()
                 render_library()
                 if isinstance(job.result, str):
@@ -714,6 +724,34 @@ def corpora_page():
             ingest_dlg.open()
 
         ingest_btn.on_click(open_ingest)
+
+        with ui.dialog() as gccf_dialog, ui.card().classes("w-[640px]"):
+            ui.label("Import classified corpora").classes("text-lg font-semibold")
+            hint(
+                "Reads the files approved by GCCF, removes listed bad records, and preserves "
+                "held-out splits. Each source becomes a separate corpus for training mixtures."
+            )
+            gccf_path = ui.input("GCCF receipt JSON path").props("outlined dense").classes("w-full")
+
+            def begin_gccf() -> None:
+                if busy():
+                    ui.notify("An ingest job is already running", type="warning")
+                    return
+                path = str(gccf_path.value or "").strip().strip('"')
+                if not path:
+                    ui.notify("Enter a GCCF receipt path", type="warning")
+                    return
+                from ...ingest.gccf import run_gccf_ingest
+
+                state["job"] = JOBS.submit("gccf-ingest", run_gccf_ingest, path)
+                progress_row.visible = True
+                plabel.text = "queued · GCCF import"
+                gccf_dialog.close()
+
+            with ui.row():
+                ui.button("Import", on_click=begin_gccf).props("no-caps")
+                ui.button("Cancel", on_click=gccf_dialog.close).props("flat no-caps")
+        gccf_btn.on_click(gccf_dialog.open)
 
         render_library()
         refresh_table()

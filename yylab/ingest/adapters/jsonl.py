@@ -196,6 +196,15 @@ def _record_messages(rec: dict) -> list[dict]:
 
 
 def _record_text(rec: dict, messages: list[dict] | None = None) -> str | None:
+    provenance = rec.get("provenance")
+    if (
+        isinstance(provenance, dict)
+        and provenance.get("gccf_schema") == "gccf.receipt/1"
+        and isinstance(rec.get("text"), str)
+    ):
+        # The shared GCCF reader already rendered the canonical causal text.
+        # Keep structured messages too, for the separate chat-SFT objective.
+        return rec["text"]
     msgs = _record_messages(rec) if messages is None else messages
     if msgs:
         rendered = format_messages(msgs)
@@ -599,7 +608,7 @@ def _iter_records(
 
 class JsonlAdapter(Adapter):
     name = "jsonl"
-    version = 2
+    version = 3
     extensions = {".jsonl", ".ndjson", ".json"}
     default_domain = "other"
 

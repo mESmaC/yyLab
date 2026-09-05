@@ -7,6 +7,9 @@ frozen bases, with chat inference.
 
 ## Quickstart
 
+Keep the SPALMER checkout beside yyLab as `../spalmer`; uv uses that editable
+dependency for the shared model and [GCCF receipt ingestion](docs/GCCF_INGESTION.md).
+
 ```powershell
 uv sync
 uv run yylab
@@ -16,6 +19,10 @@ Opens at http://127.0.0.1:8080 (`--port`, `--no-browser` supported).
 Artifacts live in `./artifacts` (override with `YYLAB_HOME`).
 
 ## Features
+
+- **GCCF classified corpora** — import a GCCF receipt, honor approved-file and
+  bad-record decisions, preserve held-out splits and training provenance, and
+  choose each classified source independently in training mixtures.
 
 - **Corpora intake** — point at a folder; adapter plugins per filetype,
   streaming JSONL/Parquet normalization, exact + bounded-memory MinHash dedup,
