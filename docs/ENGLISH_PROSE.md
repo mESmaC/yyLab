@@ -61,3 +61,11 @@ but showed a modest validation-loss penalty for rotating plasticity. See the
 [SPALMER experiment report](../../spalmer/docs/real-corpus-plasticity-results-2026-09-04.md)
 for measurements and limitations; this was a single-seed architecture pilot,
 not a classified-versus-raw data efficacy comparison.
+
+The follow-up [plastic expert budget study](../../spalmer/docs/plasticity-budget-results.md)
+completed five 1,600-update runs with the same source pool and a realized
+89.734% GCCF / 10.266% raw prose mix. Increasing the trainable expert subset
+reduced the validation-loss penalty, but no rotating arm passed its preset
+quality/resource screen. This study also read existing sources without creating
+another corpus text copy. The current prose supply remains sufficient for the
+next controlled architecture diagnostics.
