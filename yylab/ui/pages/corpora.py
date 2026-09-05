@@ -285,6 +285,13 @@ def corpora_page():
                     ui.label(
                         f"GCCF approved · {coverage} · source and receipt provenance retained"
                     ).classes("text-xs text-teal-300")
+                    changed = int(stats.get("integrity_rejections", 0))
+                    missing = int(stats.get("unavailable_documents", 0))
+                    if changed or missing:
+                        ui.label(
+                            f"Export integrity: {changed:,} changed records excluded; "
+                            f"{missing:,} records unavailable"
+                        ).classes("text-xs text-amber-300")
                 if c["error"]:
                     ui.label(c["error"]).classes("text-xs text-red-400")
                 reimport_marker = stats.get("reimport") if isinstance(stats.get("reimport"), dict) else None

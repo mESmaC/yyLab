@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import shutil
 import time
 from pathlib import Path
 
@@ -57,11 +59,12 @@ def import_export(progress: ProgressFn, export_dir: str | Path, *, workers: int 
         if not source.is_relative_to(root / "data") or not source.is_dir():
             raise ValueError("GCCF export source is missing or outside export directory")
         existing = db.q1("SELECT id,status FROM corpora WHERE source_path=?", (str(source),))
-        if existing:
-            if existing["status"] != "ready":
-                raise RuntimeError(f"existing GCCF corpus {existing['id']} is {existing['status']}")
+        if existing and existing["status"] == "ready":
             registered[name] = existing["id"]
             continue
+        if existing:
+            if existing["status"] != "failed":
+                raise RuntimeError(f"existing GCCF corpus {existing['id']} is {existing['status']}")
         progress("gccf-ingest", index / len(manifest["corpora"]), name)
         cfg = gccf_ingest_config(name="GCCF · " + name, source_dir=str(source), workers=workers)
         provenance = {
@@ -73,7 +76,9 @@ def import_export(progress: ProgressFn, export_dir: str | Path, *, workers: int 
             "approval_scope": "file_sampled",
             "classified": True,
         }
-        cid = _import_source(progress, root, cfg, stats, provenance)
+        cid = _import_source(
+            progress, root, cfg, stats, provenance, retry_id=existing["id"] if existing else None
+        )
         registered[name] = cid
     result = {
         "export_directory": str(root),
@@ -81,32 +86,79 @@ def import_export(progress: ProgressFn, export_dir: str | Path, *, workers: int 
         "receipt_sha256": manifest["audit"]["receipt_sha256"],
         "complete_source_scan": manifest["complete_source_scan"],
     }
+    # Share the ordinary native shards after integrity verification. A manifest
+    # outside data/ keeps audit records out of recursive training discovery.
+    verified = root / "verified"
+    verified_sources = {}
+    for name, cid in registered.items():
+        cdir = corpus_dir(cid)
+        native_stats = json.loads((cdir / "stats.json").read_text(encoding="utf-8"))
+        destination = verified / "data" / name
+        destination.mkdir(parents=True, exist_ok=True)
+        for shard in native_stats["shards"]:
+            target = destination / shard
+            if not target.exists():
+                try:
+                    target.hardlink_to(cdir / "data" / shard)
+                except OSError:
+                    shutil.copyfile(cdir / "data" / shard, target)
+        verified_sources[name] = {
+            "corpus_id": cid,
+            "documents": native_stats["docs_written"],
+            "utf8_bytes": native_stats.get("utf8_bytes_written"),
+            "integrity_rejections": native_stats.get("integrity_rejections", 0),
+            "unavailable_documents": native_stats.get("unavailable_documents", 0),
+            "splits": native_stats["splits"],
+        }
+    result["verified_directory"] = str(verified)
+    result["integrity_rejections"] = sum(s["integrity_rejections"] for s in verified_sources.values())
+    result["unavailable_documents"] = sum(s["unavailable_documents"] for s in verified_sources.values())
+    (verified / "verified-export.json").write_text(
+        json.dumps(
+            {"schema": "spalmer.gccf-verified-export/1", **result, "sources": verified_sources},
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     (root / "yylab-import.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     return result
 
 
-def _import_source(progress, export_root, cfg, exported_stats, provenance):
+def _import_source(progress, export_root, cfg, exported_stats, provenance, *, retry_id=None):
     """Compress already selected records without repeating raw-data classification.
 
     GCCF and the shared exporter own selection/dedup/splits. Native yyLab shards
     and statistics retain those decisions; an explicit later Re-import can run
     yyLab's ordinary document analysis if desired.
     """
+    from spalmer.data.manifest import normalize_for_dedup
+
     with _exclusive_ingest():
         started = time.perf_counter()
-        cid = db.new_id("cor")
+        cid = retry_id or db.new_id("cor")
         cdir = corpus_dir(cid)
         data_dir = cdir / "data"
         data_dir.mkdir(parents=True, exist_ok=True)
         now = db.now_iso()
-        db.execute(
-            "INSERT INTO corpora(id,name,created_at,updated_at,status,source_path) VALUES(?,?,?,?,?,?)",
-            (cid, cfg.name, now, now, "processing", cfg.source_dir),
-        )
+        if retry_id:
+            db.execute("UPDATE corpora SET status='processing',error='',updated_at=? WHERE id=?", (now, cid))
+            # Only disposable shards owned by this failed import are removed.
+            for stale in data_dir.glob("shard-*.jsonl.zst"):
+                if not stale.resolve().is_relative_to(data_dir.resolve()):
+                    raise ValueError("failed-import shard resolves outside its data directory")
+                stale.unlink()
+        else:
+            db.execute(
+                "INSERT INTO corpora(id,name,created_at,updated_at,status,source_path) VALUES(?,?,?,?,?,?)",
+                (cid, cfg.name, now, now, "processing", cfg.source_dir),
+            )
         writer = _ShardWriter(data_dir)
         stats = {
             "docs_written": 0,
             "chars_written": 0,
+            "utf8_bytes_written": 0,
+            "integrity_rejections": 0,
             "domains": {},
             "splits": {},
             "langs": {},
@@ -120,6 +172,7 @@ def _import_source(progress, export_root, cfg, exported_stats, provenance):
             count["docs"] += 1
             count["chars"] += chars
 
+        rejection_log = (cdir / "gccf-integrity-rejections.jsonl").open("w", encoding="utf-8")
         try:
             for shard in exported_stats["shards"]:
                 path = (export_root / shard).resolve()
@@ -140,10 +193,31 @@ def _import_source(progress, export_root, cfg, exported_stats, provenance):
                         text = row["text"]
                         if not isinstance(text, str):
                             raise ValueError("GCCF row text must be a string")
+                        digest = hashlib.sha256(
+                            (row["kind"] + "\0" + normalize_for_dedup(text, kind=row["kind"])).encode()
+                        ).hexdigest()
+                        if row["document_id"] != "gccf-" + digest:
+                            stats["integrity_rejections"] += 1
+                            rejection_log.write(
+                                json.dumps(
+                                    {
+                                        "document_id": row["document_id"],
+                                        "actual_normalized_sha256": digest,
+                                        "export_shard": shard,
+                                        "reason": "normalized_text_changed_after_export",
+                                        "source_path": record_provenance.get("path"),
+                                        "locator": record_provenance.get("locator"),
+                                        "split": split,
+                                    }
+                                )
+                                + "\n"
+                            )
+                            continue
                         domain = row["domain"]
                         language = row["language"]
                         native = {
                             "text": text,
+                            "kind": row["kind"],
                             "domain": domain,
                             "lang": language,
                             "source": row["source"],
@@ -157,6 +231,7 @@ def _import_source(progress, export_root, cfg, exported_stats, provenance):
                         chars = len(text)
                         stats["docs_written"] += 1
                         stats["chars_written"] += chars
+                        stats["utf8_bytes_written"] += len(text.encode("utf-8"))
                         stats["langs"][language] = stats["langs"].get(language, 0) + 1
                         add_count(stats["domains"], domain, chars)
                         split_counts = stats["splits"].setdefault(
@@ -171,8 +246,33 @@ def _import_source(progress, export_root, cfg, exported_stats, provenance):
                                 stats["docs_written"] / exported_stats["documents"],
                                 f"{cfg.name}: {stats['docs_written']:,} approved documents",
                             )
-            if stats["docs_written"] != exported_stats["documents"]:
-                raise ValueError("GCCF export document count changed")
+            observed = stats["docs_written"] + stats["integrity_rejections"]
+            if observed > exported_stats["documents"]:
+                raise ValueError("GCCF export contains more records than its manifest")
+            stats["unavailable_documents"] = exported_stats["documents"] - observed
+            (cdir / "gccf-integrity-summary.json").write_text(
+                json.dumps(
+                    {
+                        "expected_export_documents": exported_stats["documents"],
+                        "observed_export_documents": observed,
+                        "retained_documents": stats["docs_written"],
+                        "changed_records_rejected": stats["integrity_rejections"],
+                        "unavailable_documents": stats["unavailable_documents"],
+                        "note": "Missing records are counted; their identities cannot be recovered from this export.",
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            if stats["unavailable_documents"] or stats["integrity_rejections"]:
+                progress(
+                    "gccf-integrity",
+                    1,
+                    (
+                        f"{cfg.name}: excluded {stats['integrity_rejections']} changed records; "
+                        f"{stats['unavailable_documents']} records missing from export"
+                    ),
+                )
             writer.finish()
             stats["shards"] = writer.shards
             stats["bytes_on_disk"] = sum((data_dir / name).stat().st_size for name in writer.shards)
@@ -195,6 +295,8 @@ def _import_source(progress, export_root, cfg, exported_stats, provenance):
                 (str(exc)[:500], db.now_iso(), cid),
             )
             raise
+        finally:
+            rejection_log.close()
         return cid
 
 

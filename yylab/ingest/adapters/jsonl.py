@@ -151,11 +151,7 @@ def _paired_messages(rec: dict) -> list[dict]:
     if extra_input:
         prompt = f"{prompt}\n\n{extra_input}"
     response = next(
-        (
-            value
-            for field in RESPONSE_FIELDS
-            if (value := _string_field(rec, field))
-        ),
+        (value for field in RESPONSE_FIELDS if (value := _string_field(rec, field))),
         "",
     )
     if not prompt or not response:
@@ -204,6 +200,10 @@ def _record_text(rec: dict, messages: list[dict] | None = None) -> str | None:
     ):
         # The shared GCCF reader already rendered the canonical causal text.
         # Keep structured messages too, for the separate chat-SFT objective.
+        from spalmer.data.discovery import verify_gccf_text
+
+        kind = rec.get("kind") or ("code" if rec.get("domain") == "code" else "prose")
+        verify_gccf_text(rec["text"], kind=kind, document_id=rec.get("document_id", rec.get("sample_id")))
         return rec["text"]
     msgs = _record_messages(rec) if messages is None else messages
     if msgs:
@@ -240,11 +240,7 @@ def _record_split(rec: dict, path: Path) -> str:
         if isinstance(origin, str) and origin.strip():
             return infer_source_split(origin, explicit)
     if isinstance(provenance, dict):
-        origin = (
-            provenance.get("logical_path")
-            or provenance.get("path")
-            or provenance.get("source_path")
-        )
+        origin = provenance.get("logical_path") or provenance.get("path") or provenance.get("source_path")
         if isinstance(origin, str) and origin.strip():
             return infer_source_split(origin, explicit)
     return infer_source_split(path, explicit)

@@ -32,6 +32,25 @@ flow into yyLab/SPALMER training provenance. Importing the same export again
 reuses its ready corpus registrations. A later explicit Re-import can run the
 ordinary yyLab analysis pipeline against the approved export.
 
+Registration verifies each record's normalized text against its export ID.
+Changed records are excluded and listed, without their contents, in each corpus's
+`gccf-integrity-rejections.jsonl`; `stats.json` records the count. Failed imports
+can be retried with the same command. Ready corpora are reused.
+Missing records are separately counted in `gccf-integrity-summary.json` and the
+verified manifest; their IDs cannot be recovered from the remaining export.
+An export with more records than its manifest is rejected.
+
+The importer also publishes `verified/data/` beneath the export directory, using
+the normal native `.jsonl.zst` shards. `verified/verified-export.json` records the
+usable counts and receipt lineage. Point standalone SPALMER `prepare-data` at
+that **verified/data** directory. Its reader understands the native fields and
+checks GCCF identities too. This verifies normalized canonical text, not every
+metadata field or the exact original byte representation.
+
+On this machine, Windows Defender remediated embedded scripts in part of the
+security-code export. Changed records are excluded; security settings and
+quarantined content are left alone. Use the verified view for experiments.
+
 Select the **train** split for training. Use token-balanced corpus mixing and
 source weights to prevent the largest code collections from dominating. Start
 with classified-only data; raw general prose can later supply a controlled

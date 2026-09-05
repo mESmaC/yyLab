@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
+from pathlib import Path
+
+import pytest
 
 from yylab import db
 from yylab.artifacts import corpus_dir
@@ -78,3 +82,88 @@ def test_classified_import_does_not_get_shadowed_by_existing_raw_data():
     assert cfg.language_filter is False
     assert cfg.quality_filter is False
     assert cfg.selection_profile == "preserve"
+
+
+@pytest.mark.parametrize("expected_documents", [1, 2, 3])
+def test_failed_import_retries_and_audits_changed_records(tmp_path, expected_documents):
+    from spalmer.data.discovery import discover_jsonl, iter_approved_jsonl
+    from spalmer.data.gccf import EXPORT_SCHEMA
+    from spalmer.data.manifest import normalize_for_dedup
+
+    root = tmp_path / "export"
+    source = root / "data" / "approved-source"
+    source.mkdir(parents=True)
+    receipt_hash = "a" * 64
+    records = []
+    for text in ("def retained(): return 1", "def changed(): return 2"):
+        digest = hashlib.sha256(("code\0" + normalize_for_dedup(text, kind="code")).encode()).hexdigest()
+        records.append(
+            {
+                "text": text,
+                "kind": "code",
+                "domain": "code",
+                "language": "python",
+                "source": "approved-source",
+                "split": "train",
+                "document_id": "gccf-" + digest,
+                "provenance": {
+                    "gccf_schema": "gccf.receipt/1",
+                    "receipt_sha256": receipt_hash,
+                    "verdict": "include",
+                    "path": "source.parquet",
+                    "locator": {"type": "row", "index": len(records)},
+                },
+            }
+        )
+    records[1]["text"] = "modified after export"
+    from yylab.ingest.adapters.jsonl import _record_text
+
+    with pytest.raises(ValueError, match="GCCF text changed after export"):
+        _record_text(records[1])
+    (source / "approved.jsonl").write_text("\n".join(map(json.dumps, records)), encoding="utf-8")
+    (root / "gccf-export.json").write_text(
+        json.dumps(
+            {
+                "schema": EXPORT_SCHEMA,
+                "audit": {"receipt_sha256": receipt_hash},
+                "complete_source_scan": True,
+                "corpora": {
+                    "approved-source": {
+                        "documents": expected_documents,
+                        "shards": ["data/approved-source/approved.jsonl"],
+                    }
+                },
+            }
+        )
+    )
+    cid = db.new_id("cor")
+    now = db.now_iso()
+    db.execute(
+        "INSERT INTO corpora(id,name,created_at,updated_at,status,source_path) VALUES(?,?,?,?,?,?)",
+        (cid, "GCCF failed import", now, now, "failed", str(source.resolve())),
+    )
+    failed_data = corpus_dir(cid) / "data"
+    failed_data.mkdir(parents=True)
+    (failed_data / "shard-00002.jsonl.zst").write_bytes(b"partial prior import")
+
+    if expected_documents == 1:
+        with pytest.raises(ValueError, match="more records than its manifest"):
+            import_export(lambda *a: None, root)
+        assert db.q1("SELECT status FROM corpora WHERE id=?", (cid,))["status"] == "failed"
+        assert not (root / "verified").exists()
+        return
+    result = import_export(lambda *a: None, root)
+    assert result["corpora"] == {"approved-source": cid}
+    assert result["integrity_rejections"] == 1
+    assert result["unavailable_documents"] == expected_documents - 2
+    assert not (failed_data / "shard-00002.jsonl.zst").exists()
+    native = list(iter_corpus_docs([cid], splits=["train"]))
+    assert [r["text"] for r in native] == [records[0]["text"]]
+    rejected = json.loads((corpus_dir(cid) / "gccf-integrity-rejections.jsonl").read_text())
+    assert rejected["document_id"] == records[1]["document_id"]
+    assert "text" not in rejected
+    assert rejected["locator"] == {"type": "row", "index": 1}
+    docs = list(iter_approved_jsonl(discover_jsonl([Path(result["verified_directory"]) / "data"])))
+    assert [(d.text, d.kind, d.language, d.document_id) for d in docs] == [
+        (records[0]["text"], "code", "python", records[0]["document_id"])
+    ]
