@@ -639,21 +639,30 @@ def iter_corpus_docs(
         # Resolve the generation once per stream so a re-import published
         # mid-run cannot mix old and new shards into the same epoch.
         data_dir = corpus_data_dir(corpus_id)
-        shards = corpus_shards(corpus_id, data_dir=data_dir)
-        if not shards:
-            return
-        for line in _iter_shards(data_dir, shards):
-            split = infer_source_split(line.get("source", ""), line.get("split"))
-            if (domain_set is None or line.get("domain") in domain_set) and (
-                split_set is None or split in split_set
-            ):
-                if line.get("split") != split or annotate_source:
-                    line = dict(line)
-                if line.get("split") != split:
-                    line["split"] = split
-                if annotate_source:
-                    line[CORPUS_ID_FIELD] = corpus_id
-                yield line
+        if (corpus_dir(corpus_id) / "gccf-source.json").exists():
+            from ..ingest.gccf import iter_source_corpus
+
+            records = iter_source_corpus(corpus_id, splits=selected_splits or None)
+        else:
+            shards = corpus_shards(corpus_id, data_dir=data_dir)
+            if not shards:
+                return
+            records = _iter_shards(data_dir, shards)
+        try:
+            for line in records:
+                split = infer_source_split(line.get("source", ""), line.get("split"))
+                if (domain_set is None or line.get("domain") in domain_set) and (
+                    split_set is None or split in split_set
+                ):
+                    if line.get("split") != split or annotate_source:
+                        line = dict(line)
+                    if line.get("split") != split:
+                        line["split"] = split
+                    if annotate_source:
+                        line[CORPUS_ID_FIELD] = corpus_id
+                    yield line
+        finally:
+            records.close()
 
     def shuffled_stream(
         items: Iterator[dict],

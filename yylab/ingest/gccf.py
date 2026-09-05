@@ -307,10 +307,31 @@ def run_gccf_ingest(
     output: str | None = None,
     limit_per_file: int | None = None,
     workers: int | None = None,
+    materialize: bool = False,
 ) -> dict:
     _, audit_receipt, export_receipt = _receipt_tools()
     audit = audit_receipt(receipt_path)
     suffix = f"-sample-{limit_per_file}" if limit_per_file else ""
+    if not materialize:
+        from spalmer.data.gccf_index import build_receipt_index
+
+        destination = (
+            Path(output) if output else (PATHS.cache / "gccf-index" / (audit["receipt_sha256"][:20] + suffix))
+        )
+        if not destination.exists():
+            build_receipt_index(
+                receipt_path,
+                destination,
+                limit_per_file=limit_per_file,
+                progress=lambda message: progress("gccf-index", 0, message),
+            )
+        manifest = json.loads((destination / "gccf-index.json").read_text(encoding="utf-8"))
+        if (
+            manifest["audit"]["receipt_sha256"] != audit["receipt_sha256"]
+            or manifest["limit_per_file"] != limit_per_file
+        ):
+            raise ValueError("existing index does not match receipt and sampling limit")
+        return register_source_index(progress, destination)
     destination = Path(output) if output else (PATHS.cache / "gccf" / (audit["receipt_sha256"][:20] + suffix))
     if destination.exists():
         manifest = json.loads((destination / "gccf-export.json").read_text(encoding="utf-8"))
@@ -329,6 +350,81 @@ def run_gccf_ingest(
     return import_export(progress, destination, workers=workers)
 
 
+def register_source_index(progress, index_directory):
+    """Register lightweight corpus pointers; no extracted text is written."""
+    from spalmer.data.gccf_index import INDEX_SCHEMA
+
+    root = Path(index_directory).resolve()
+    manifest = json.loads((root / "gccf-index.json").read_text(encoding="utf-8"))
+    if manifest.get("schema") != INDEX_SCHEMA:
+        raise ValueError("unsupported GCCF source index")
+    registered = {}
+    with _exclusive_ingest():
+        for name, source_stats in manifest["corpora"].items():
+            source = (root / "sources" / name).resolve()
+            if not source.is_relative_to(root / "sources"):
+                raise ValueError("GCCF indexed source is outside its index")
+            existing = db.q1("SELECT id,status FROM corpora WHERE source_path=?", (str(source),))
+            if existing:
+                if existing["status"] != "ready":
+                    raise ValueError("existing indexed corpus is not ready")
+                registered[name] = existing["id"]
+                continue
+            cid = db.new_id("cor")
+            cdir = corpus_dir(cid)
+            cdir.mkdir(parents=True, exist_ok=True)
+            pointer = {"index_directory": str(root), "source": name}
+            (cdir / "gccf-source.json").write_text(json.dumps(pointer), encoding="utf-8")
+            provenance = {
+                "receipt_sha256": manifest["audit"]["receipt_sha256"],
+                "index_manifest": str(root / "gccf-index.json"),
+                "source": name,
+                "storage": "original_sources",
+                "classified": True,
+                "complete_source_scan": manifest["complete_source_scan"],
+                "approval_scope": "file_sampled",
+            }
+            cfg = gccf_ingest_config(name="GCCF · " + name, source_dir=str(source))
+            stats = {
+                **source_stats,
+                "gccf": provenance,
+                "bytes_on_disk": 0,
+                "ingest_config": cfg.ingest_config_stats(workers=1),
+            }
+            (cdir / "stats.json").write_text(json.dumps(stats, indent=2), encoding="utf-8")
+            (cdir / "gccf-provenance.json").write_text(json.dumps(provenance), encoding="utf-8")
+            now = db.now_iso()
+            db.execute(
+                "INSERT INTO corpora(id,name,created_at,updated_at,status,source_path,stats_json) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (cid, cfg.name, now, now, "ready", str(source), json.dumps(stats)),
+            )
+            registered[name] = cid
+            progress("gccf-index", 1, f"{cfg.name}: reads original files")
+    result = {
+        "index_directory": str(root),
+        "storage": "original_sources",
+        "corpora": registered,
+        "receipt_sha256": manifest["audit"]["receipt_sha256"],
+        "complete_source_scan": manifest["complete_source_scan"],
+        "text_bytes_copied": 0,
+    }
+    (root / "yylab-import.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+    return result
+
+
+def iter_source_corpus(corpus_id, *, splits=None):
+    from spalmer.data.gccf_index import iter_indexed_records
+
+    pointer = json.loads((corpus_dir(corpus_id) / "gccf-source.json").read_text(encoding="utf-8"))
+    stream = iter_indexed_records(pointer["index_directory"], source=pointer["source"], splits=splits)
+    try:
+        for row in stream:
+            yield {**row, "lang": row["language"], "sample_id": row["document_id"]}
+    finally:
+        stream.close()
+
+
 def main(argv=None) -> None:
     parser = argparse.ArgumentParser(description="Import a GCCF receipt into yyLab")
     parser.add_argument("receipt", type=Path, nargs="?")
@@ -336,6 +432,7 @@ def main(argv=None) -> None:
     parser.add_argument("--output", type=str)
     parser.add_argument("--limit-per-file", type=int)
     parser.add_argument("--workers", type=int)
+    parser.add_argument("--materialize", action="store_true", help="explicitly copy processed text")
     args = parser.parse_args(argv)
     if bool(args.receipt) == bool(args.export_dir):
         parser.error("provide either a receipt or --export-dir")
@@ -353,6 +450,7 @@ def main(argv=None) -> None:
             output=args.output,
             limit_per_file=args.limit_per_file,
             workers=args.workers,
+            materialize=args.materialize,
         )
     )
     print(json.dumps(result, indent=2))

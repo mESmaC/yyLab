@@ -22,7 +22,8 @@ Artifacts live in `./artifacts` (override with `YYLAB_HOME`).
 
 - **GCCF classified corpora** — import a GCCF receipt, honor approved-file and
   bad-record decisions, preserve held-out splits and training provenance, and
-  choose each classified source independently in training mixtures.
+  read each classified source directly from the original datasets. Processed
+  copies require an explicit option.
 
 - **Corpora intake** — point at a folder; adapter plugins per filetype,
   streaming JSONL/Parquet normalization, exact + bounded-memory MinHash dedup,

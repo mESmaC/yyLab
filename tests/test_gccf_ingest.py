@@ -12,7 +12,8 @@ from yylab.ingest.gccf import gccf_ingest_config, import_export, run_gccf_ingest
 from yylab.train.data import corpus_data_provenance, iter_corpus_docs
 
 
-def test_receipt_to_yylab_training_preserves_selection_splits_and_provenance(tmp_path):
+@pytest.mark.parametrize("materialize", [False, True])
+def test_receipt_to_yylab_training_preserves_selection_splits_and_provenance(tmp_path, materialize):
     source = tmp_path / "source"
     source.mkdir()
     data = source / "data.jsonl"
@@ -60,7 +61,7 @@ def test_receipt_to_yylab_training_preserves_selection_splits_and_provenance(tmp
         )
     )
     output = tmp_path / "export"
-    result = run_gccf_ingest(lambda *a: None, str(r), output=str(output), workers=1)
+    result = run_gccf_ingest(lambda *a: None, str(r), output=str(output), workers=1, materialize=materialize)
     cid = next(iter(result["corpora"].values()))
     assert db.q1("SELECT status FROM corpora WHERE id=?", (cid,))["status"] == "ready"
     assert list(iter_corpus_docs([cid], splits=["train"])) == []
@@ -73,7 +74,24 @@ def test_receipt_to_yylab_training_preserves_selection_splits_and_provenance(tmp
     lineage = corpus_data_provenance([cid])["corpora"][0]
     assert lineage["catalog_status"] == "gccf_catalogued"
     assert lineage["gccf"]["receipt_sha256"] == result["receipt_sha256"]
-    assert import_export(lambda *a: None, output)["corpora"] == result["corpora"]
+    if materialize:
+        assert import_export(lambda *a: None, output)["corpora"] == result["corpora"]
+    else:
+        assert result["storage"] == "original_sources"
+        assert result["text_bytes_copied"] == 0
+        assert not list(output.rglob("*.jsonl*"))
+        assert not (corpus_dir(cid) / "data").exists()
+        assert run_gccf_ingest(lambda *a: None, str(r), output=str(output))["corpora"] == result["corpora"]
+        from yylab.train.data import corpus_training_preflight
+
+        assert not corpus_training_preflight([cid], splits=["test"])["errors"]
+        from yylab.ingest.pipeline import reimport_corpus
+
+        with pytest.raises(ValueError, match="new GCCF receipt"):
+            reimport_corpus(lambda *a: None, cid, gccf_ingest_config(name="direct", source_dir=str(source)))
+        data.unlink()
+        with pytest.raises(FileNotFoundError):
+            list(iter_corpus_docs([cid], splits=["test"]))
 
 
 def test_classified_import_does_not_get_shadowed_by_existing_raw_data():

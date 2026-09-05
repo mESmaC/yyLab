@@ -272,6 +272,7 @@ def corpora_page():
                                 on_click=lambda cid=cid: open_reimport(cid),
                             ).props("dense no-caps outline").set_enabled(
                                 c["status"] in {"ready", "failed"} and not busy()
+                                and (stats.get("gccf") or {}).get("storage") != "original_sources"
                             )
                         ui.button(
                             "Delete",
@@ -281,10 +282,14 @@ def corpora_page():
                 ui.label(f'source: {c["source_path"]}').classes("text-xs text-gray-500")
                 gccf = stats.get("gccf") or {}
                 if gccf:
-                    coverage = "complete export" if gccf.get("complete_source_scan") else "partial sample export"
+                    coverage = "full source scan" if gccf.get("complete_source_scan") else "partial source scan"
                     ui.label(
                         f"GCCF approved · {coverage} · source and receipt provenance retained"
                     ).classes("text-xs text-teal-300")
+                    if gccf.get("storage") == "original_sources":
+                        ui.label("Reads original files · import a new receipt to update selection").classes(
+                            "text-xs text-gray-400"
+                        )
                     changed = int(stats.get("integrity_rejections", 0))
                     missing = int(stats.get("unavailable_documents", 0))
                     if changed or missing:
@@ -444,7 +449,18 @@ def corpora_page():
 
                 sample = []
                 shards = stats.get("shards", [])
-                if shards:
+                if (stats.get("gccf") or {}).get("storage") == "original_sources":
+                    from ...ingest.gccf import iter_source_corpus
+
+                    records = iter_source_corpus(cid)
+                    try:
+                        for line in records:
+                            sample.append(line)
+                            if len(sample) >= 3:
+                                break
+                    finally:
+                        records.close()
+                elif shards:
                     for line in _iter_shards(corpus_bucket_dir(cid, "data"), shards[:1]):
                         sample.append(line)
                         if len(sample) >= 3:
@@ -736,9 +752,10 @@ def corpora_page():
             ui.label("Import classified corpora").classes("text-lg font-semibold")
             hint(
                 "Reads the files approved by GCCF, removes listed bad records, and preserves "
-                "held-out splits. Each source becomes a separate corpus for training mixtures."
+                "held-out splits. Text stays in the original datasets by default."
             )
             gccf_path = ui.input("GCCF receipt JSON path").props("outlined dense").classes("w-full")
+            gccf_copy = ui.checkbox("Create a processed copy (uses additional disk space)", value=False)
 
             def begin_gccf() -> None:
                 if busy():
@@ -750,7 +767,9 @@ def corpora_page():
                     return
                 from ...ingest.gccf import run_gccf_ingest
 
-                state["job"] = JOBS.submit("gccf-ingest", run_gccf_ingest, path)
+                state["job"] = JOBS.submit(
+                    "gccf-ingest", run_gccf_ingest, path, materialize=bool(gccf_copy.value)
+                )
                 progress_row.visible = True
                 plabel.text = "queued · GCCF import"
                 gccf_dialog.close()

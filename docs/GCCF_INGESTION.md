@@ -1,9 +1,10 @@
 # Import GCCF classified corpora
 
 In **Corpora**, select **Import GCCF receipt** and enter the path to a
-`gccf.receipt/1` JSON receipt. yyLab extracts only included files, applies the
-receipt's bad-record locators, deduplicates, preserves held-out splits, and creates
-one selectable corpus per approved source. Corpus names begin with `GCCF ·`.
+`gccf.receipt/1` JSON receipt. By default, yyLab builds a metadata index over the
+original datasets. It applies approved-file and bad-record decisions, deduplicates,
+preserves held-out splits, and creates one selectable corpus per approved source.
+Corpus text stays in the datasets directory. Names begin with `GCCF ·`.
 
 The reviewed source files must still exist and match their recorded sizes and
 modification times. File approval reflects sampled records, not a classifier
@@ -15,6 +16,9 @@ From the yyLab checkout:
 uv sync
 .venv\Scripts\python.exe -m yylab.ingest.gccf C:\path\gccf-receipt.json
 
+# Optional: explicitly create a processed copy.
+.venv\Scripts\python.exe -m yylab.ingest.gccf C:\path\gccf-receipt.json --materialize
+
 # Reuse a SPALMER export rather than extracting the original corpus again.
 .venv\Scripts\python.exe -m yylab.ingest.gccf --export-dir C:\data\gccf-approved
 ```
@@ -23,14 +27,23 @@ The shared reader lives in the sibling `../spalmer` checkout, now used as yyLab'
 editable uv dependency. Both checkouts are required for this local development
 configuration. For a bounded ingestion smoke test, add `--limit-per-file 32`;
 this is explicitly recorded as a partial prefix sample, not a training corpus
-quality assessment. The cache separates partial and full exports.
+quality assessment. The cache separates metadata indexes, materialized exports,
+and partial/full scans.
 
-GCCF imports compress already approved records directly into yyLab shards.
-They preserve canonical causal text and structured messages for chat SFT without
-repeating raw-corpus quality analysis. Native split membership and receipt hashes
-flow into yyLab/SPALMER training provenance. Importing the same export again
-reuses its ready corpus registrations. A later explicit Re-import can run the
-ordinary yyLab analysis pipeline against the approved export.
+The index stores record locations, content identities, deduplication/split
+decisions, and counts. Training and previews extract canonical text and messages
+from the original files on demand. No source-text spool or processed corpus is
+created during indexing. Source size/mtime and record identities are checked on
+read; changed sources require a new receipt/index. Repeating the same import
+reuses its index and ready registrations. The shared index is also a valid input
+to SPALMER `prepare-data`, which writes token shards directly from bounded memory
+buffers instead of making a temporary text corpus.
+
+## Optional processed copy
+
+Enable **Create a processed copy** in the dialog, or pass `--materialize`, to
+request compressed yyLab shards. The already completed September 5 import remains
+available in this form. It was not deleted or recreated when the default changed.
 
 Registration verifies each record's normalized text against its export ID.
 Changed records are excluded and listed, without their contents, in each corpus's
@@ -49,7 +62,9 @@ metadata field or the exact original byte representation.
 
 On this machine, Windows Defender remediated embedded scripts in part of the
 security-code export. Changed records are excluded; security settings and
-quarantined content are left alone. Use the verified view for experiments.
+quarantined content are left alone. Use the verified view when using that existing copy.
+
+## Training
 
 Select the **train** split for training. Use token-balanced corpus mixing and
 source weights to prevent the largest code collections from dominating. Start
