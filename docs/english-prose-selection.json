@@ -1,0 +1,7 @@
+{
+  "validation_files": ["the-blue-castle.txt", "deductive-logic.txt"],
+  "test_files": ["the-roman-hat.txt", "the-book-of-logic.txt"],
+  "end_before_lines": {
+    "The Book of Disquiet - Fernando Pessoa_djvu.txt": "Table of Contents"
+  }
+}

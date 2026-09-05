@@ -73,6 +73,10 @@ with classified-only data; raw general prose can later supply a controlled
 ingested raw data erase approved copies; training-time cross-corpus deduplication
 is still available.
 
+The supplied 16-book collection is now available as **Raw prose · english-prose**,
+backed directly by the originals. See [ENGLISH_PROSE.md](ENGLISH_PROSE.md) for
+its book-level holdouts, unclassified provenance, and a 90/10 starting target.
+
 The full schema and extraction/split guarantees are documented in SPALMER's
 `docs/gccf-ingestion.md`. GCCF export artifacts are reusable by SPALMER's
 `prepare-data` command and are not tied to yyLab's database.

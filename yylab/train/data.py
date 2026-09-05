@@ -435,8 +435,11 @@ def corpus_data_provenance(
             kind = str(row.get("kind") or "ingested")
             verdict = str(row.get("verdict") or "")
             gccf_catalog = dict(stats.get("gccf") or {})
+            source_index = dict(stats.get("source_index") or {})
             if gccf_catalog:
                 catalog_status = "gccf_catalogued"
+            elif source_index:
+                catalog_status = "raw_source_index"
             elif cdas_catalog:
                 catalog_status = "cdas_catalogued"
             elif kind == "approved":
@@ -458,6 +461,7 @@ def corpus_data_provenance(
                 catalog_status=catalog_status,
                 cdas_catalog=cdas_catalog,
                 gccf=gccf_catalog,
+                source_index=source_index,
             )
             total_docs += docs
             total_chars += chars
@@ -639,7 +643,11 @@ def iter_corpus_docs(
         # Resolve the generation once per stream so a re-import published
         # mid-run cannot mix old and new shards into the same epoch.
         data_dir = corpus_data_dir(corpus_id)
-        if (corpus_dir(corpus_id) / "gccf-source.json").exists():
+        if (corpus_dir(corpus_id) / "text-source.json").exists():
+            from ..ingest.text_source import iter_text_source_corpus
+
+            records = iter_text_source_corpus(corpus_id, splits=selected_splits or None)
+        elif (corpus_dir(corpus_id) / "gccf-source.json").exists():
             from ..ingest.gccf import iter_source_corpus
 
             records = iter_source_corpus(corpus_id, splits=selected_splits or None)

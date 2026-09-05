@@ -1,0 +1,360 @@
+{
+  "source_directory": "C:\\Users\\engin\\Documents\\datasets\\english-prose",
+  "file_count": 16,
+  "source_bytes": 13920131,
+  "source_words": 2314378,
+  "view_excluded_bytes": 301384,
+  "stats": {
+    "docs_written": 1577,
+    "chars_written": 13493139,
+    "utf8_bytes_written": 13618733,
+    "words": 2266651,
+    "domains": {
+      "language": {
+        "docs": 1577,
+        "chars": 13493139,
+        "tokens": {}
+      }
+    },
+    "langs": {
+      "en": 1577
+    },
+    "splits": {
+      "train": {
+        "docs": 1333,
+        "chars": 11481287,
+        "utf8_bytes": 11575462,
+        "domains": {
+          "language": {
+            "docs": 1333,
+            "chars": 11481287,
+            "tokens": {}
+          }
+        }
+      },
+      "test": {
+        "docs": 141,
+        "chars": 1168470,
+        "utf8_bytes": 1187076,
+        "domains": {
+          "language": {
+            "docs": 141,
+            "chars": 1168470,
+            "tokens": {}
+          }
+        }
+      },
+      "validation": {
+        "docs": 103,
+        "chars": 843382,
+        "utf8_bytes": 856195,
+        "domains": {
+          "language": {
+            "docs": 103,
+            "chars": 843382,
+            "tokens": {}
+          }
+        }
+      }
+    },
+    "shards": []
+  },
+  "normalized_duplicates_removed": 0,
+  "index_directory": "C:\\Users\\engin\\Desktop\\yy\\yyLab\\artifacts\\cache\\text-sources\\283724bfb2def47f0de5",
+  "index_sha256": "3f74d60ca9a2e33826b3752a2c9aab4bb01651cc9054927760bdb1d82994e333",
+  "index_bytes": 742835,
+  "corpus_id": "cor_20260904_230255_cb24da",
+  "classified": false,
+  "text_bytes_copied": 0,
+  "shared_reader_text_sha256": "40e79ec7191c935fc3d606165093fc9204b4c66c14686a3ef5b71b8e63af71e0",
+  "all_source_hashes_unchanged": true,
+  "mixed_training_preflight": {
+    "classified_corpora": 12,
+    "raw_corpora": 1,
+    "errors": [],
+    "warnings": []
+  },
+  "bounded_mix_smoke": {
+    "gccf": 123,
+    "raw": 5
+  },
+  "files": [
+    {
+      "path": "C:\\Users\\engin\\Documents\\datasets\\english-prose\\crime-and-punishment.txt",
+      "size_bytes": 1201725,
+      "mtime_ns": 1788576110948546700,
+      "sha256": "d139120965c81f10e3f747d891a49babdb49d986b25f7ab25299b1bbf4731146",
+      "title": "Crime and Punishment",
+      "author": "Fyodor Dostoyevsky",
+      "raw_words": 206718,
+      "body_start": 923,
+      "body_end": 1182818,
+      "excluded_bytes": 19830,
+      "gutenberg_wrapper": true,
+      "end_before_line": null,
+      "file_id": 0,
+      "filename": "crime-and-punishment.txt",
+      "split": "train"
+    },
+    {
+      "path": "C:\\Users\\engin\\Documents\\datasets\\english-prose\\deductive-and-inductive.txt",
+      "size_bytes": 829315,
+      "mtime_ns": 1788576211580875100,
+      "sha256": "3170d07cf0adbb259e38d8f422fe6a0543a1a3b0b55fa942b227eeebb3048ccd",
+      "title": "Logic: Deductive and Inductive",
+      "author": "Carveth Read",
+      "raw_words": 134569,
+      "body_start": 923,
+      "body_end": 810398,
+      "excluded_bytes": 19840,
+      "gutenberg_wrapper": true,
+      "end_before_line": null,
+      "file_id": 1,
+      "filename": "deductive-and-inductive.txt",
+      "split": "train"
+    },
+    {
+      "path": "C:\\Users\\engin\\Documents\\datasets\\english-prose\\deductive-logic.txt",
+      "size_bytes": 467781,
+      "mtime_ns": 1788576223353247400,
+      "sha256": "64ac23b025f341d98e8f26667871d6c29459b19ae581610eed16b6cbcc63e103",
+      "title": "Deductive Logic",
+      "author": "St. George William Joseph Stock",
+      "raw_words": 75968,
+      "body_start": 956,
+      "body_end": 448879,
+      "excluded_bytes": 19858,
+      "gutenberg_wrapper": true,
+      "end_before_line": null,
+      "file_id": 2,
+      "filename": "deductive-logic.txt",
+      "split": "validation"
+    },
+    {
+      "path": "C:\\Users\\engin\\Documents\\datasets\\english-prose\\detective-stories.txt",
+      "size_bytes": 881030,
+      "mtime_ns": 1788576183731730300,
+      "sha256": "558a2fe355274607360fad8a7752a0b104062b154d2edf5fcbd9561e5247842a",
+      "title": "Great short stories, Volume 1 (of 3)",
+      "author": "",
+      "raw_words": 154291,
+      "body_start": 936,
+      "body_end": 862107,
+      "excluded_bytes": 19859,
+      "gutenberg_wrapper": true,
+      "end_before_line": null,
+      "file_id": 3,
+      "filename": "detective-stories.txt",
+      "split": "train"
+    },
+    {
+      "path": "C:\\Users\\engin\\Documents\\datasets\\english-prose\\mathematics.txt",
+      "size_bytes": 993493,
+      "mtime_ns": 1788576641809650600,
+      "sha256": "7e52015850ff1a25cbba577911e2648d7ee200d2f15adbe05c8adf65776543d3",
+      "title": "Amusements in Mathematics",
+      "author": "Henry Ernest Dudeney",
+      "raw_words": 166959,
+      "body_start": 1000,
+      "body_end": 974496,
+      "excluded_bytes": 19997,
+      "gutenberg_wrapper": true,
+      "end_before_line": null,
+      "file_id": 4,
+      "filename": "mathematics.txt",
+      "split": "train"
+    },
+    {
+      "path": "C:\\Users\\engin\\Documents\\datasets\\english-prose\\pride-and-prej.txt",
+      "size_bytes": 772386,
+      "mtime_ns": 1788576094668018100,
+      "sha256": "3f6bb9d6f78e0293b56acd4714dd68cb7d6d1d293402031ce9d5a216bcaf9d75",
+      "title": "Pride and Prejudice",
+      "author": "Jane Austen",
+      "raw_words": 130615,
+      "body_start": 993,
+      "body_end": 753480,
+      "excluded_bytes": 19899,
+      "gutenberg_wrapper": true,
+      "end_before_line": null,
+      "file_id": 5,
+      "filename": "pride-and-prej.txt",
+      "split": "train"
+    },
+    {
+      "path": "C:\\Users\\engin\\Documents\\datasets\\english-prose\\sherlock.txt",
+      "size_bytes": 622091,
+      "mtime_ns": 1788576146060289500,
+      "sha256": "bf63b19ade817616aa64b5dcaf32e8685592c315fd22e336defe685baa02d419",
+      "title": "Adventures of Sherlock Holmes",
+      "author": "Arthur Conan Doyle",
+      "raw_words": 109751,
+      "body_start": 1095,
+      "body_end": 603092,
+      "excluded_bytes": 20094,
+      "gutenberg_wrapper": true,
+      "end_before_line": null,
+      "file_id": 6,
+      "filename": "sherlock.txt",
+      "split": "train"
+    },
+    {
+      "path": "C:\\Users\\engin\\Documents\\datasets\\english-prose\\The Book of Disquiet - Fernando Pessoa_djvu.txt",
+      "size_bytes": 1050583,
+      "mtime_ns": 1788576585274292300,
+      "sha256": "16ff8c7c980d8b885b9978efd62d67b9463e787c29d6cb24f8157f1b0d72c33e",
+      "title": "The Book of Disquiet - Fernando Pessoa_djvu",
+      "author": "",
+      "raw_words": 179964,
+      "body_start": 0,
+      "body_end": 1048154,
+      "excluded_bytes": 2429,
+      "gutenberg_wrapper": false,
+      "end_before_line": "Table of Contents",
+      "file_id": 7,
+      "filename": "The Book of Disquiet - Fernando Pessoa_djvu.txt",
+      "split": "train"
+    },
+    {
+      "path": "C:\\Users\\engin\\Documents\\datasets\\english-prose\\the-blue-castle.txt",
+      "size_bytes": 428204,
+      "mtime_ns": 1788576129899603200,
+      "sha256": "b418e6dae92794a0a79cb160f29d88c5e7169d342f9128f005d91905e9023636",
+      "title": "The Blue Castle: a novel",
+      "author": "L. M. Montgomery",
+      "raw_words": 72650,
+      "body_start": 1021,
+      "body_end": 409293,
+      "excluded_bytes": 19932,
+      "gutenberg_wrapper": true,
+      "end_before_line": null,
+      "file_id": 8,
+      "filename": "the-blue-castle.txt",
+      "split": "validation"
+    },
+    {
+      "path": "C:\\Users\\engin\\Documents\\datasets\\english-prose\\the-book-of-logic.txt",
+      "size_bytes": 622267,
+      "mtime_ns": 1788576240367930800,
+      "sha256": "3eb1577c2472b3d0b84b9808231eef152d289eb04a1cc30ea2f6f6c61821e95f",
+      "title": "Logic, Inductive and Deductive",
+      "author": "William Minto",
+      "raw_words": 101919,
+      "body_start": 944,
+      "body_end": 603267,
+      "excluded_bytes": 19944,
+      "gutenberg_wrapper": true,
+      "end_before_line": null,
+      "file_id": 9,
+      "filename": "the-book-of-logic.txt",
+      "split": "test"
+    },
+    {
+      "path": "C:\\Users\\engin\\Documents\\datasets\\english-prose\\the-critique-of-pratical-reason.txt",
+      "size_bytes": 397584,
+      "mtime_ns": 1788576454553638700,
+      "sha256": "09794f0a1f60e4e5d2a0c286b8f9f8bc65290d901d91f8596f9fb75b812dde96",
+      "title": "The Critique of Practical Reason",
+      "author": "Immanuel Kant",
+      "raw_words": 66090,
+      "body_start": 1007,
+      "body_end": 378580,
+      "excluded_bytes": 20011,
+      "gutenberg_wrapper": true,
+      "end_before_line": null,
+      "file_id": 10,
+      "filename": "the-critique-of-pratical-reason.txt",
+      "split": "train"
+    },
+    {
+      "path": "C:\\Users\\engin\\Documents\\datasets\\english-prose\\the-critique-of-pure-reason.txt",
+      "size_bytes": 1315283,
+      "mtime_ns": 1788576439494470100,
+      "sha256": "9e44b1bc6042da4aeb669d4f3f585037a5488a2908e7ec225f9431c43f6720fc",
+      "title": "The Critique of Pure Reason",
+      "author": "Immanuel Kant",
+      "raw_words": 213570,
+      "body_start": 933,
+      "body_end": 1296369,
+      "excluded_bytes": 19847,
+      "gutenberg_wrapper": true,
+      "end_before_line": null,
+      "file_id": 11,
+      "filename": "the-critique-of-pure-reason.txt",
+      "split": "train"
+    },
+    {
+      "path": "C:\\Users\\engin\\Documents\\datasets\\english-prose\\the-principles-of-science.txt",
+      "size_bytes": 1839423,
+      "mtime_ns": 1788576196248323000,
+      "sha256": "fa0cf1b68b41e59fb08b7e411a635efef96cb39a89d3fb24cd446eb4346ca868",
+      "title": "The principles of science",
+      "author": "William Stanley Jevons",
+      "raw_words": 295499,
+      "body_start": 1114,
+      "body_end": 1820511,
+      "excluded_bytes": 20026,
+      "gutenberg_wrapper": true,
+      "end_before_line": null,
+      "file_id": 12,
+      "filename": "the-principles-of-science.txt",
+      "split": "train"
+    },
+    {
+      "path": "C:\\Users\\engin\\Documents\\datasets\\english-prose\\the-roman-hat.txt",
+      "size_bytes": 604602,
+      "mtime_ns": 1788576164429353500,
+      "sha256": "62143b216908da145e02b240fbd8146e0ae9bf95161ef22bd812f2af67053b5b",
+      "title": "The Roman hat mystery",
+      "author": "Ellery Queen",
+      "raw_words": 98465,
+      "body_start": 941,
+      "body_end": 585694,
+      "excluded_bytes": 19849,
+      "gutenberg_wrapper": true,
+      "end_before_line": null,
+      "file_id": 13,
+      "filename": "the-roman-hat.txt",
+      "split": "test"
+    },
+    {
+      "path": "C:\\Users\\engin\\Documents\\datasets\\english-prose\\tragic-sense-of-life.txt",
+      "size_bytes": 721697,
+      "mtime_ns": 1788576465674652500,
+      "sha256": "1a0af878f83426376631fdcad02d7a082682e557b55257c5af081f0b06da3e8f",
+      "title": "Tragic Sense Of Life",
+      "author": "Miguel de Unamuno",
+      "raw_words": 122691,
+      "body_start": 990,
+      "body_end": 702713,
+      "excluded_bytes": 19974,
+      "gutenberg_wrapper": true,
+      "end_before_line": null,
+      "file_id": 14,
+      "filename": "tragic-sense-of-life.txt",
+      "split": "train"
+    },
+    {
+      "path": "C:\\Users\\engin\\Documents\\datasets\\english-prose\\unconscious.txt",
+      "size_bytes": 1172667,
+      "mtime_ns": 1788576676260659700,
+      "sha256": "07b808b69c98854f3a5e8745439d889cf1e8c01b7b4f957511c6a3d18152e498",
+      "title": "Psychology of the Unconscious",
+      "author": "C. G. Jung",
+      "raw_words": 184659,
+      "body_start": 1079,
+      "body_end": 1153751,
+      "excluded_bytes": 19995,
+      "gutenberg_wrapper": true,
+      "end_before_line": null,
+      "file_id": 15,
+      "filename": "unconscious.txt",
+      "split": "train"
+    }
+  ],
+  "tests": {
+    "spalmer_passed": 463,
+    "spalmer_skipped": 4,
+    "yylab_selection_passed": 192
+  }
+}

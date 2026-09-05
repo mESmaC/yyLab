@@ -273,6 +273,7 @@ def corpora_page():
                             ).props("dense no-caps outline").set_enabled(
                                 c["status"] in {"ready", "failed"} and not busy()
                                 and (stats.get("gccf") or {}).get("storage") != "original_sources"
+                                and not stats.get("source_index")
                             )
                         ui.button(
                             "Delete",
@@ -281,6 +282,8 @@ def corpora_page():
                         ).props("flat dense no-caps color=negative")
                 ui.label(f'source: {c["source_path"]}').classes("text-xs text-gray-500")
                 gccf = stats.get("gccf") or {}
+                if stats.get("source_index"):
+                    ui.label("Unclassified prose supplement · reads original files").classes("text-xs text-gray-400")
                 if gccf:
                     coverage = "full source scan" if gccf.get("complete_source_scan") else "partial source scan"
                     ui.label(
@@ -449,10 +452,10 @@ def corpora_page():
 
                 sample = []
                 shards = stats.get("shards", [])
-                if (stats.get("gccf") or {}).get("storage") == "original_sources":
-                    from ...ingest.gccf import iter_source_corpus
+                if stats.get("source_index") or (stats.get("gccf") or {}).get("storage") == "original_sources":
+                    from ...train.data import iter_corpus_docs
 
-                    records = iter_source_corpus(cid)
+                    records = iter_corpus_docs([cid], shuffle_buffer=1)
                     try:
                         for line in records:
                             sample.append(line)

@@ -1466,6 +1466,8 @@ def reimport_corpus(progress: ProgressFn, cid: str, cfg: IngestConfig) -> str:
     and is untouched if the run fails.
     """
 
+    if (corpus_dir(cid) / "text-source.json").exists():
+        raise ValueError("Re-index original text sources to update this corpus")
     if (corpus_dir(cid) / "gccf-source.json").exists():
         raise ValueError("Import a new GCCF receipt to update a corpus that reads original sources")
     if cfg.selection_profile not in SELECTION_PROFILES:
