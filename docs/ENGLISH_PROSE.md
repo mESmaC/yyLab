@@ -54,3 +54,10 @@ and experimental limitations are described in the sibling SPALMER checkout's
 readers produced identical text. SPALMER's full suite passed 463 tests (4 skipped),
 and the yyLab integration selection passed 192. No model-quality result is
 implied by these ingestion checks.
+
+The first real-corpus B/BR/P1/P2 comparison has since completed using a measured
+90.2% GCCF / 9.8% prose training mix. It confirmed the optimizer-state reduction
+but showed a modest validation-loss penalty for rotating plasticity. See the
+[SPALMER experiment report](../../spalmer/docs/real-corpus-plasticity-results-2026-09-04.md)
+for measurements and limitations; this was a single-seed architecture pilot,
+not a classified-versus-raw data efficacy comparison.
