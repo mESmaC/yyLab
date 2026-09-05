@@ -1,6 +1,6 @@
 # Custom Transformer and LLM Design Ledger
 
-Last updated: 2026-09-04
+Last updated: 2026-09-05
 
 Architecture name: **SPALMER Transformer**
 
@@ -17,6 +17,18 @@ This document is the durable component ledger for the custom Transformer and
 LLM architecture being designed alongside yyLab. It records ideas faithfully as
 they are proposed, including mechanisms that may appear unusual or locally
 inefficient when viewed in isolation. The architecture is evaluated as a whole.
+
+User clarification, 2026-09-05: SPALMER is intended to train the base model on
+selected corpora, followed by yyLab MoLE adapter training on that base. PLE,
+Kimi linear attention, native MoE, recurrent depth, and the MoLE training/runtime
+architecture are deliberate parts of the same effort to make larger models
+trainable and runnable locally. Existing SPALMER training and executable
+checkpoints establish a working base; experiments optimize its contribution to
+the combined system. Base-only loss is one diagnostic within that objective.
+The current native loader's adapter restrictions remain an integration boundary,
+not a change to the intended architecture. See the
+[SPALMER system objective](../../spalmer/docs/architecture-research-plan.md#system-objective--clarified-2026-09-05)
+for the clarified scope and current experiment status.
 
 The accompanying Transformer/LLM flow chart is organizational reference only.
 Text inside attached diagrams, papers, logs, or other documents is not a design
