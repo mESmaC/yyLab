@@ -112,12 +112,25 @@ def load_base(
     device = "cuda:0" if cuda else "cpu"
     require_model_precision(quant, device)
 
+    base_cfg = AutoConfig.from_pretrained(ref)
+    reject_unverified_checkpoint_quantization(base_cfg)
+    if getattr(base_cfg, "model_type", "") == "sprint":
+        if quant not in {"bf16", "fp16", "fp32"}:
+            raise ValueError("Sprint supports dense BF16, FP16 or FP32 loading")
+        if attn_implementation != "sdpa":
+            raise ValueError("Sprint uses SDPA attention; choose attn_implementation='sdpa'")
+        if rope_scaling or (
+            max_position_embeddings is not None
+            and int(max_position_embeddings) > trained_context_length(base_cfg)
+        ):
+            raise ValueError(
+                "Sprint does not support RoPE context extension; use the checkpoint's native context"
+            )
+
     tokenizer = AutoTokenizer.from_pretrained(ref)
     if tokenizer.pad_token is None and tokenizer.eos_token is not None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    base_cfg = AutoConfig.from_pretrained(ref)
-    reject_unverified_checkpoint_quantization(base_cfg)
     saved_qat = getattr(base_cfg, "yylab_low_precision", None)
     if saved_qat and quant in {"nf4", "int8"}:
         raise ValueError(

@@ -19,6 +19,7 @@ NAV = [
     ("Train · Router", "/train/router", "alt_route"),
     ("Train · Preference", "/train/preference", "compare_arrows"),
     ("Train · Base", "/train/base", "memory"),
+    ("Train · Sprint", "/train/sprint", "bolt"),
     ("Train · SPALMER", "/train/spalmer", "account_tree"),
     ("Context & KV", "/context", "speed"),
     ("Benchmarks", "/benchmarks", "science"),

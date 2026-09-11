@@ -136,7 +136,7 @@ def mark_training_artifacts_failed(run_kind: str, cfg: dict) -> None:
         db.execute("UPDATE adapters SET status='failed' WHERE id=?", (cfg["adapter_id"],))
     if run_kind == "router_stage2" and cfg.get("router_id"):
         db.execute("UPDATE routers SET status='failed' WHERE id=?", (cfg["router_id"],))
-    if run_kind in {"base", "spalmer_base"} and cfg.get("out_checkpoint_id"):
+    if run_kind in {"base", "spalmer_base", "sprint"} and cfg.get("out_checkpoint_id"):
         # The failed run remains the durable error record. Do not leave a
         # phantom checkpoint selectable as a training or inference input.
         db.execute(
@@ -1923,6 +1923,14 @@ def main() -> None:
             from ..train.spalmer import run_spalmer_base
 
             summary = run_spalmer_base(cfg, rd)
+        elif run["kind"] == "sprint":
+            from ..train.sprint import run_sprint_training
+
+            summary = run_sprint_training(cfg, rd)
+        elif run["kind"] == "sprint_benchmark":
+            from ..train.benchmark_sprint import run_sprint_benchmark
+
+            summary = run_sprint_benchmark(cfg, rd)
         elif run["kind"] == "export":
             summary = run_export(cfg, rd)
         elif run["kind"] == "benchmark_quality":

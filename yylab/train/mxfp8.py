@@ -82,6 +82,23 @@ def resolve_mxfp8_backend(
     raise MXFP8Error(f"native MXFP8 requested but unavailable: {note}")
 
 
+@torch.library.custom_op("yylab::mxfp8_quantize_rows", mutates_args=())
+def _mx_quantize_rows_raw(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    # Keep the provider's cast opaque to AOTAutograd. On Windows its Triton
+    # mutation analysis can fail conservatively and clone every operand, even
+    # though this cast only writes fresh output buffers. This explicit contract
+    # avoids those copies while running the exact same native cast kernel.
+    from torchao.prototype.mx_formats.kernels import triton_to_mxfp8_dim0
+
+    return triton_to_mxfp8_dim0(value, inner_block_size=32, scaling_mode="rceil")
+
+
+@_mx_quantize_rows_raw.register_fake
+def _mx_quantize_rows_fake(value):
+    return (torch.empty_like(value, dtype=torch.float8_e4m3fn),
+            value.new_empty((value.shape[0], value.shape[1] // 32), dtype=torch.float8_e8m0fnu))
+
+
 def _mx_quantize_rows(value: torch.Tensor):
     """Quantize contiguous matrix rows in 32-value MXFP8 blocks.
 
@@ -91,22 +108,14 @@ def _mx_quantize_rows(value: torch.Tensor):
     present.  Both operands still reach the real MXFP8 Tensor Core GEMM.
     """
 
-    from torchao.prototype.mx_formats.config import (
-        MXFP8Dim0CastKernelChoice,
-        ScaleCalculationMode,
-    )
     from torchao.prototype.mx_formats.mx_tensor import MXTensor
     from torchao.quantization.quantize_.common.kernel_preference import (
         KernelPreference,
     )
 
-    return MXTensor.to_mx(
-        value.contiguous(),
-        torch.float8_e4m3fn,
-        32,
-        ScaleCalculationMode.RCEIL,
-        KernelPreference.AUTO,
-        mxfp8_dim0_cast_kernel_choice=MXFP8Dim0CastKernelChoice.TRITON,
+    qdata, scales = _mx_quantize_rows_raw(value.contiguous())
+    return MXTensor.from_qdata_and_scales(
+        qdata, scales, value.dtype, block_size=32, kernel_preference=KernelPreference.AUTO,
     )
 
 
@@ -138,7 +147,13 @@ def mxfp8_mm_nt(
     if left.numel() == 0 or right_rows.numel() == 0:
         return left.new_zeros((left.shape[0], right_rows.shape[0]))
 
-    resolve_mxfp8_backend(backend, left.device)
+    _canonical_backend(backend)
+    # Device inventory belongs to eager preflight. Tracing device_count inside
+    # every GEMM breaks the compiled forward/backward graph. The compiled path
+    # still dispatches only the native operator, which errors on unsupported
+    # devices; there is no emulated or dense fallback.
+    if not torch.compiler.is_compiling():
+        resolve_mxfp8_backend(backend, left.device)
     if not left.is_cuda:
         raise MXFP8Error("native MXFP8 requires CUDA operands")
     if left.dtype != torch.bfloat16:

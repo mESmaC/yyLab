@@ -20,6 +20,17 @@ Artifacts live in `./artifacts` (override with `YYLAB_HOME`).
 
 ## Features
 
+- **Sprint throughput-first training** — a new dense decoder with packed QKV,
+  SDPA, tied embeddings, BF16 weights, FP32 CPU optimizer offload, reusable packed
+  token caches, and optional compilation. Train arbitrary model sizes from
+  registered corpora/tokenizers, run pretraining or chat SFT, evaluate, checkpoint,
+  resume, and benchmark batch/compilation choices on the actual GPU. Open
+  **Train · Sprint**; see [the training guide](docs/SPRINT_TRAINING.md) for
+  measurement scope, memory requirements and supported features. Throughput
+  sizing starts at 10M parameters. See the
+  [10M–1B precision and parameter-budget experiments](docs/SPRINT_SPEED_ROUND2_2026-09-11.md)
+  for complete training-step measurements on the RTX 5070.
+
 - **GCCF classified corpora** — import a GCCF receipt, honor approved-file and
   bad-record decisions, preserve held-out splits and training provenance, and
   read each classified source directly from the original datasets. Processed

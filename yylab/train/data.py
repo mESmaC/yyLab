@@ -33,14 +33,26 @@ DEFAULT_TEXT_CHUNK_CHARS = 65_536
 CORPUS_MIX_CONCATENATE = "concatenate"
 CORPUS_MIX_ROUND_ROBIN = "round_robin"
 CORPUS_MIX_TOKEN_BALANCED = "token_balanced"
-CORPUS_MIX_MODES = frozenset(
-    {CORPUS_MIX_CONCATENATE, CORPUS_MIX_ROUND_ROBIN, CORPUS_MIX_TOKEN_BALANCED}
-)
+CORPUS_MIX_MODES = frozenset({CORPUS_MIX_CONCATENATE, CORPUS_MIX_ROUND_ROBIN, CORPUS_MIX_TOKEN_BALANCED})
 OBJECTIVE_CAUSAL_LM = "causal_lm"
 OBJECTIVE_CHAT_SFT = "chat_sft"
 TRAINING_OBJECTIVES = frozenset({OBJECTIVE_CAUSAL_LM, OBJECTIVE_CHAT_SFT})
 MAX_CHAT_FAILURE_REASONS = 12
 CORPUS_ID_FIELD = "_yylab_corpus_id"
+PREPARED_FIELD = "_yylab_prepared"
+
+
+def _document_chars(record: dict) -> int:
+    prepared = record.get(PREPARED_FIELD)
+    return int(prepared["chars"]) if prepared else len(str(record.get("text") or ""))
+
+
+def _shuffle_bytes(record: dict) -> int:
+    prepared = record.get(PREPARED_FIELD)
+    if prepared:
+        return int(prepared["shuffle_bytes"])
+    return sys.getsizeof(record) + sys.getsizeof(record.get("text", ""))
+
 
 _ROLE_HEADER = re.compile(r"(?im)^(system|user|assistant)[ \t]*:[ \t]*")
 
@@ -618,6 +630,7 @@ def iter_corpus_docs(
     corpus_weights: Mapping[str, float] | None = None,
     source_max_ratio: float | None = None,
     annotate_source: bool = False,
+    corpus_reader: Callable[[str], Iterator[dict]] | None = None,
 ) -> Iterator[dict]:
     if (shard_index is None) != (num_shards is None):
         raise ValueError("shard_index and num_shards must be supplied together")
@@ -643,7 +656,9 @@ def iter_corpus_docs(
         # Resolve the generation once per stream so a re-import published
         # mid-run cannot mix old and new shards into the same epoch.
         data_dir = corpus_data_dir(corpus_id)
-        if (corpus_dir(corpus_id) / "text-source.json").exists():
+        if corpus_reader is not None:
+            records = corpus_reader(corpus_id)
+        elif (corpus_dir(corpus_id) / "text-source.json").exists():
             from ..ingest.text_source import iter_text_source_corpus
 
             records = iter_text_source_corpus(corpus_id, splits=selected_splits or None)
@@ -686,13 +701,11 @@ def iter_corpus_docs(
         buffered_bytes = 0
         for item in items:
             buf.append(item)
-            buffered_bytes += sys.getsizeof(item) + sys.getsizeof(item.get("text", ""))
+            buffered_bytes += _shuffle_bytes(item)
             if len(buf) >= max_items or buffered_bytes >= max_bytes:
                 index = rng.randrange(len(buf))
                 selected = buf[index]
-                buffered_bytes -= sys.getsizeof(selected) + sys.getsizeof(
-                    selected.get("text", "")
-                )
+                buffered_bytes -= _shuffle_bytes(selected)
                 yield selected
                 buf[index] = buf[-1]
                 buf.pop()
@@ -715,9 +728,7 @@ def iter_corpus_docs(
             iter(
                 shuffled_stream(
                     corpus_stream(corpus_id),
-                    rng=random.Random(
-                        seed if source_count == 1 else f"{seed}:{index}:{corpus_id}"
-                    ),
+                    rng=random.Random(seed if source_count == 1 else f"{seed}:{index}:{corpus_id}"),
                     max_items=per_source_items,
                     max_bytes=per_source_bytes,
                 )
@@ -745,9 +756,7 @@ def iter_corpus_docs(
         emitted = [0] * len(active)
         total_emitted = 0
         exhausted: set[int] = set()
-        effective_weights = [
-            float(weights.get(corpus_id, 1.0)) for corpus_id in selected_corpora
-        ]
+        effective_weights = [float(weights.get(corpus_id, 1.0)) for corpus_id in selected_corpora]
         while len(exhausted) < len(active):
             for index, iterator in enumerate(active):
                 if index in exhausted or index in pending_items:
@@ -768,7 +777,7 @@ def iter_corpus_docs(
             chosen: int | None = None
             if source_max_ratio is not None and len(active) > 1 and total_emitted:
                 for index in ranked:
-                    cost = max(1, len(str(pending_items[index].get("text") or "")))
+                    cost = max(1, _document_chars(pending_items[index]))
                     projected_share = (emitted[index] + cost) / (total_emitted + cost)
                     if projected_share <= source_max_ratio:
                         chosen = index
@@ -785,7 +794,7 @@ def iter_corpus_docs(
                     chosen = min(
                         pending_items,
                         key=lambda index: (
-                            len(str(pending_items[index].get("text") or "")),
+                            _document_chars(pending_items[index]),
                             emitted[index] / effective_weights[index],
                             index,
                         ),
@@ -794,14 +803,14 @@ def iter_corpus_docs(
                 chosen = min(
                     pending_items,
                     key=lambda index: (
-                        len(str(pending_items[index].get("text") or "")),
+                        _document_chars(pending_items[index]),
                         index,
                     ),
                 )
             if chosen is None:
                 chosen = ranked[0]
             item = pending_items.pop(chosen)
-            cost = max(1, len(str(item.get("text") or "")))
+            cost = max(1, _document_chars(item))
             emitted[chosen] += cost
             total_emitted += cost
             yield item
@@ -812,12 +821,15 @@ def iter_corpus_docs(
         for line in raw_stream():
             if cross_corpus_dedup:
                 text = line.get("text")
-                if not isinstance(text, str) or not text:
+                prepared = line.get(PREPARED_FIELD)
+                if (prepared and not prepared["chars"]) or (
+                    not prepared and (not isinstance(text, str) or not text)
+                ):
                     continue
                 # Hard suppression uses exact model-visible bytes. Normalized,
                 # structural, and LSH identities remain evidence because case
                 # folding can change code, symbols, and natural-language meaning.
-                fingerprint = bytes.fromhex(sha256_hex(text))[:16]
+                fingerprint = bytes.fromhex(prepared["text_sha256"] if prepared else sha256_hex(text))[:16]
                 if fingerprint in seen_hashes:
                     continue
                 seen_hashes.add(fingerprint)
@@ -839,11 +851,11 @@ def iter_corpus_docs(
     buffered_bytes = 0
     for item in stream():
         buf.append(item)
-        buffered_bytes += sys.getsizeof(item) + sys.getsizeof(item.get("text", ""))
+        buffered_bytes += _shuffle_bytes(item)
         if len(buf) >= shuffle_buffer or buffered_bytes >= shuffle_buffer_bytes:
             i = rng.randrange(len(buf))
             selected = buf[i]
-            buffered_bytes -= sys.getsizeof(selected) + sys.getsizeof(selected.get("text", ""))
+            buffered_bytes -= _shuffle_bytes(selected)
             yield selected
             buf[i] = buf[-1]
             buf.pop()
@@ -888,9 +900,7 @@ class PackedBatches:
         rendered = self.tokens_seen + self.boundary_tokens
         target_slots = self.sequences_forwarded * max(self.seq_len - 1, 0)
         sources = sorted(
-            set(self.source_docs_seen)
-            | set(self.source_content_tokens)
-            | set(self.source_forwarded_tokens)
+            set(self.source_docs_seen) | set(self.source_content_tokens) | set(self.source_forwarded_tokens)
         )
         return {
             "docs_seen": self.docs_seen,
@@ -932,7 +942,7 @@ class PackedBatches:
         # Keep the document boundary alongside each bounded raw-text chunk.
         # Tokenization may happen in several calls for one long document, but
         # packing must still add exactly one EOS for that original document.
-        pending_texts: list[tuple[str, bool, str]] = []
+        pending_texts: list[tuple[Any, bool, str]] = []
         source_runs: deque[list[Any]] = deque()
         batches_made = 0
 
@@ -975,8 +985,10 @@ class PackedBatches:
             texts = [text for text, _is_doc_end, _source in pending_texts]
             boundaries = [is_doc_end for _text, is_doc_end, _source in pending_texts]
             sources = [source for _text, _is_doc_end, source in pending_texts]
+            prepared = not isinstance(texts[0], str)
+            encodings = [value.read_ids() for value in texts] if prepared else self.tokenize(texts)
             for ids, is_doc_end, source in zip(
-                self.tokenize(texts),
+                encodings,
                 boundaries,
                 sources,
                 strict=True,
@@ -1016,12 +1028,20 @@ class PackedBatches:
 
         for doc in self.docs:
             self.docs_seen += 1
-            text = doc["text"]
             source = str(doc.get(CORPUS_ID_FIELD) or "unknown")
             self.source_docs_seen[source] += 1
-            for start in range(0, max(len(text), 1), self.max_text_chars):
-                end = min(start + self.max_text_chars, len(text))
-                pending_texts.append((text[start:end], end >= len(text), source))
+            prepared = doc.get(PREPARED_FIELD)
+            if prepared:
+                chunks = prepared["units"]
+                parts = ((chunk, index == len(chunks) - 1) for index, chunk in enumerate(chunks))
+            else:
+                text = doc["text"]
+                parts = (
+                    (text[start : start + self.max_text_chars], start + self.max_text_chars >= len(text))
+                    for start in range(0, max(len(text), 1), self.max_text_chars)
+                )
+            for part, is_end in parts:
+                pending_texts.append((part, is_end, source))
                 if len(pending_texts) >= self.tokenize_chunk:
                     yield from flush_texts()
                     if self.max_batches is not None and batches_made >= self.max_batches:
@@ -1031,6 +1051,32 @@ class PackedBatches:
         if batch and (self.max_batches is None or batches_made < self.max_batches):
             mark_forwarded(batch_exposures)
             yield {"input_ids": list(batch)}
+
+
+def render_chat_record(tokenizer, doc: dict) -> tuple[dict, list]:
+    """Render one record identically for live packing and offline preparation."""
+    raw_messages = doc.get("messages")
+    status = {"structured": isinstance(raw_messages, list), "skipped": False, "error": None}
+    try:
+        if status["structured"]:
+            messages = normalize_chat_messages(raw_messages)
+            if not messages:
+                raise ValueError("structured messages normalized to an empty chat")
+        else:
+            messages = parse_role_transcript(doc.get("text", ""))
+        if not messages or not any(message["role"] == "assistant" for message in messages):
+            if status["structured"]:
+                raise ValueError("structured chat has no assistant turn")
+            status["skipped"] = True
+            return status, []
+        return status, tokenize_chat_examples(tokenizer, messages)
+    except Exception as exc:  # same per-record rejection contract as the live packer
+        message = (str(exc).splitlines() or [""])[0].strip()[:180]
+        status.update(
+            skipped=True,
+            error=f"{type(exc).__name__}: {message or 'unrenderable chat record'}",
+        )
+        return status, []
 
 
 class ChatSFTBatches:
@@ -1087,9 +1133,7 @@ class ChatSFTBatches:
         model_slots = self.sequences_made * self.seq_len
         target_slots = self.sequences_made * (self.seq_len - 1)
         sources = sorted(
-            set(self.source_docs_seen)
-            | set(self.source_rendered_tokens)
-            | set(self.source_forwarded_tokens)
+            set(self.source_docs_seen) | set(self.source_rendered_tokens) | set(self.source_forwarded_tokens)
         )
         return {
             "docs_seen": self.docs_seen,
@@ -1138,9 +1182,7 @@ class ChatSFTBatches:
             },
         }
 
-    def _record_failure(self, exc: BaseException) -> None:
-        message = str(exc).splitlines()[0].strip()[:180]
-        reason = f"{type(exc).__name__}: {message or 'unrenderable chat record'}"
+    def _record_failure(self, reason: str) -> None:
         if reason in self.failure_reasons:
             self.failure_reasons[reason] += 1
         elif len(self.failure_reasons) < MAX_CHAT_FAILURE_REASONS:
@@ -1245,36 +1287,21 @@ class ChatSFTBatches:
             self.docs_seen += 1
             source = str(doc.get(CORPUS_ID_FIELD) or "unknown")
             self.source_docs_seen[source] += 1
-            raw_messages = doc.get("messages")
-            if isinstance(raw_messages, list):
+            prepared = doc.get(PREPARED_FIELD)
+            if prepared:
+                status = prepared["chat"]
+                examples = (unit.read_chat() for unit in prepared["units"])
+            else:
+                status, examples = render_chat_record(self.tokenizer, doc)
+            if status["structured"]:
                 self.structured_docs += 1
-                try:
-                    messages = normalize_chat_messages(raw_messages)
-                except Exception as exc:  # noqa: BLE001
-                    self.skipped_docs += 1
-                    self.unrenderable_docs += 1
-                    self._record_failure(exc)
-                    continue
-                if not messages:
-                    self.skipped_docs += 1
-                    self.unrenderable_docs += 1
-                    self._record_failure(ValueError("structured messages normalized to an empty chat"))
-                    continue
             else:
                 self.legacy_transcript_docs += 1
-                messages = parse_role_transcript(doc.get("text", ""))
-            if not messages or not any(message["role"] == "assistant" for message in messages):
+            if status["skipped"]:
                 self.skipped_docs += 1
-                if isinstance(raw_messages, list):
+                if status["error"]:
                     self.unrenderable_docs += 1
-                    self._record_failure(ValueError("structured chat has no assistant turn"))
-                continue
-            try:
-                examples = tokenize_chat_examples(self.tokenizer, messages)
-            except Exception as exc:  # noqa: BLE001
-                self.skipped_docs += 1
-                self.unrenderable_docs += 1
-                self._record_failure(exc)
+                    self._record_failure(status["error"])
                 continue
             self.parseable_docs += 1
             for input_ids, labels in examples:

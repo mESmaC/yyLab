@@ -1,0 +1,74 @@
+{
+  "model_config": {
+    "transformers_version": "5.16.1",
+    "architectures": [
+      "SprintForCausalLM"
+    ],
+    "output_hidden_states": false,
+    "return_dict": true,
+    "dtype": null,
+    "chunk_size_feed_forward": 0,
+    "is_encoder_decoder": false,
+    "id2label": {
+      "0": "LABEL_0",
+      "1": "LABEL_1"
+    },
+    "label2id": {
+      "LABEL_0": 0,
+      "LABEL_1": 1
+    },
+    "problem_type": null,
+    "_name_or_path": "",
+    "tie_word_embeddings": true,
+    "num_key_value_heads": 32,
+    "head_dim": 128,
+    "model_type": "sprint",
+    "vocab_size": 8192,
+    "hidden_size": 4096,
+    "intermediate_size": 6016,
+    "num_hidden_layers": 4,
+    "num_attention_heads": 32,
+    "max_position_embeddings": 2048,
+    "mlp_type": "gelu",
+    "rope_theta": 10000.0,
+    "rms_norm_eps": 1e-06,
+    "initializer_range": 0.02,
+    "loss_backend": "auto",
+    "loss_chunk_size": 1024,
+    "use_cache": true,
+    "output_attentions": false
+  },
+  "target_parameters": 500000000,
+  "precisions": [
+    "nvfp4_mxfp8_fast"
+  ],
+  "effective_batch": 32,
+  "seq_len": 512,
+  "batch_sizes": [
+    16
+  ],
+  "compile_modes": [
+    "default"
+  ],
+  "warmup_steps": 5,
+  "measure_steps": 80,
+  "device": "cuda",
+  "cpu_threads": 20,
+  "cpu_optimizer_kernel": "compiled",
+  "offload_bucket_mb": 32,
+  "attention_backend": "cudnn",
+  "gradient_checkpointing": false,
+  "seed": 42,
+  "lr": 0.0003,
+  "parameter_dtype": "bfloat16",
+  "optimizer_state_offload": "cpu",
+  "compute_dtype": "auto",
+  "weight_decay": 0.1,
+  "betas": [
+    0.9,
+    0.95
+  ],
+  "eps": 1e-08,
+  "grad_clip": 1.0,
+  "min_lr_ratio": 0.1
+}

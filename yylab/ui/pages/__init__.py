@@ -14,4 +14,5 @@ from . import (  # noqa: F401
     train_preference,
     train_router,
     train_spalmer,
+    train_sprint,
 )

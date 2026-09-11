@@ -190,7 +190,7 @@ def runs_page():
                 )
             if (
                 run
-                and run["kind"] in {"base", "spalmer_base"}
+                and run["kind"] in {"base", "spalmer_base", "sprint"}
                 and config.get("out_checkpoint_id")
             ):
                 db.execute(

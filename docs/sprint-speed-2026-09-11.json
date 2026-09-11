@@ -1,0 +1,754 @@
+{
+  "schema": "yylab-sprint-speed-comparison-v1",
+  "date_utc": "2026-09-11",
+  "method": "Before uses saved pre-optimization model and trainer source. After uses throughput sizing, double-buffer transfers, compiled large CPU updates and cuDNN attention. All use BF16 GPU weights/gradients, FP32 CPU masters/moments, vocabulary 8192, sequence 512 and effective batch 32. Same seeded synthetic input and optimizer schedule. Architecture changes; this is not an equal-quality comparison.",
+  "limits": "Single repeated-batch run per final case; no language-quality or corpus-IO assessment. Initialization, compilation, warmup, preparation, validation and checkpoint IO excluded from synchronized complete-step throughput. 50M measured 60 steps; 500M and 1B measured 8 steps. Shared desktop hardware can vary.",
+  "startup_change_after_measurement": "Final helper isolates CPU compiler code objects per tuning key to prevent cross-candidate recompile limits. Fused update algebra and steady-state dispatch are unchanged.",
+  "comparisons": [
+    {
+      "target": "50m",
+      "before": {
+        "schema": "yylab-sprint-benchmark-v1",
+        "hardware": "NVIDIA GeForce RTX 5070",
+        "torch_version": "2.11.0+cu128",
+        "device": "cuda",
+        "model_config": {
+          "transformers_version": "5.16.1",
+          "architectures": [
+            "SprintForCausalLM"
+          ],
+          "output_hidden_states": false,
+          "return_dict": true,
+          "dtype": null,
+          "chunk_size_feed_forward": 0,
+          "is_encoder_decoder": false,
+          "id2label": {
+            "0": "LABEL_0",
+            "1": "LABEL_1"
+          },
+          "label2id": {
+            "LABEL_0": 0,
+            "LABEL_1": 1
+          },
+          "problem_type": null,
+          "_name_or_path": "",
+          "tie_word_embeddings": true,
+          "num_key_value_heads": 10,
+          "head_dim": 64,
+          "model_type": "sprint",
+          "vocab_size": 8192,
+          "hidden_size": 640,
+          "intermediate_size": 2208,
+          "num_hidden_layers": 10,
+          "num_attention_heads": 10,
+          "max_position_embeddings": 2048,
+          "mlp_type": "gelu",
+          "rope_theta": 10000.0,
+          "rms_norm_eps": 1e-06,
+          "initializer_range": 0.02,
+          "loss_backend": "auto",
+          "loss_chunk_size": 1024,
+          "use_cache": true,
+          "output_attentions": false
+        },
+        "host_processor": "Intel64 Family 6 Model 198 Stepping 2, GenuineIntel",
+        "host_logical_cores": 20,
+        "torch_cpu_threads": 20,
+        "sweeps": {
+          "cpu_thread_counts": [
+            20
+          ],
+          "offload_bucket_sizes_mb": [
+            32
+          ],
+          "attention_backends": [
+            "auto"
+          ]
+        },
+        "parameters": 49902720,
+        "effective_batch": 32,
+        "execution": {
+          "parameter_dtype": "bfloat16",
+          "optimizer_state_offload": "cpu",
+          "gradient_checkpointing": false,
+          "attention_backend": "auto"
+        },
+        "sequence_length": 512,
+        "warmup_steps": 5,
+        "measure_steps": 60,
+        "measurement": "Synthetic repeated tokens; synchronized complete forward/backward/clip/optimizer updates including CPU-to-device transfer. Warmup, compilation, validation, data preparation and checkpoints excluded from steady-state throughput. No language-quality assessment.",
+        "cases": [
+          {
+            "micro_batch": 32,
+            "grad_accum": 1,
+            "torch_compile": true,
+            "compile_mode": "default",
+            "parameter_dtype": "bfloat16",
+            "optimizer_state_offload": "cpu",
+            "gradient_checkpointing": false,
+            "cpu_threads": 20,
+            "offload_bucket_mb": 32,
+            "attention_backend": "auto",
+            "offload_bucket_bytes": 33554432,
+            "initialization_seconds": 0.6386829000257421,
+            "warmup_and_compile_seconds": 2.8229453999956604,
+            "status": "ok",
+            "measured_seconds": 10.567566600017017,
+            "measured_steps": 60,
+            "tokens": 983040,
+            "supervised_tokens": 981120,
+            "tokens_per_second": 93024.2540414571,
+            "supervised_tokens_per_second": 92842.56604528238,
+            "seconds_per_step": 0.1761261100002836,
+            "last_loss": 0.8919641971588135,
+            "compute_dtype": "bfloat16",
+            "peak_cuda_allocated_bytes": 3854518272,
+            "peak_cuda_reserved_bytes": 3900702720,
+            "cpu_optimizer_state_bytes": 598832640,
+            "projected_seconds_per_billion_targets": 10770.92159982165
+          }
+        ],
+        "recommended": {
+          "micro_batch": 32,
+          "grad_accum": 1,
+          "torch_compile": true,
+          "compile_mode": "default",
+          "parameter_dtype": "bfloat16",
+          "optimizer_state_offload": "cpu",
+          "gradient_checkpointing": false,
+          "cpu_threads": 20,
+          "offload_bucket_mb": 32,
+          "attention_backend": "auto"
+        },
+        "best_supervised_tokens_per_second": 92842.56604528238,
+        "projected_seconds_per_billion_targets": 10770.92159982165,
+        "recommendation_scope": "Fastest measured candidate for this exact shape and effective batch, including the recorded CPU thread count, offload bucket size, and attention backend; short-run noise, IO and startup may change the best end-to-end choice. Re-run finalists before a long training run."
+      },
+      "after": {
+        "schema": "yylab-sprint-benchmark-v1",
+        "hardware": "NVIDIA GeForce RTX 5070",
+        "torch_version": "2.11.0+cu128",
+        "device": "cuda",
+        "model_config": {
+          "transformers_version": "5.16.1",
+          "architectures": [
+            "SprintForCausalLM"
+          ],
+          "output_hidden_states": false,
+          "return_dict": true,
+          "dtype": null,
+          "chunk_size_feed_forward": 0,
+          "is_encoder_decoder": false,
+          "id2label": {
+            "0": "LABEL_0",
+            "1": "LABEL_1"
+          },
+          "label2id": {
+            "LABEL_0": 0,
+            "LABEL_1": 1
+          },
+          "problem_type": null,
+          "_name_or_path": "",
+          "tie_word_embeddings": true,
+          "vocab_size": 8192,
+          "hidden_size": 1024,
+          "intermediate_size": 3008,
+          "num_hidden_layers": 4,
+          "num_attention_heads": 8,
+          "num_key_value_heads": 8,
+          "head_dim": 128,
+          "max_position_embeddings": 2048,
+          "mlp_type": "gelu",
+          "rope_theta": 10000.0,
+          "rms_norm_eps": 1e-06,
+          "initializer_range": 0.02,
+          "loss_backend": "auto",
+          "loss_chunk_size": 1024,
+          "use_cache": true,
+          "model_type": "sprint",
+          "output_attentions": false
+        },
+        "host_processor": "Intel64 Family 6 Model 198 Stepping 2, GenuineIntel",
+        "host_logical_cores": 20,
+        "torch_cpu_threads": 20,
+        "sweeps": {
+          "cpu_thread_counts": [
+            20
+          ],
+          "offload_bucket_sizes_mb": [
+            32
+          ],
+          "attention_backends": [
+            "cudnn"
+          ]
+        },
+        "parameters": 49816576,
+        "effective_batch": 32,
+        "execution": {
+          "parameter_dtype": "bfloat16",
+          "optimizer_state_offload": "cpu",
+          "cpu_optimizer_kernel": "auto",
+          "gradient_checkpointing": false,
+          "attention_backend": "cudnn"
+        },
+        "sequence_length": 512,
+        "warmup_steps": 5,
+        "measure_steps": 60,
+        "measurement": "Synthetic repeated tokens; synchronized complete forward/backward/clip/optimizer updates including CPU-to-device transfer. Warmup, compilation, validation, data preparation and checkpoints excluded from steady-state throughput. No language-quality assessment.",
+        "cases": [
+          {
+            "micro_batch": 32,
+            "grad_accum": 1,
+            "torch_compile": true,
+            "compile_mode": "default",
+            "parameter_dtype": "bfloat16",
+            "optimizer_state_offload": "cpu",
+            "gradient_checkpointing": false,
+            "cpu_threads": 20,
+            "offload_bucket_mb": 32,
+            "attention_backend": "cudnn",
+            "cpu_optimizer_kernel": "compiled",
+            "cpu_optimizer_kernel_reason": "compiled CPU Adam for large BF16 slices; native CPU Adam for small slices",
+            "offload_bucket_bytes": 33554432,
+            "initialization_seconds": 4.7555909999937285,
+            "warmup_and_compile_seconds": 6.1724578000139445,
+            "status": "ok",
+            "measured_seconds": 8.084901599999284,
+            "measured_steps": 60,
+            "tokens": 983040,
+            "supervised_tokens": 981120,
+            "tokens_per_second": 121589.60598853634,
+            "supervised_tokens_per_second": 121352.12628933998,
+            "seconds_per_step": 0.13474835999998808,
+            "last_loss": 0.009959204122424126,
+            "compute_dtype": "bfloat16",
+            "peak_cuda_allocated_bytes": 2490132480,
+            "peak_cuda_reserved_bytes": 2826960896,
+            "cpu_optimizer_state_bytes": 597798912,
+            "projected_seconds_per_billion_targets": 8240.481898238018
+          }
+        ],
+        "recommended": {
+          "micro_batch": 32,
+          "grad_accum": 1,
+          "torch_compile": true,
+          "compile_mode": "default",
+          "parameter_dtype": "bfloat16",
+          "optimizer_state_offload": "cpu",
+          "gradient_checkpointing": false,
+          "cpu_threads": 20,
+          "offload_bucket_mb": 32,
+          "attention_backend": "cudnn",
+          "cpu_optimizer_kernel": "compiled"
+        },
+        "best_supervised_tokens_per_second": 121352.12628933998,
+        "projected_seconds_per_billion_targets": 8240.481898238018,
+        "recommendation_scope": "Fastest measured candidate for this exact shape and effective batch, including the recorded CPU thread count, offload bucket size, and attention backend; short-run noise, IO and startup may change the best end-to-end choice. Re-run finalists before a long training run."
+      },
+      "throughput_gain_percent": 30.70742382341367,
+      "step_time_reduction_percent": 23.493251511788294
+    },
+    {
+      "target": "500m",
+      "before": {
+        "schema": "yylab-sprint-benchmark-v1",
+        "hardware": "NVIDIA GeForce RTX 5070",
+        "torch_version": "2.11.0+cu128",
+        "device": "cuda",
+        "model_config": {
+          "transformers_version": "5.16.1",
+          "architectures": [
+            "SprintForCausalLM"
+          ],
+          "output_hidden_states": false,
+          "return_dict": true,
+          "dtype": null,
+          "chunk_size_feed_forward": 0,
+          "is_encoder_decoder": false,
+          "id2label": {
+            "0": "LABEL_0",
+            "1": "LABEL_1"
+          },
+          "label2id": {
+            "LABEL_0": 0,
+            "LABEL_1": 1
+          },
+          "problem_type": null,
+          "_name_or_path": "",
+          "tie_word_embeddings": true,
+          "num_key_value_heads": 22,
+          "head_dim": 64,
+          "model_type": "sprint",
+          "vocab_size": 8192,
+          "hidden_size": 1408,
+          "intermediate_size": 5440,
+          "num_hidden_layers": 21,
+          "num_attention_heads": 22,
+          "max_position_embeddings": 2048,
+          "mlp_type": "gelu",
+          "rope_theta": 10000.0,
+          "rms_norm_eps": 1e-06,
+          "initializer_range": 0.02,
+          "loss_backend": "auto",
+          "loss_chunk_size": 1024,
+          "use_cache": true,
+          "output_attentions": false
+        },
+        "host_processor": "Intel64 Family 6 Model 198 Stepping 2, GenuineIntel",
+        "host_logical_cores": 20,
+        "torch_cpu_threads": 20,
+        "sweeps": {
+          "cpu_thread_counts": [
+            20
+          ],
+          "offload_bucket_sizes_mb": [
+            32
+          ],
+          "attention_backends": [
+            "auto"
+          ]
+        },
+        "parameters": 499821696,
+        "effective_batch": 32,
+        "execution": {
+          "parameter_dtype": "bfloat16",
+          "optimizer_state_offload": "cpu",
+          "gradient_checkpointing": false,
+          "attention_backend": "auto"
+        },
+        "sequence_length": 512,
+        "warmup_steps": 5,
+        "measure_steps": 8,
+        "measurement": "Synthetic repeated tokens; synchronized complete forward/backward/clip/optimizer updates including CPU-to-device transfer. Warmup, compilation, validation, data preparation and checkpoints excluded from steady-state throughput. No language-quality assessment.",
+        "cases": [
+          {
+            "micro_batch": 8,
+            "grad_accum": 4,
+            "torch_compile": true,
+            "compile_mode": "default",
+            "parameter_dtype": "bfloat16",
+            "optimizer_state_offload": "cpu",
+            "gradient_checkpointing": false,
+            "cpu_threads": 20,
+            "offload_bucket_mb": 32,
+            "attention_backend": "auto",
+            "offload_bucket_bytes": 33554432,
+            "initialization_seconds": 2.9397293999791145,
+            "warmup_and_compile_seconds": 29.300413999997545,
+            "status": "ok",
+            "measured_seconds": 11.843981599988183,
+            "measured_steps": 8,
+            "tokens": 131072,
+            "supervised_tokens": 130816,
+            "tokens_per_second": 11066.548769387718,
+            "supervised_tokens_per_second": 11044.934416322507,
+            "seconds_per_step": 1.4804976999985229,
+            "last_loss": 6.2874321937561035,
+            "compute_dtype": "bfloat16",
+            "peak_cuda_allocated_bytes": 6670370304,
+            "peak_cuda_reserved_bytes": 6876561408,
+            "cpu_optimizer_state_bytes": 5997860352,
+            "projected_seconds_per_billion_targets": 90539.2429059762
+          }
+        ],
+        "recommended": {
+          "micro_batch": 8,
+          "grad_accum": 4,
+          "torch_compile": true,
+          "compile_mode": "default",
+          "parameter_dtype": "bfloat16",
+          "optimizer_state_offload": "cpu",
+          "gradient_checkpointing": false,
+          "cpu_threads": 20,
+          "offload_bucket_mb": 32,
+          "attention_backend": "auto"
+        },
+        "best_supervised_tokens_per_second": 11044.934416322507,
+        "projected_seconds_per_billion_targets": 90539.2429059762,
+        "recommendation_scope": "Fastest measured candidate for this exact shape and effective batch, including the recorded CPU thread count, offload bucket size, and attention backend; short-run noise, IO and startup may change the best end-to-end choice. Re-run finalists before a long training run."
+      },
+      "after": {
+        "schema": "yylab-sprint-benchmark-v1",
+        "hardware": "NVIDIA GeForce RTX 5070",
+        "torch_version": "2.11.0+cu128",
+        "device": "cuda",
+        "model_config": {
+          "transformers_version": "5.16.1",
+          "architectures": [
+            "SprintForCausalLM"
+          ],
+          "output_hidden_states": false,
+          "return_dict": true,
+          "dtype": null,
+          "chunk_size_feed_forward": 0,
+          "is_encoder_decoder": false,
+          "id2label": {
+            "0": "LABEL_0",
+            "1": "LABEL_1"
+          },
+          "label2id": {
+            "LABEL_0": 0,
+            "LABEL_1": 1
+          },
+          "problem_type": null,
+          "_name_or_path": "",
+          "tie_word_embeddings": true,
+          "vocab_size": 8192,
+          "hidden_size": 2304,
+          "intermediate_size": 6976,
+          "num_hidden_layers": 9,
+          "num_attention_heads": 18,
+          "num_key_value_heads": 18,
+          "head_dim": 128,
+          "max_position_embeddings": 2048,
+          "mlp_type": "gelu",
+          "rope_theta": 10000.0,
+          "rms_norm_eps": 1e-06,
+          "initializer_range": 0.02,
+          "loss_backend": "auto",
+          "loss_chunk_size": 1024,
+          "use_cache": true,
+          "model_type": "sprint",
+          "output_attentions": false
+        },
+        "host_processor": "Intel64 Family 6 Model 198 Stepping 2, GenuineIntel",
+        "host_logical_cores": 20,
+        "torch_cpu_threads": 20,
+        "sweeps": {
+          "cpu_thread_counts": [
+            20
+          ],
+          "offload_bucket_sizes_mb": [
+            32
+          ],
+          "attention_backends": [
+            "cudnn"
+          ]
+        },
+        "parameters": 499329792,
+        "effective_batch": 32,
+        "execution": {
+          "parameter_dtype": "bfloat16",
+          "optimizer_state_offload": "cpu",
+          "cpu_optimizer_kernel": "auto",
+          "gradient_checkpointing": false,
+          "attention_backend": "cudnn"
+        },
+        "sequence_length": 512,
+        "warmup_steps": 5,
+        "measure_steps": 8,
+        "measurement": "Synthetic repeated tokens; synchronized complete forward/backward/clip/optimizer updates including CPU-to-device transfer. Warmup, compilation, validation, data preparation and checkpoints excluded from steady-state throughput. No language-quality assessment.",
+        "cases": [
+          {
+            "micro_batch": 8,
+            "grad_accum": 4,
+            "torch_compile": true,
+            "compile_mode": "default",
+            "parameter_dtype": "bfloat16",
+            "optimizer_state_offload": "cpu",
+            "gradient_checkpointing": false,
+            "cpu_threads": 20,
+            "offload_bucket_mb": 32,
+            "attention_backend": "cudnn",
+            "cpu_optimizer_kernel": "compiled",
+            "cpu_optimizer_kernel_reason": "compiled CPU Adam for large BF16 slices; native CPU Adam for small slices",
+            "offload_bucket_bytes": 33554432,
+            "initialization_seconds": 5.935116600012407,
+            "warmup_and_compile_seconds": 20.206584600004135,
+            "status": "ok",
+            "measured_seconds": 9.626296200003708,
+            "measured_steps": 8,
+            "tokens": 131072,
+            "supervised_tokens": 130816,
+            "tokens_per_second": 13616.036456466976,
+            "supervised_tokens_per_second": 13589.442635262938,
+            "seconds_per_step": 1.2032870250004635,
+            "last_loss": 1.7248334884643555,
+            "compute_dtype": "bfloat16",
+            "peak_cuda_allocated_bytes": 4988585472,
+            "peak_cuda_reserved_bytes": 5546967040,
+            "cpu_optimizer_state_bytes": 5991957504,
+            "projected_seconds_per_billion_targets": 73586.53528623187
+          }
+        ],
+        "recommended": {
+          "micro_batch": 8,
+          "grad_accum": 4,
+          "torch_compile": true,
+          "compile_mode": "default",
+          "parameter_dtype": "bfloat16",
+          "optimizer_state_offload": "cpu",
+          "gradient_checkpointing": false,
+          "cpu_threads": 20,
+          "offload_bucket_mb": 32,
+          "attention_backend": "cudnn",
+          "cpu_optimizer_kernel": "compiled"
+        },
+        "best_supervised_tokens_per_second": 13589.442635262938,
+        "projected_seconds_per_billion_targets": 73586.53528623187,
+        "recommendation_scope": "Fastest measured candidate for this exact shape and effective batch, including the recorded CPU thread count, offload bucket size, and attention backend; short-run noise, IO and startup may change the best end-to-end choice. Re-run finalists before a long training run."
+      },
+      "throughput_gain_percent": 23.037784771090063,
+      "step_time_reduction_percent": 18.7241543839167
+    },
+    {
+      "target": "1b",
+      "before": {
+        "schema": "yylab-sprint-benchmark-v1",
+        "hardware": "NVIDIA GeForce RTX 5070",
+        "torch_version": "2.11.0+cu128",
+        "device": "cuda",
+        "model_config": {
+          "transformers_version": "5.16.1",
+          "architectures": [
+            "SprintForCausalLM"
+          ],
+          "output_hidden_states": false,
+          "return_dict": true,
+          "dtype": null,
+          "chunk_size_feed_forward": 0,
+          "is_encoder_decoder": false,
+          "id2label": {
+            "0": "LABEL_0",
+            "1": "LABEL_1"
+          },
+          "label2id": {
+            "LABEL_0": 0,
+            "LABEL_1": 1
+          },
+          "problem_type": null,
+          "_name_or_path": "",
+          "tie_word_embeddings": true,
+          "num_key_value_heads": 27,
+          "head_dim": 64,
+          "model_type": "sprint",
+          "vocab_size": 8192,
+          "hidden_size": 1728,
+          "intermediate_size": 7104,
+          "num_hidden_layers": 27,
+          "num_attention_heads": 27,
+          "max_position_embeddings": 2048,
+          "mlp_type": "gelu",
+          "rope_theta": 10000.0,
+          "rms_norm_eps": 1e-06,
+          "initializer_range": 0.02,
+          "loss_backend": "auto",
+          "loss_chunk_size": 1024,
+          "use_cache": true,
+          "output_attentions": false
+        },
+        "host_processor": "Intel64 Family 6 Model 198 Stepping 2, GenuineIntel",
+        "host_logical_cores": 20,
+        "torch_cpu_threads": 20,
+        "sweeps": {
+          "cpu_thread_counts": [
+            20
+          ],
+          "offload_bucket_sizes_mb": [
+            32
+          ],
+          "attention_backends": [
+            "auto"
+          ]
+        },
+        "parameters": 999625536,
+        "effective_batch": 32,
+        "execution": {
+          "parameter_dtype": "bfloat16",
+          "optimizer_state_offload": "cpu",
+          "gradient_checkpointing": false,
+          "attention_backend": "auto"
+        },
+        "sequence_length": 512,
+        "warmup_steps": 5,
+        "measure_steps": 8,
+        "measurement": "Synthetic repeated tokens; synchronized complete forward/backward/clip/optimizer updates including CPU-to-device transfer. Warmup, compilation, validation, data preparation and checkpoints excluded from steady-state throughput. No language-quality assessment.",
+        "cases": [
+          {
+            "micro_batch": 4,
+            "grad_accum": 8,
+            "torch_compile": true,
+            "compile_mode": "default",
+            "parameter_dtype": "bfloat16",
+            "optimizer_state_offload": "cpu",
+            "gradient_checkpointing": false,
+            "cpu_threads": 20,
+            "offload_bucket_mb": 32,
+            "attention_backend": "auto",
+            "offload_bucket_bytes": 33554432,
+            "initialization_seconds": 5.695247399999062,
+            "warmup_and_compile_seconds": 18.43072309999843,
+            "status": "ok",
+            "measured_seconds": 23.36346749999211,
+            "measured_steps": 8,
+            "tokens": 131072,
+            "supervised_tokens": 130816,
+            "tokens_per_second": 5610.1261510109425,
+            "supervised_tokens_per_second": 5599.168873372249,
+            "seconds_per_step": 2.920433437499014,
+            "last_loss": 6.257852077484131,
+            "compute_dtype": "bfloat16",
+            "peak_cuda_allocated_bytes": 7750886912,
+            "peak_cuda_reserved_bytes": 8696889344,
+            "cpu_optimizer_state_bytes": 11995506432,
+            "projected_seconds_per_billion_targets": 178597.93526779686
+          }
+        ],
+        "recommended": {
+          "micro_batch": 4,
+          "grad_accum": 8,
+          "torch_compile": true,
+          "compile_mode": "default",
+          "parameter_dtype": "bfloat16",
+          "optimizer_state_offload": "cpu",
+          "gradient_checkpointing": false,
+          "cpu_threads": 20,
+          "offload_bucket_mb": 32,
+          "attention_backend": "auto"
+        },
+        "best_supervised_tokens_per_second": 5599.168873372249,
+        "projected_seconds_per_billion_targets": 178597.93526779686,
+        "recommendation_scope": "Fastest measured candidate for this exact shape and effective batch, including the recorded CPU thread count, offload bucket size, and attention backend; short-run noise, IO and startup may change the best end-to-end choice. Re-run finalists before a long training run."
+      },
+      "after": {
+        "schema": "yylab-sprint-benchmark-v1",
+        "hardware": "NVIDIA GeForce RTX 5070",
+        "torch_version": "2.11.0+cu128",
+        "device": "cuda",
+        "model_config": {
+          "transformers_version": "5.16.1",
+          "architectures": [
+            "SprintForCausalLM"
+          ],
+          "output_hidden_states": false,
+          "return_dict": true,
+          "dtype": null,
+          "chunk_size_feed_forward": 0,
+          "is_encoder_decoder": false,
+          "id2label": {
+            "0": "LABEL_0",
+            "1": "LABEL_1"
+          },
+          "label2id": {
+            "LABEL_0": 0,
+            "LABEL_1": 1
+          },
+          "problem_type": null,
+          "_name_or_path": "",
+          "tie_word_embeddings": true,
+          "vocab_size": 8192,
+          "hidden_size": 2816,
+          "intermediate_size": 10112,
+          "num_hidden_layers": 11,
+          "num_attention_heads": 22,
+          "num_key_value_heads": 22,
+          "head_dim": 128,
+          "max_position_embeddings": 2048,
+          "mlp_type": "gelu",
+          "rope_theta": 10000.0,
+          "rms_norm_eps": 1e-06,
+          "initializer_range": 0.02,
+          "loss_backend": "auto",
+          "loss_chunk_size": 1024,
+          "use_cache": true,
+          "model_type": "sprint",
+          "output_attentions": false
+        },
+        "host_processor": "Intel64 Family 6 Model 198 Stepping 2, GenuineIntel",
+        "host_logical_cores": 20,
+        "torch_cpu_threads": 20,
+        "sweeps": {
+          "cpu_thread_counts": [
+            20
+          ],
+          "offload_bucket_sizes_mb": [
+            32
+          ],
+          "attention_backends": [
+            "cudnn"
+          ]
+        },
+        "parameters": 998505728,
+        "effective_batch": 32,
+        "execution": {
+          "parameter_dtype": "bfloat16",
+          "optimizer_state_offload": "cpu",
+          "cpu_optimizer_kernel": "auto",
+          "gradient_checkpointing": false,
+          "attention_backend": "cudnn"
+        },
+        "sequence_length": 512,
+        "warmup_steps": 5,
+        "measure_steps": 8,
+        "measurement": "Synthetic repeated tokens; synchronized complete forward/backward/clip/optimizer updates including CPU-to-device transfer. Warmup, compilation, validation, data preparation and checkpoints excluded from steady-state throughput. No language-quality assessment.",
+        "cases": [
+          {
+            "micro_batch": 8,
+            "grad_accum": 4,
+            "torch_compile": true,
+            "compile_mode": "default",
+            "parameter_dtype": "bfloat16",
+            "optimizer_state_offload": "cpu",
+            "gradient_checkpointing": false,
+            "cpu_threads": 20,
+            "offload_bucket_mb": 32,
+            "attention_backend": "cudnn",
+            "cpu_optimizer_kernel": "compiled",
+            "cpu_optimizer_kernel_reason": "compiled CPU Adam for large BF16 slices; native CPU Adam for small slices",
+            "offload_bucket_bytes": 33554432,
+            "initialization_seconds": 8.604398099996615,
+            "warmup_and_compile_seconds": 21.56555929998285,
+            "status": "ok",
+            "measured_seconds": 18.771027200011304,
+            "measured_steps": 8,
+            "tokens": 131072,
+            "supervised_tokens": 130816,
+            "tokens_per_second": 6982.675940074343,
+            "supervised_tokens_per_second": 6969.037901128886,
+            "seconds_per_step": 2.346378400001413,
+            "last_loss": 1.057748794555664,
+            "compute_dtype": "bfloat16",
+            "peak_cuda_allocated_bytes": 8725124608,
+            "peak_cuda_reserved_bytes": 9653190656,
+            "cpu_optimizer_state_bytes": 11982068736,
+            "projected_seconds_per_billion_targets": 143491.82974568327
+          }
+        ],
+        "recommended": {
+          "micro_batch": 8,
+          "grad_accum": 4,
+          "torch_compile": true,
+          "compile_mode": "default",
+          "parameter_dtype": "bfloat16",
+          "optimizer_state_offload": "cpu",
+          "gradient_checkpointing": false,
+          "cpu_threads": 20,
+          "offload_bucket_mb": 32,
+          "attention_backend": "cudnn",
+          "cpu_optimizer_kernel": "compiled"
+        },
+        "best_supervised_tokens_per_second": 6969.037901128886,
+        "projected_seconds_per_billion_targets": 143491.82974568327,
+        "recommendation_scope": "Fastest measured candidate for this exact shape and effective batch, including the recorded CPU thread count, offload bucket size, and attention backend; short-run noise, IO and startup may change the best end-to-end choice. Re-run finalists before a long training run."
+      },
+      "throughput_gain_percent": 24.46557799446396,
+      "step_time_reduction_percent": 19.656501330473997
+    }
+  ],
+  "final_source_sha256": {
+    "yylab/models/sprint.py": "9d75ae63293ea4353a53ddc96a3c6381a87d75872faf438301d52de24d64bdcb",
+    "yylab/train/sprint.py": "c8c19937bfcd794b4f5e0d12a9e83518ff969e6685c3b1b9fab513924b2943d1",
+    "yylab/train/sprint_cpu_adam.py": "1e89643be1138eecb54473c08cf99a6fd93c96b4843f6fc6683e530b974e9560",
+    "yylab/train/benchmark_sprint.py": "8355333c4e109d873fa08e4b59d2b536d7baae07e7b19ff152fc01536e95f054",
+    "yylab/ui/pages/train_sprint.py": "c40432e98cd4825daf613b098acfafa8ee5fd93bf95d26db9c45e513d0a2dd2f"
+  },
+  "original_source_sha256": {
+    "model.py": "ebbacff11c8eb785f40582bcefad3825228a0813f88c13f2678fca9f3627eee3",
+    "trainer.py": "0791c3394fec10c611aa4a16495bee5c4ff3b4d52704922610b9334a65d600c3",
+    "benchmark.py": "a57a1e7492051c931dbc6463da108fae812699b89f3aeb436e1d1160fc08edf1"
+  },
+  "validation": {
+    "focused_tests_passed": 335,
+    "coverage": "Sprint model, trainer, runtime, UI, benchmark, execution policy, planner profiles, native/pipelined/compiled optimizer and CUDA checks; existing engine, model families, Runs UI, Spalmer UI and base training regressions."
+  }
+}
