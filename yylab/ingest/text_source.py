@@ -14,10 +14,18 @@ from .pipeline import _exclusive_ingest
 
 
 def run_text_source(
-    progress, source_directory, *, validation_files=(), test_files=(), end_before_lines=None, output=None
+    progress,
+    source_directory,
+    *,
+    validation_files=(),
+    test_files=(),
+    end_before_lines=None,
+    output=None,
+    preprocessing="prose_v1",
 ):
-    from spalmer.data.text_index import build_text_index
+    from spalmer.data.text_index import build_text_index, preprocessing_identity
 
+    profile = preprocessing_identity(preprocessing)
     source = Path(source_directory).resolve()
     inventory = [(p.name, p.stat().st_size, p.stat().st_mtime_ns) for p in sorted(source.glob("*.txt"))]
     request = {
@@ -27,6 +35,8 @@ def run_text_source(
         "test": sorted(test_files),
         "boundaries": end_before_lines or {},
     }
+    if profile is not None:
+        request["preprocessing"] = profile
     identity = hashlib.sha256(json.dumps(request, sort_keys=True).encode()).hexdigest()[:20]
     destination = Path(output) if output else PATHS.cache / "text-sources" / identity
     if not destination.exists():
@@ -37,6 +47,7 @@ def run_text_source(
             validation_files=validation_files,
             test_files=test_files,
             end_before_lines=end_before_lines,
+            preprocessing=preprocessing,
         )
     else:
         manifest = json.loads((destination / "text-index.json").read_text(encoding="utf-8"))
@@ -50,6 +61,8 @@ def run_text_source(
                 f["filename"]: f["end_before_line"] for f in indexed_files if f["end_before_line"] is not None
             },
         }
+        if manifest.get("preprocessing") is not None:
+            indexed_request["preprocessing"] = manifest["preprocessing"]
         request["files"] = sorted(inventory)
         if indexed_request != request:
             raise ValueError(
@@ -59,12 +72,12 @@ def run_text_source(
 
 
 def register_text_index(progress, index_directory):
-    from spalmer.data.text_index import TEXT_INDEX_SCHEMA, iter_indexed_text
+    from spalmer.data.text_index import TEXT_INDEX_SCHEMAS, iter_indexed_text
 
     root = Path(index_directory).resolve()
     path = root / "text-index.json"
     manifest = json.loads(path.read_text(encoding="utf-8"))
-    if manifest.get("schema") != TEXT_INDEX_SCHEMA or manifest.get("classified") is not False:
+    if manifest.get("schema") not in TEXT_INDEX_SCHEMAS or manifest.get("classified") is not False:
         raise ValueError("expected an unclassified text source index")
     verified = sum(1 for _ in iter_indexed_text(root))
     if verified != manifest["stats"]["docs_written"]:
@@ -87,6 +100,7 @@ def register_text_index(progress, index_directory):
                 "index_sha256": manifest["index_sha256"],
                 "source_directory": manifest["source_directory"],
                 "split_policy": manifest["split_policy"],
+                "preprocessing": manifest.get("preprocessing"),
             }
             stats = {**manifest["stats"], "source_index": provenance, "bytes_on_disk": 0}
             (cdir / "text-source.json").write_text(
@@ -96,7 +110,16 @@ def register_text_index(progress, index_directory):
             now = db.now_iso()
             db.execute(
                 "INSERT INTO corpora(id,name,created_at,updated_at,status,source_path,stats_json) VALUES(?,?,?,?,?,?,?)",
-                (cid, "Raw prose · " + manifest["name"], now, now, "ready", str(path), json.dumps(stats)),
+                (
+                    cid,
+                    ("Prepared prose · " if manifest.get("preprocessing") else "Raw prose · ")
+                    + manifest["name"],
+                    now,
+                    now,
+                    "ready",
+                    str(path),
+                    json.dumps(stats),
+                ),
             )
     result = {
         "corpus_id": cid,
@@ -105,6 +128,7 @@ def register_text_index(progress, index_directory):
         "text_bytes_copied": 0,
         "documents": verified,
         "stats": manifest["stats"],
+        "preprocessing": manifest.get("preprocessing"),
     }
     (root / "yylab-import.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     progress("text-index", 1, f"{verified:,} documents available from original files")
@@ -130,8 +154,10 @@ def main(argv=None):
         "--selection", type=Path, help="JSON with validation_files, test_files, end_before_lines"
     )
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--preprocessing", choices=["none", "prose_v1"], default="prose_v1")
     args = parser.parse_args(argv)
     selection = json.loads(args.selection.read_text(encoding="utf-8")) if args.selection else {}
+    selection["preprocessing"] = None if args.preprocessing == "none" else args.preprocessing
     db.init_db()
     result = run_text_source(
         lambda stage, fraction, message: print(message, flush=True),

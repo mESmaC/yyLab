@@ -26,6 +26,14 @@ def test_native_precision_capabilities_probes_exact_yylab_device(monkeypatch) ->
     assert report["detail"] == "test"
 
 
+def test_pipeline_controls_are_persisted_in_run_recipe(monkeypatch):
+    cfg = _run_config(monkeypatch, optimizer_state_offload="none", token_shard_mib=16, data_prefetch_batches=3)
+    assert cfg["training"]["optimizer_state_offload"] == "none"
+    assert cfg["token_cache"] is True
+    assert cfg["token_shard_bytes"] == 16 * 2**20
+    assert cfg["data_prefetch_batches"] == 3
+
+
 def _resolved_plan() -> dict:
     return {
         "target_parameters": 10_000_000,
@@ -317,6 +325,8 @@ def test_spalmer_ui_config_continues_from_checkpoint(monkeypatch) -> None:
     assert config["spalmer"]["attention_backend"] == "fla"
     assert "architecture" not in config
     assert "precision" not in config
+    assert "parameter_dtype" not in config["training"]
+    assert "stochastic_parameter_rounding" not in config["training"]
     assert config["tokenizer"] == {
         "source": "checkpoint",
         "registry_id": None,
@@ -332,13 +342,20 @@ def test_spalmer_ui_checkpoint_mode_requires_parent(monkeypatch) -> None:
         _run_config(monkeypatch, initialization_mode="checkpoint", parent_checkpoint_id=None)
 
 
-def test_spalmer_ui_checkpoint_mode_normalizes(monkeypatch, tmp_path) -> None:
+@pytest.mark.parametrize(("dtype", "policy"), [("bfloat16", "cpu"), ("float32", "none")])
+def test_spalmer_ui_checkpoint_mode_normalizes(monkeypatch, tmp_path, dtype, policy) -> None:
+    import torch
+
     from yylab import db
     from yylab.train.spalmer import normalize_spalmer_config
 
     bundle = tmp_path / "parent" / "spalmer.pt"
     bundle.parent.mkdir()
-    bundle.write_bytes(b"bundle")
+    torch.save({
+        "format": "spalmer.prototype.checkpoint",
+        "model_parameter_dtype": dtype,
+        "experts_config": {"expert_master_dtype": dtype},
+    }, bundle)
     monkeypatch.setattr(
         db,
         "q1",
@@ -359,12 +376,15 @@ def test_spalmer_ui_checkpoint_mode_normalizes(monkeypatch, tmp_path) -> None:
         resolved_plan={},
         target_parameters=0,
         attention_backend="fla",
+        optimizer_state_offload=policy,
     )
 
     normalized = normalize_spalmer_config(config, require_runtime=True)
 
     assert normalized["initialization"]["checkpoint_ref"] == str(bundle.resolve())
     assert normalized["spalmer"] == {"attention_backend": "fla", "require_fla": True}
+    assert normalized["training"]["parameter_dtype"] == dtype
+    assert normalized["optimizer_state_offload"] == policy
 
 
 def test_spalmer_checkpoint_rows_filter_by_family(monkeypatch) -> None:
@@ -452,6 +472,28 @@ def test_spalmer_ui_config_omits_recurrence_when_disabled(monkeypatch) -> None:
     assert config["spalmer"]["recurrence"] == {"enabled": False}
     assert "mean_recurrence" not in config
     assert "mean_recurrence" not in config["training"]
+
+
+@pytest.mark.parametrize("scheme", ["fixed", "uniform", "poisson_lognormal"])
+def test_recurrence_depth_controls_survive_recipe_normalization(monkeypatch, scheme):
+    from yylab.train.spalmer import normalize_spalmer_config
+
+    config = _recurrent_run_config(monkeypatch, recurrence_sampling=scheme, max_recurrence=12)
+    normalized = normalize_spalmer_config(config, require_runtime=True)
+    for values in (config, config["training"], normalized):
+        assert values["recurrence_sampling"] == scheme
+        assert values["max_recurrence"] == 12
+
+
+@pytest.mark.parametrize("controls", [
+    {"mean_recurrence": float("nan")}, {"recurrence_sigma": float("inf")},
+    {"recurrence_sampling": "invalid"},
+    {"recurrence_sampling": "fixed", "mean_recurrence": 4.5},
+    {"max_recurrence": 4}, {"max_recurrence": 8.5},
+])
+def test_recurrence_ui_rejects_invalid_sampling_controls(monkeypatch, controls):
+    with pytest.raises(ValueError):
+        _recurrent_run_config(monkeypatch, **controls)
 
 
 def test_spalmer_ui_config_rejects_inconsistent_recurrence(monkeypatch) -> None:

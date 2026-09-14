@@ -4,6 +4,7 @@ import json
 import math
 from collections.abc import Mapping
 from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 from nicegui import ui
@@ -27,6 +28,12 @@ from .train_mole import corpus_options
 
 SPRINT_RUN_KIND = "sprint"
 SPRINT_BENCHMARK_KIND = "sprint_benchmark"
+SPRINT_FIXED_TOKEN_QUOTA = "fixed_token_quota"
+CORPUS_MIX_OPTIONS = {
+    SPRINT_FIXED_TOKEN_QUOTA: "Fixed token shares",
+    CORPUS_MIX_TOKEN_BALANCED: "Balance while sources last (characters)",
+    "round_robin": "Round robin", "concatenate": "Concatenate",
+}
 SPLIT_OPTIONS = ["train", "validation", "test", "unspecified"]
 EXECUTION_PRESETS = {
     "cpu_offload": {"parameter_dtype": "bfloat16", "optimizer_state_offload": "cpu"},
@@ -36,6 +43,8 @@ COMPILE_MODES = ("default", "reduce-overhead", "max-autotune", "max-autotune-no-
 ATTENTION_OPTIONS = {"auto": "Auto · let PyTorch choose", "cudnn": "cuDNN", "efficient": "Memory-efficient",
                      "flash": "Flash attention", "math": "Math"}
 SHAPE_PROFILES = {"throughput": "Throughput (wider, fewer layers)", "balanced": "Original proportions"}
+PLE_OPTIONS = {"none": "No PLE", "full": "Regular PLE", "qr": "QR PLE"}
+ARCHITECTURE_ATTENTION_OPTIONS = {"sdpa": "Standard attention", "kda": "Kimi linear attention · hybrid 3:1"}
 CPU_OPTIMIZER_KERNELS = {"auto": "Auto", "native": "Native", "compiled": "Compiled"}
 LOSS_OPTIONS = {
     "auto": "Auto · use the model's default choice",
@@ -52,6 +61,39 @@ def _positive_integer(value: Any, name: str) -> int:
     except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError(f"{name} must be a positive integer") from exc
     return parsed
+
+
+def sprint_generation_eval_config(value: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Keep scheduling separate from the reusable evaluator's bounded options."""
+    from ...train.sprint_quality import normalize_sprint_quality_config
+
+    if value is not None and not isinstance(value, Mapping):
+        raise ValueError("Generated text checks must be a settings object")
+    selected = dict(value or {})
+    if selected.keys() - {"enabled", "interval", "options"}:
+        raise ValueError("Generated text checks support enabled, interval and options")
+    enabled = selected.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise ValueError("Generated text checks enabled must be Boolean")
+    options = selected.get("options", {})
+    if not isinstance(options, Mapping):
+        raise ValueError("Generated text check options must be a settings object")
+    options = {"max_new_tokens": 64, **options}
+    normalize_sprint_quality_config(options)
+    return {"enabled": enabled,
+            "interval": _positive_integer(selected.get("interval", 500), "Generated text check interval"),
+            "options": options}
+
+
+def sprint_corpus_preflight(config: Mapping[str, Any]) -> dict:
+    """Use shared admission only; the Sprint packer owns fixed token allocation."""
+    mix = config["corpus_mix"]
+    return corpus_training_preflight(
+        config["corpora"], config["domains"] or None,
+        corpus_mix=CORPUS_MIX_TOKEN_BALANCED if mix == SPRINT_FIXED_TOKEN_QUOTA else mix,
+        splits=config["splits"], cross_corpus_dedup=config["cross_corpus_dedup"],
+        corpus_weights=config["corpus_weights"] or None, source_max_ratio=config["source_max_ratio"],
+    )
 
 
 def sprint_performance_config(
@@ -107,11 +149,15 @@ def sprint_memory_estimate(parameters: int, *, parameter_dtype: str = "bfloat16"
 
 
 @lru_cache(maxsize=64)
-def _planned_config(target: int, vocab_size: int, context: int, profile: str) -> str:
+def _planned_config(target: int, vocab_size: int, context: int, profile: str,
+                    ple_type: str = "none", ple_lanes: int = 4, attention_type: str = "sdpa",
+                    kda_backend: str = "auto", kda_disable_recompute: bool = True) -> str:
     from ...models.sprint import plan_sprint_model
 
     return json.dumps(
-        plan_sprint_model(target, vocab_size, max_position_embeddings=context, profile=profile).to_dict(),
+        plan_sprint_model(target, vocab_size, max_position_embeddings=context, profile=profile,
+                          ple_type=ple_type, ple_lanes=ple_lanes, attention_type=attention_type,
+                          kda_backend=kda_backend, kda_disable_recompute=kda_disable_recompute).to_dict(),
         sort_keys=True,
     )
 
@@ -124,31 +170,48 @@ def resolve_sprint_shape(
     model_config: Mapping[str, Any] | None = None,
     profile: str = "throughput",
     loss_backend: str | None = None,
+    ple_type: str | None = None,
+    ple_lanes: int | None = None,
+    attention_type: str | None = None,
+    kda_backend: str | None = None,
+    kda_disable_recompute: bool | None = None,
 ) -> dict[str, Any]:
     """Plan and count an architecture without constructing model weights."""
-    from ...models.sprint import SprintConfig, estimate_parameter_count
+    from ...models.sprint import SprintConfig, estimate_parameter_breakdown
 
     if loss_backend is not None and loss_backend not in LOSS_OPTIONS:
         raise ValueError("Choose a supported loss implementation")
+    values = dict(model_config or {})
+    ple_values = {"ple_type": ple_type if ple_type is not None else values.get("ple_type", "none"),
+                  "ple_lanes": ple_lanes if ple_lanes is not None else values.get("ple_lanes", 4)}
+    attention_values = {
+        "attention_type": attention_type if attention_type is not None else values.get("attention_type", "sdpa"),
+        "kda_backend": kda_backend if kda_backend is not None else values.get("kda_backend", "auto"),
+        "kda_disable_recompute": (kda_disable_recompute if kda_disable_recompute is not None
+                                  else values.get("kda_disable_recompute", True)),
+    }
     if target_parameters:
         if profile not in SHAPE_PROFILES:
             raise ValueError("Choose a supported model sizing profile")
         config = SprintConfig(**json.loads(_planned_config(
             int(target_parameters), int(vocab_size), int(context_length), profile,
+            ple_values["ple_type"], ple_values["ple_lanes"],
+            attention_values["attention_type"], attention_values["kda_backend"],
+            attention_values["kda_disable_recompute"],
         )))
     else:
         config = SprintConfig(**{
-            **dict(model_config or {}),
+            **values, **ple_values, **attention_values,
             "vocab_size": int(vocab_size),
             "max_position_embeddings": int(context_length),
         })
     if loss_backend is not None:
         config.loss_backend = loss_backend
     config.validate()
-    count = estimate_parameter_count(config)
+    breakdown = estimate_parameter_breakdown(config)
     return {
         "model_config": config.to_dict(),
-        "parameters": count,
+        "parameters": breakdown["total"], "parameter_breakdown": breakdown,
         "target_parameters": int(target_parameters),
         **({"shape_profile": profile} if target_parameters else {}),
     }
@@ -221,15 +284,22 @@ def build_sprint_run_config(values: Mapping[str, Any] | None = None, **overrides
         if sequence > model.max_position_embeddings:
             raise ValueError("Training sequence length exceeds the model context")
         model_config = model.to_dict()
-    mix = normalize_corpus_mix(raw.get("corpus_mix", CORPUS_MIX_TOKEN_BALANCED))
-    weights = {str(key): float(value) for key, value in dict(raw.get("corpus_weights") or {}).items()}
+    objective = normalize_training_objective(raw.get("objective"))
+    default_mix = SPRINT_FIXED_TOKEN_QUOTA if objective == "causal_lm" else CORPUS_MIX_TOKEN_BALANCED
+    requested_mix = raw.get("corpus_mix", default_mix)
+    mix = (SPRINT_FIXED_TOKEN_QUOTA if str(requested_mix).strip().casefold() == SPRINT_FIXED_TOKEN_QUOTA
+           else normalize_corpus_mix(requested_mix))
+    raw_weights = dict(raw.get("corpus_weights") or {})
+    if any(isinstance(value, bool) for value in raw_weights.values()):
+        raise ValueError("Corpus weights must be positive finite numbers for selected corpora")
+    weights = {str(key): float(value) for key, value in raw_weights.items()}
     if any(key not in corpora or not math.isfinite(value) or value <= 0 for key, value in weights.items()):
         raise ValueError("Corpus weights must be positive finite numbers for selected corpora")
     cap = float(raw.get("source_max_ratio") or 0)
     if not math.isfinite(cap) or not 0 <= cap <= 1:
         raise ValueError("Source ratio cap must be between 0 and 1")
-    if (weights or cap) and mix != CORPUS_MIX_TOKEN_BALANCED:
-        raise ValueError("Corpus weights and source ratio caps require token-balanced mixing")
+    if (weights or cap) and mix not in {CORPUS_MIX_TOKEN_BALANCED, SPRINT_FIXED_TOKEN_QUOTA}:
+        raise ValueError("Corpus weights require fixed token shares or legacy token-balanced mixing; source caps require legacy mixing")
     if cap and cap < 1 / len(corpora):
         raise ValueError("Source ratio cap is too small for the number of selected corpora")
     splits = normalize_source_splits(raw.get("splits", ["train", "unspecified"]))
@@ -250,6 +320,8 @@ def build_sprint_run_config(values: Mapping[str, Any] | None = None, **overrides
         optimizer_state_offload=str(raw.get("optimizer_state_offload", "cpu")),
         gradient_checkpointing=raw.get("gradient_checkpointing", raw.get("activation_checkpointing", False)),
     )
+    if model_config.get("attention_type", "sdpa") == "kda" and execution["parameter_dtype"] != "float32":
+        raise ValueError("Kimi linear attention currently requires the GPU optimizer preset (FP32 weights)")
     cfg = {
         "recipe_version": 1,
         "architecture_type": "sprint",
@@ -264,7 +336,7 @@ def build_sprint_run_config(values: Mapping[str, Any] | None = None, **overrides
         "corpora": corpora,
         "domains": list(dict.fromkeys(raw.get("domains") or [])),
         "splits": splits,
-        "objective": normalize_training_objective(raw.get("objective")),
+        "objective": objective,
         "corpus_mix": mix,
         "corpus_weights": weights,
         "cross_corpus_dedup": bool(raw.get("cross_corpus_dedup", True)),
@@ -296,9 +368,14 @@ def build_sprint_run_config(values: Mapping[str, Any] | None = None, **overrides
         "eval_interval": eval_interval,
         "eval_steps": int(raw.get("eval_steps", 10)),
         "eval_splits": eval_splits,
+        "generation_eval": sprint_generation_eval_config(raw.get("generation_eval")),
         "save_interval": int(raw.get("save_interval", 1000)),
         "log_interval": int(raw.get("log_interval", 20)),
     }
+    if mode == "scratch":
+        from ...models.sprint import estimate_parameter_breakdown
+
+        cfg["parameter_breakdown"] = estimate_parameter_breakdown(model)
     for key in ("lr", "weight_decay", "min_lr_ratio", "grad_clip"):
         if not math.isfinite(cfg[key]) or cfg[key] < 0:
             raise ValueError(f"{key} must be finite and nonnegative")
@@ -314,6 +391,15 @@ def build_sprint_run_config(values: Mapping[str, Any] | None = None, **overrides
         if profile not in SHAPE_PROFILES:
             raise ValueError("Choose a supported model sizing profile")
         cfg["shape_profile"] = profile
+    if mix == SPRINT_FIXED_TOKEN_QUOTA:
+        from ...train.sprint_mix import normalize_quota_config
+
+        cfg["quota_max_source_epochs"] = raw.get("quota_max_source_epochs", 1.0)
+        if "quota_row_filter" in raw:
+            cfg["quota_row_filter"] = raw["quota_row_filter"]
+        if "quota_version" in raw:
+            cfg["quota_version"] = raw["quota_version"]
+        cfg = normalize_quota_config(cfg)
     return cfg
 
 
@@ -328,7 +414,7 @@ def build_sprint_benchmark_config(
     shape_profile: str | None = None,
     cpu_optimizer_kernel: str = "auto",
 ) -> dict[str, Any]:
-    from ...models.sprint import SprintConfig
+    from ...models.sprint import SprintConfig, estimate_parameter_breakdown
 
     model = SprintConfig(**dict(model_config))
     model.validate()
@@ -347,7 +433,8 @@ def build_sprint_benchmark_config(
     if device not in {"auto", "cuda", "cpu"}:
         raise ValueError("Device must be auto, cuda, or cpu")
     config = {
-        "model_config": model.to_dict(), "seq_len": int(seq_len), "batch_sizes": batches,
+        "model_config": model.to_dict(), "parameter_breakdown": estimate_parameter_breakdown(model),
+        "seq_len": int(seq_len), "batch_sizes": batches,
         "compile_modes": list(dict.fromkeys(compile_modes)), "effective_batch": int(effective_batch),
         "warmup_steps": int(warmup_steps), "measure_steps": int(measure_steps), "device": device,
         **sprint_execution_config(parameter_dtype=parameter_dtype, optimizer_state_offload=optimizer_state_offload,
@@ -356,6 +443,8 @@ def build_sprint_benchmark_config(
                                     attention_backend=attention_backend, cpu_optimizer_kernel=cpu_optimizer_kernel,
                                     parameter_dtype=parameter_dtype, optimizer_state_offload=optimizer_state_offload),
     }
+    if model.attention_type == "kda" and config["parameter_dtype"] != "float32":
+        raise ValueError("Kimi linear attention currently requires the GPU optimizer preset (FP32 weights)")
     for name, values in (("cpu_thread_counts", cpu_thread_counts), ("offload_bucket_sizes_mb", offload_bucket_sizes_mb)):
         parsed = _optional_integer_sweep(values, name)
         if parsed:
@@ -391,6 +480,31 @@ def sprint_checkpoint_rows() -> list[dict[str, Any]]:
     return selected
 
 
+def checkpoint_attention_type(checkpoint: Mapping[str, Any] | None = None, *, resume_from: str = "") -> str | None:
+    """Read local checkpoint configuration or registered metadata without loading weights."""
+    row = dict(checkpoint or {})
+    reference = resume_from or row.get("path") or row.get("ref")
+    if reference:
+        path = Path(str(reference)).expanduser()
+        config_path = (path.parent if path.name == "trainer.pt" else path) / "config.json"
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            if isinstance(config, dict) and config.get("model_type") == "sprint":
+                attention = config.get("attention_type", "sdpa")
+                return attention if attention in ARCHITECTURE_ATTENTION_OPTIONS else None
+        except (OSError, ValueError):
+            pass
+    try:
+        metadata = json.loads(row.get("meta_json") or "{}")
+        config = metadata.get("model_config") if isinstance(metadata, dict) else None
+        if isinstance(config, dict):
+            attention = config.get("attention_type", "sdpa")
+            return attention if attention in ARCHITECTURE_ATTENTION_OPTIONS else None
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
 def latest_sprint_recommendation(
     model_config: Mapping[str, Any], sequence_length: int, *, device: str = "auto",
     parameter_dtype: str = "bfloat16", optimizer_state_offload: str = "cpu",
@@ -415,8 +529,12 @@ def latest_sprint_recommendation(
     shape_keys = (
         "vocab_size", "hidden_size", "intermediate_size", "num_hidden_layers", "num_attention_heads",
         "max_position_embeddings", "tie_word_embeddings", "mlp_type", "loss_backend", "loss_chunk_size",
+        "ple_type", "ple_lanes",
+        "attention_type", "kda_backend", "kda_disable_recompute",
     )
-    expected = tuple(model_config.get(key) for key in shape_keys)
+    legacy_defaults = {"ple_type": "none", "ple_lanes": 4, "attention_type": "sdpa",
+                       "kda_backend": "auto", "kda_disable_recompute": True}
+    expected = tuple(model_config.get(key, legacy_defaults.get(key)) for key in shape_keys)
     for row in db.q(
         "SELECT id,metrics_json FROM runs WHERE kind=? AND status='done' ORDER BY finished_at DESC",
         (SPRINT_BENCHMARK_KIND,),
@@ -427,7 +545,7 @@ def latest_sprint_recommendation(
                 path = run_dir(row["id"]) / "benchmark.json"
                 report = json.loads(path.read_text("utf-8")) if path.is_file() else {}
             measured_model = report.get("model_config") or {}
-            if tuple(measured_model.get(key) for key in shape_keys) != expected:
+            if tuple(measured_model.get(key, legacy_defaults.get(key)) for key in shape_keys) != expected:
                 continue
             if int(report.get("sequence_length") or 0) != int(sequence_length):
                 continue
@@ -481,6 +599,7 @@ def queue_sprint_job(config: Mapping[str, Any], *, benchmark: bool = False) -> s
                  "SprintForCausalLM", int(model.get("hidden_size") or 0),
                  int(model.get("num_hidden_layers") or 0), json.dumps({
                      "architecture_type": "sprint", "model_config": model,
+                     **({"parameter_breakdown": cfg["parameter_breakdown"]} if cfg.get("parameter_breakdown") else {}),
                      "initialization": cfg.get("initialization"),
                      **({"shape_profile": cfg["shape_profile"]} if cfg.get("shape_profile") else {}),
                  })),
@@ -533,7 +652,9 @@ def train_sprint_page() -> None:
             resume.bind_visibility_from(initialization, "value", backward=lambda value: value == "resume")
             tokenizer.bind_visibility_from(initialization, "value", backward=lambda value: value == "scratch")
             hint("Continue starts a fresh optimizer and accepts a new training budget. Resume restores an "
-                 "interrupted run's optimizer, scheduler, and data position using its original recipe and budget.")
+                 "interrupted run's optimizer, scheduler, and data position using its original recipe and budget. "
+                 "Both inherit the checkpoint's attention and PLE choices; changing these requires a new model.")
+            inherited_attention_hint = ui.label().classes("text-sm text-gray-400")
             with ui.column().classes("w-full") as shape_controls:
                 with field_grid(4):
                     sizing = ui.select({"target": "Target parameter count", "manual": "Manual architecture"},
@@ -557,6 +678,15 @@ def train_sprint_page() -> None:
                     heads = ui.number("Attention heads", value=12, min=1, format="%.0f")
                     intermediate = ui.number("MLP width", value=2048, min=8, step=64, format="%.0f")
                 manual.bind_visibility_from(sizing, "value", backward=lambda value: value == "manual")
+                architecture_attention = ui.select(ARCHITECTURE_ATTENTION_OPTIONS, value="sdpa",
+                                                   label="Model attention").classes("w-full")
+                hint("Kimi linear attention uses three linear layers per standard attention layer. "
+                     "It currently uses the GPU optimizer preset. Generation recomputes the prefix; "
+                     "incremental generation caching is not yet available for this architecture.")
+                ple_type = ui.select(PLE_OPTIONS, value="none", label="Per-layer embeddings (PLE)").classes("w-full")
+                hint("Regular PLE adds a token lookup before each later layer. QR PLE uses smaller combined tables "
+                     "with four lanes. At a fixed total size, PLE leaves fewer parameters for feed-forward layers. "
+                     "Measure speed for your setup; equal model quality has not been established.")
                 loss_backend = ui.select(LOSS_OPTIONS, value="auto", label="Loss implementation").classes("w-full")
                 hint("PyTorch keeps the full output scores in memory. Liger uses a fused loss to reduce GPU memory, "
                      "and requires CUDA and Liger kernels. Benchmark both for your model; lower memory use does not "
@@ -565,7 +695,7 @@ def train_sprint_page() -> None:
             shape_controls.bind_visibility_from(initialization, "value", backward=lambda value: value == "scratch")
 
         with panel():
-            form_section("2", "Training data", "Packed corpora are cached and reused across runs.")
+            form_section("2", "Training data", "Finished packed data is reused automatically, including compatible token budgets.")
             corpora = ui.select(corpus_options(), multiple=True, label="Corpora", value=[]).props("use-chips").classes("w-full")
             with field_grid(3):
                 objective = ui.select({"causal_lm": "Pretraining", "chat_sft": "Chat SFT · assistant tokens"},
@@ -575,15 +705,33 @@ def train_sprint_page() -> None:
                                    label="Training source splits").props("use-chips")
             with ui.expansion("Corpus mixing and deduplication").classes("w-full"):
                 with field_grid(3):
-                    mix = ui.select({"token_balanced": "Balance source tokens", "round_robin": "Round robin",
-                                     "concatenate": "Concatenate"}, value="token_balanced", label="Corpus mixing")
+                    mix = ui.select(CORPUS_MIX_OPTIONS, value=SPRINT_FIXED_TOKEN_QUOTA, label="Corpus mixing")
                     cap = ui.number("Maximum source ratio · 0 disables", value=0, min=0, max=1, step=0.05)
-                    dedup = ui.checkbox("Deduplicate across corpora", value=True)
+                    dedup = ui.checkbox("Remove identical source records across corpora", value=True)
+                cap.bind_visibility_from(mix, "value", backward=lambda value: value == CORPUS_MIX_TOKEN_BALANCED)
                 weights = ui.input("Optional corpus weights (JSON)", value="{}",
                                    placeholder='{"corpus_id": 2.0}').classes("w-full")
+                weights.bind_visibility_from(mix, "value", backward=lambda value: value in {
+                    SPRINT_FIXED_TOKEN_QUOTA, CORPUS_MIX_TOKEN_BALANCED})
+                with ui.column().classes("w-full") as quota_controls:
+                    quota_epochs = ui.number("Maximum passes through each source", value=1, min=1, step=.25)
+                    row_cleanup = ui.checkbox("Remove duplicate and extremely repetitive sequences", value=True)
+                    hint("Builds a filtered copy of the source pools: removes exact repeated sequences across selected sources and sequences "
+                         "dominated by repeated short patterns. Original corpora remain available. "
+                         "This does not group similar wording or problem templates; extremely repetitive "
+                         "sequences can still be removed.")
+                    hint("Fixed token shares allocate the budget using these relative weights; omitted sources have weight 1. "
+                         "Shares are rounded to complete training sequences. A pass limit of 1 uses each source row at most once. "
+                         "Larger limits explicitly allow replay. If a source cannot supply its share within this limit, "
+                         "packing stops with an error. Adjust its weight, the budget, or its pass limit.")
+                quota_controls.bind_visibility_from(mix, "value", backward=lambda value: value == SPRINT_FIXED_TOKEN_QUOTA)
+                hint("Legacy balancing measures characters and changes the mixture as sources run out. "
+                     "Fixed token shares are available for pretraining.")
                 source_cache = ui.checkbox("Build or reuse the per-document token cache before packing", value=False)
-                hint("Sprint always caches packed training rows. Enable this extra cache for repeated corpus "
-                     "experiments; preparing the whole corpus adds first-run time and disk usage.")
+                hint("Changing model size or optimizer settings keeps the packed cache. Fixed token shares reuse source "
+                     "pools to prepare an allocation for each budget and mixture. Changing the tokenizer or sequence length "
+                     "requires new pools. The optional document cache saves tokenization across those changes, "
+                     "but prepares whole corpora first.")
 
         with panel():
             form_section("3", "Training budget and speed")
@@ -642,6 +790,12 @@ def train_sprint_page() -> None:
                 eval_splits = ui.select(SPLIT_OPTIONS, multiple=True, value=["validation"], label="Evaluation source splits")
                 eval_steps = ui.number("Evaluation batches", value=10, min=1, format="%.0f")
             hint("Evaluation requires held-out source splits. Final checkpoints and resumable training state are saved automatically.")
+            with field_grid(2):
+                generation_enabled = ui.checkbox("Check generated text for repetition", value=True)
+                generation_interval = ui.number("Check generated text every N steps", value=500, min=1, format="%.0f")
+            generation_interval.bind_visibility_from(generation_enabled, "value")
+            hint("Short fixed prompts are checked during training and at the final save, independently of held-out loss. "
+                 "Repetition and simple answer checks produce warnings; passing them does not establish model quality.")
 
         def current_shape() -> dict[str, Any]:
             row = tokenizers.get(tokenizer.value or "")
@@ -651,6 +805,8 @@ def train_sprint_page() -> None:
                 target_parameters=int(target.value or 0) if sizing.value == "target" else 0,
                 profile=str(shape_profile.value),
                 loss_backend=str(loss_backend.value),
+                ple_type=str(ple_type.value), ple_lanes=4,
+                attention_type=str(architecture_attention.value),
                 model_config={"hidden_size": int(width.value or 0), "num_hidden_layers": int(layers.value or 0),
                               "num_attention_heads": int(heads.value or 0), "intermediate_size": int(intermediate.value or 0)},
             )
@@ -659,6 +815,7 @@ def train_sprint_page() -> None:
             try:
                 plan = current_shape()
                 model = plan["model_config"]
+                allocation = plan["parameter_breakdown"]
                 state = sprint_memory_estimate(plan["parameters"], **EXECUTION_PRESETS[str(execution_mode.value)])
                 if state["cpu_bytes"]:
                     memory = (f"CUDA state: {state['gpu_bytes'] / 2**30:,.2f} GiB for BF16 weights and gradients; "
@@ -669,6 +826,9 @@ def train_sprint_page() -> None:
                               "A 1B model uses about 16 GB GPU state.")
                 preview.set_text(f"{plan['parameters']:,} parameters · {model['num_hidden_layers']} layers · "
                                  f"width {model['hidden_size']} · {model['num_attention_heads']} heads · tied embeddings · "
+                                 f"{ARCHITECTURE_ATTENTION_OPTIONS[model['attention_type']]} · "
+                                 f"{PLE_OPTIONS[model['ple_type']]}: {allocation['ple']:,} parameters · "
+                                 f"feed-forward: {allocation['ffn']:,} parameters (width {model['intermediate_size']}) · "
                                  f"{SHAPE_PROFILES[plan['shape_profile']] + ' · ' if plan.get('shape_profile') else ''}"
                                  f"{memory} Estimates exclude activations and transfer buffers.")
             except (ValueError, TypeError, RuntimeError) as exc:
@@ -697,6 +857,8 @@ def train_sprint_page() -> None:
                     resume_from=resume.value if selected_mode == "resume" else "", corpora=corpora.value,
                     domains=domains.value, splits=splits.value, objective=objective.value, corpus_mix=mix.value,
                     corpus_weights=json.loads(weights.value or "{}"), source_max_ratio=cap.value,
+                    quota_max_source_epochs=quota_epochs.value,
+                    quota_row_filter={"enabled": row_cleanup.value},
                     cross_corpus_dedup=dedup.value, token_cache=source_cache.value, seq_len=int(sequence.value or 0),
                     micro_batch=int(micro.value or 0), grad_accum=int(accum.value or 0),
                     token_budget=int(tokens.value or 0) if budget_mode.value == "tokens" else 0,
@@ -711,12 +873,10 @@ def train_sprint_page() -> None:
                     activation_checkpointing=checkpointing.value, log_interval=log_interval.value,
                     save_interval=save_interval.value, eval_interval=eval_interval.value,
                     eval_steps=eval_steps.value, eval_splits=eval_splits.value,
+                    generation_eval={"enabled": generation_enabled.value, "interval": generation_interval.value,
+                                     "options": {"max_new_tokens": 64}},
                 )
-                preflight = corpus_training_preflight(
-                    cfg["corpora"], cfg["domains"] or None, corpus_mix=cfg["corpus_mix"], splits=cfg["splits"],
-                    cross_corpus_dedup=cfg["cross_corpus_dedup"], corpus_weights=cfg["corpus_weights"] or None,
-                    source_max_ratio=cfg["source_max_ratio"],
-                )
+                preflight = sprint_corpus_preflight(cfg)
                 if preflight["errors"]:
                     raise ValueError("; ".join(preflight["errors"]))
                 run_id = queue_sprint_job(cfg)
@@ -796,8 +956,45 @@ def train_sprint_page() -> None:
                 ui.link("View runs and benchmark results", "/runs")
         benchmark_panel.bind_visibility_from(initialization, "value", backward=lambda value: value == "scratch")
 
+        def select_attention() -> None:
+            if architecture_attention.value == "kda":
+                execution_mode.set_value("gpu")
+            update_preview()
+
+        def select_objective() -> None:
+            options = (CORPUS_MIX_OPTIONS if objective.value == "causal_lm" else
+                       {key: value for key, value in CORPUS_MIX_OPTIONS.items() if key != SPRINT_FIXED_TOKEN_QUOTA})
+            mix.set_options(options, value=mix.value if mix.value in options else CORPUS_MIX_TOKEN_BALANCED)
+
+        def select_mix() -> None:
+            if mix.value != CORPUS_MIX_TOKEN_BALANCED:
+                cap.set_value(0)
+
+        def select_initialization() -> None:
+            mode = str(initialization.value)
+            inherited = (checkpoint_attention_type(checkpoints.get(parent.value or "")) if mode == "checkpoint"
+                         else checkpoint_attention_type(resume_from=str(resume.value or "")) if mode == "resume"
+                         else None)
+            if inherited == "kda":
+                execution_mode.set_value("gpu")
+                inherited_attention_hint.set_text(
+                    "This checkpoint uses Kimi linear attention. GPU optimizer with FP32 weights selected; "
+                    "the checkpoint's model architecture will be inherited.")
+            elif mode != "scratch" and inherited is None:
+                inherited_attention_hint.set_text(
+                    "Select a readable checkpoint to identify its attention. Kimi linear attention requires "
+                    "the GPU optimizer preset; the worker validates the loaded model before updating weights.")
+            else:
+                inherited_attention_hint.set_text("")
+            update_preview()
+
+        architecture_attention.on_value_change(lambda _: select_attention())
+        objective.on_value_change(lambda _: select_objective())
+        mix.on_value_change(lambda _: select_mix())
+        for element in (initialization, parent, resume):
+            element.on_value_change(lambda _: select_initialization())
         for element in (tokenizer, sizing, target, context, width, layers, heads, intermediate,
                         sequence, micro, accum, budget_mode, tokens, steps, benchmark_vocab, execution_mode,
-                        shape_profile, loss_backend):
+                        shape_profile, loss_backend, ple_type, architecture_attention):
             element.on_value_change(lambda _: update_preview())
         update_preview()

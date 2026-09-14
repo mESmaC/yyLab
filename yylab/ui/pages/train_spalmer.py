@@ -702,8 +702,13 @@ def build_spalmer_run_config(
     mean_recurrence: float | None = None,
     backprop_depth: int | None = None,
     recurrence_sigma: float | None = None,
+    recurrence_sampling: str | None = None,
+    max_recurrence: int | None = None,
     parent_recurrent: bool = False,
     ple_backend: str | None = None,
+    optimizer_state_offload: str = "cpu",
+    token_shard_mib: int = 64,
+    data_prefetch_batches: int = 2,
 ) -> dict[str, Any]:
     """Build the durable UI/worker boundary for one SPALMER scratch or continued run."""
 
@@ -820,7 +825,9 @@ def build_spalmer_run_config(
     recurrence_requested = bool(recurrence_payload.get("enabled"))
     training_recurrence_requested = any(
         value is not None
-        for value in (mean_recurrence, backprop_depth, recurrence_sigma)
+        for value in (
+            mean_recurrence, backprop_depth, recurrence_sigma, recurrence_sampling, max_recurrence
+        )
     )
     if continuing:
         if recurrence_requested:
@@ -856,18 +863,27 @@ def build_spalmer_run_config(
     resolved_mean_recurrence: float | None = None
     resolved_backprop_depth: int | None = None
     resolved_recurrence_sigma: float | None = None
+    resolved_recurrence_sampling = recurrence_sampling or "poisson_lognormal"
     if recurrent:
         resolved_mean_recurrence = float(8.0 if mean_recurrence is None else mean_recurrence)
         resolved_backprop_depth = int(4 if backprop_depth is None else backprop_depth)
         resolved_recurrence_sigma = float(
             0.5 if recurrence_sigma is None else recurrence_sigma
         )
-        if resolved_mean_recurrence < 1:
-            raise ValueError("mean recurrence must be at least 1")
+        if not math.isfinite(resolved_mean_recurrence) or resolved_mean_recurrence < 1:
+            raise ValueError("mean recurrence must be at least 1 and finite")
         if resolved_backprop_depth < 1:
             raise ValueError("backprop depth must be at least 1")
-        if resolved_recurrence_sigma < 0:
-            raise ValueError("recurrence sigma cannot be negative")
+        if not math.isfinite(resolved_recurrence_sigma) or resolved_recurrence_sigma < 0:
+            raise ValueError("recurrence sigma must be non-negative and finite")
+        if resolved_recurrence_sampling not in {"poisson_lognormal", "uniform", "fixed"}:
+            raise ValueError("unsupported recurrence sampling scheme")
+        if resolved_recurrence_sampling == "fixed" and not resolved_mean_recurrence.is_integer():
+            raise ValueError("fixed sampling requires an integer mean recurrence")
+        if max_recurrence is not None:
+            if max_recurrence != int(max_recurrence) or max_recurrence < resolved_mean_recurrence:
+                raise ValueError("maximum recurrence must be an integer at least the mean recurrence")
+            max_recurrence = int(max_recurrence)
 
     atxy_payload = dict(atxy)
     if atxy_payload.get("enabled"):
@@ -946,6 +962,10 @@ def build_spalmer_run_config(
             "expert_precision": precision_status,
         },
     }
+    if optimizer_state_offload not in {"cpu", "none"}:
+        raise ValueError("optimizer_state_offload must be cpu or none")
+    if int(token_shard_mib) < 1 or int(data_prefetch_batches) < 0:
+        raise ValueError("token shard size must be positive and prefetch depth non-negative")
     training = {
         "max_steps": resolved_steps,
         "micro_batch_size": int(micro_batch),
@@ -966,7 +986,7 @@ def build_spalmer_run_config(
         "compute_dtype": "bfloat16",
         "parameter_dtype": "bfloat16",
         "optimizer_state_dtype": "float32",
-        "optimizer_state_offload": "cpu",
+        "optimizer_state_offload": optimizer_state_offload,
         "stochastic_parameter_rounding": True,
         "optimizer_update_chunk_size": 1_048_576,
         "fused_adamw": "auto",
@@ -984,10 +1004,15 @@ def build_spalmer_run_config(
             "mean_recurrence": resolved_mean_recurrence,
             "mean_backprop_depth": resolved_backprop_depth,
             "recurrence_sigma": resolved_recurrence_sigma,
-            "recurrence_sampling": "poisson_lognormal",
+            "recurrence_sampling": resolved_recurrence_sampling,
+            "max_recurrence": max_recurrence,
         }
         training.update(recurrence_training)
     if continuing:
+        # The bundle owns persistent precision. Keep the user's moment-placement
+        # choice, but let the bridge resolve the actual parent parameter dtype.
+        training.pop("parameter_dtype")
+        training.pop("stochastic_parameter_rounding")
         initialization = {"mode": "checkpoint", "checkpoint_id": parent_id}
         tokenizer = {
             "source": "checkpoint",
@@ -1054,6 +1079,9 @@ def build_spalmer_run_config(
         "shuffle_buffer": 128,
         "shuffle_buffer_bytes": 64 * 2**20,
         "tokenize_chunk": 8,
+        "token_cache": True,
+        "token_shard_bytes": int(token_shard_mib) * 2**20,
+        "data_prefetch_batches": int(data_prefetch_batches),
         "lr": float(learning_rate),
         "min_lr_ratio": float(minimum_lr_ratio),
         "warmup_steps": warmup,
@@ -1069,15 +1097,7 @@ def build_spalmer_run_config(
         "activation_checkpointing": False,
         # Root aliases so a replayed recipe keeps the depth policy even when
         # only the flat keys are read.
-        **(
-            {
-                "mean_recurrence": resolved_mean_recurrence,
-                "mean_backprop_depth": resolved_backprop_depth,
-                "recurrence_sigma": resolved_recurrence_sigma,
-            }
-            if recurrent
-            else {}
-        ),
+        **recurrence_training,
         **budget,
     }
 
@@ -1370,7 +1390,7 @@ def train_spalmer_page() -> None:
                     ui.label(
                         "Canonical expert policy: 200 coherent identities · training top-k 2 · "
                         "request residency 2–20 · grouped execution · BF16 master / "
-                        "CPU-offloaded FP32 moments."
+                        "FP32 moments (CPU offload by default)."
                     ).classes("text-xs text-violet-300")
 
                 ui.separator().classes("my-3")
@@ -1550,15 +1570,36 @@ def train_spalmer_page() -> None:
                             .props("dense outlined")
                             .classes("w-full")
                         )
+                    with field_grid(2):
+                        recurrence_sampling = ui.select(
+                            {"poisson_lognormal": "Poisson-lognormal", "uniform": "Uniform",
+                             "fixed": "Fixed"},
+                            value="poisson_lognormal", label="Depth sampling",
+                        ).props("dense outlined").classes("w-full")
+                        max_recurrence = ui.number(
+                            "Maximum iterations (0 = automatic)", value=0, min=0, precision=0,
+                        ).props("dense outlined").classes("w-full")
                     hint(
-                        "Each optimizer step samples one iteration count r from a log-normal "
-                        "Poisson with mean r̄, and backpropagates through only the last k "
-                        "iterations, so activation memory stays bounded while the model learns "
-                        "to keep iterating. r̄ = 1 degenerates to a plain stack."
+                        "One depth is shared by all microbatches in an optimizer step; only the "
+                        "last k iterations retain their gradient graph. The automatic maximum is "
+                        "4 × ceil(mean). Clipping can lower the observed mean. Fixed depth needs "
+                        "an integer mean. A depth of 1 still uses the recurrent adapter and norms."
                     )
                 with ui.expansion("Advanced optimizer and losses", icon="tune").classes(
                     "w-full"
                 ):
+                    with field_grid(3):
+                        optimizer_state_offload = ui.select(
+                            {"cpu": "CPU — lower VRAM", "none": "GPU — fewer transfers"},
+                            value="cpu", label="FP32 optimizer moments",
+                        ).props("dense outlined").classes("w-full")
+                        token_shard_mib = ui.number(
+                            "Token shard size (MiB)", value=64, min=1, precision=0,
+                        ).props("dense outlined").classes("w-full")
+                        data_prefetch_batches = ui.number(
+                            "CPU batches ahead", value=2, min=0, precision=0,
+                        ).props("dense outlined").classes("w-full")
+                    hint("Prepared tokens are reused between runs. GPU moments require about 8 extra bytes per dense trainable parameter.")
                     with field_grid(3):
                         minimum_lr_ratio = (
                             ui.number("Minimum LR ratio", value=0.1, min=0, max=1, step=0.05)
@@ -1618,7 +1659,7 @@ def train_spalmer_page() -> None:
                     ui.label(
                         "Expert precision is limited to providers that pass native forward and backward "
                         "checks on this GPU; dense and grouped providers are labeled honestly. Persistent parameters "
-                        "and gradients are BF16; Adam moments remain FP32 on CPU. QR-PLE keeps its "
+                        "and gradients are BF16; Adam moments remain FP32 on the selected device. QR-PLE keeps its "
                         "exact input table and codebooks in BF16."
                     ).classes("text-sm text-gray-300")
                     ui.label(
@@ -2131,6 +2172,9 @@ def train_spalmer_page() -> None:
                     minimum_lr_ratio=float(minimum_lr_ratio.value or 0),
                     warmup_steps=int(warmup_steps.value or 0),
                     weight_decay=float(weight_decay.value or 0),
+                    optimizer_state_offload=str(optimizer_state_offload.value),
+                    token_shard_mib=int(token_shard_mib.value),
+                    data_prefetch_batches=int(data_prefetch_batches.value),
                     beta1=float(beta1.value or 0),
                     beta2=float(beta2.value or 0),
                     epsilon=float(epsilon.value or 0),
@@ -2165,6 +2209,12 @@ def train_spalmer_page() -> None:
                     ),
                     recurrence_sigma=(
                         float(recurrence_sigma.value or 0) if recurrent_run() else None
+                    ),
+                    recurrence_sampling=(
+                        str(recurrence_sampling.value) if recurrent_run() else None
+                    ),
+                    max_recurrence=(
+                        int(max_recurrence.value) if recurrent_run() and max_recurrence.value else None
                     ),
                     parent_recurrent=bool(inherited_recurrence),
                     ple_backend=None if continuing() else current_ple_backend(),

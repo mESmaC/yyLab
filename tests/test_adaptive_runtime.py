@@ -346,8 +346,9 @@ class _EngineTokenizer:
         del messages, tokenize, add_generation_prompt
         return "prompt"
 
-    def __call__(self, _text, return_tensors=None):
+    def __call__(self, _text, return_tensors=None, add_special_tokens=True):
         assert return_tensors == "pt"
+        assert add_special_tokens is False  # The rendered template owns control tokens.
         ids = torch.tensor([[2, 3, 4]], dtype=torch.long)
         return {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
 

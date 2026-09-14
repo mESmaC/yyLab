@@ -17,7 +17,7 @@ import shutil
 import tempfile
 import time
 from collections.abc import Iterable, Mapping
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -33,7 +33,6 @@ from .data import (
     DEFAULT_TEXT_CHUNK_CHARS,
     OBJECTIVE_CHAT_SFT,
     ChatSFTBatches,
-    PackedBatches,
     iter_corpus_docs,
     normalize_corpus_ids,
     normalize_source_splits,
@@ -41,6 +40,7 @@ from .data import (
 from .loop import CPUOffloadAdamW
 from .prefetch import BufferedBatches, batch_stream
 from .prepared import prepare_for_training, source_snapshot, tokenizer_fingerprint
+from .sprint_packing import SprintCausalBatches, make_sprint_tokenize
 
 PACKED_SCHEMA = "sprint-packed-v1"
 TRAINER_SCHEMA = "sprint-trainer-v1"
@@ -63,6 +63,28 @@ def _positive_int(value: Any, name: str, *, zero: bool = False) -> int:
     return int(value)
 
 
+def normalize_generation_evaluation(value: Mapping[str, Any] | None = None, *, objective="causal_lm") -> dict:
+    """Separate a read-only diagnostic's cadence from its sampling options."""
+    from .sprint_quality import normalize_sprint_quality_config
+
+    if value is not None and not isinstance(value, Mapping):
+        raise ValueError("generation_eval must contain enabled, interval and options")
+    supplied = dict(value or {})
+    if supplied.keys() - {"enabled", "interval", "options"}:
+        raise ValueError("generation_eval accepts only enabled, interval and options")
+    enabled = supplied.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise ValueError("generation_eval.enabled must be Boolean")
+    interval = _positive_int(supplied.get("interval", 500), "generation_eval.interval")
+    options = supplied.get("options", {})
+    if not isinstance(options, Mapping):
+        raise ValueError("generation_eval.options must be an object")
+    options = dict(options)
+    options.setdefault("prompt_format", "tokenizer_chat" if objective == OBJECTIVE_CHAT_SFT else "plain")
+    return {"enabled": enabled, "interval": interval,
+            "options": normalize_sprint_quality_config(options)}
+
+
 def normalize_sprint_config(config: Mapping[str, Any]) -> dict:
     """Accept UI aliases and validate the complete training request."""
     # Shared corpus admission and mixing rules remain authoritative in yyLab.
@@ -71,12 +93,28 @@ def normalize_sprint_config(config: Mapping[str, Any]) -> dict:
     cfg = dict(config)
     if cfg.get("objective") == "pretrain":
         cfg["objective"] = "causal_lm"
+    from .sprint_mix import MODE as QUOTA_MODE
+    from .sprint_mix import normalize_quota_config
+
+    quota_mode = cfg.get("corpus_mix") == QUOTA_MODE
+    if not quota_mode and "quota_row_filter" in cfg:
+        from .sprint_row_filter import normalize_row_filter
+
+        if normalize_row_filter(cfg.pop("quota_row_filter")) is not None:
+            raise ValueError("quota_row_filter requires fixed_token_quota corpus mixing")
+    if quota_mode:
+        # Shared admission still validates corpus IDs, splits and weights.
+        # Its legacy scheduler does not implement Sprint's new token quotas.
+        cfg["corpus_mix"] = "token_balanced"
     cfg = normalize_base_data_config(cfg)
+    if quota_mode:
+        cfg["corpus_mix"] = QUOTA_MODE
     defaults = {
         "seq_len": 1024, "micro_batch": 8, "grad_accum": 1, "seed": 42,
         "max_steps": 0, "epochs": 0, "warmup_steps": 0, "eval_steps": 20,
         "data_prefetch_batches": 2, "shuffle_buffer": 128,
         "shuffle_buffer_bytes": 64 * 2**20, "shuffle_block_rows": 1024,
+        "tokenization_batch_size": 128,
     }
     for key, default in defaults.items():
         cfg[key] = _positive_int(cfg.get(key, default), key, zero=key in {
@@ -103,6 +141,10 @@ def normalize_sprint_config(config: Mapping[str, Any]) -> dict:
         raise ValueError("Sprint requires max_steps or token_budget")
     cfg["max_rows"] = min(budget_rows or cfg["max_steps"] * rows_per_step,
                           cfg["max_steps"] * rows_per_step)
+    if quota_mode:
+        cfg = normalize_quota_config(cfg)
+    if cfg.get("fixed_token_mix") is not None:
+        _validate_fixed_token_mix(cfg)
     for key, default, low, high in (
         ("lr", 3e-4, 0.0, None), ("weight_decay", 0.1, 0.0, None),
         ("min_lr_ratio", 0.1, 0.0, 1.0), ("grad_clip", 1.0, 0.0, None),
@@ -170,15 +212,63 @@ def normalize_sprint_config(config: Mapping[str, Any]) -> dict:
     cfg["initialization"] = dict(cfg.get("initialization") or {"mode": "scratch"})
     if cfg["initialization"].get("mode", "scratch") not in {"scratch", "checkpoint", "resume"}:
         raise ValueError("initialization mode must be scratch, checkpoint, or resume")
+    # Missing checkpoint overrides mean inherit; do not turn a saved PLE model
+    # into a no-PLE request when continuing or resuming from an older recipe.
+    from ..models.sprint import SprintConfig
+
+    ple = SprintConfig(ple_type=cfg["model_config"].get("ple_type", "none"),
+                       ple_lanes=cfg["model_config"].get("ple_lanes", 4))
+    ple.validate()
+    if cfg["initialization"].get("mode", "scratch") == "scratch" and not cfg.get("resume_from"):
+        cfg["model_config"].setdefault("ple_type", ple.ple_type)
+        cfg["model_config"].setdefault("ple_lanes", ple.ple_lanes)
+    attention_defaults = {"attention_type": "sdpa", "kda_backend": "auto", "kda_disable_recompute": True}
+    attention = {key: cfg["model_config"].get(key, default) for key, default in attention_defaults.items()}
+    if attention["attention_type"] not in {"sdpa", "kda"}:
+        raise ValueError("Sprint attention_type must be sdpa or kda")
+    if attention["kda_backend"] not in {"auto", "fla", "reference"}:
+        raise ValueError("Sprint kda_backend must be auto, fla, or reference")
+    if not isinstance(attention["kda_disable_recompute"], bool):
+        raise ValueError("Sprint kda_disable_recompute must be Boolean")
+    if cfg["initialization"].get("mode", "scratch") == "scratch" and not cfg.get("resume_from"):
+        for key, value in attention.items():
+            cfg["model_config"].setdefault(key, value)
+    if attention["attention_type"] == "kda" and cfg["parameter_dtype"] != "float32":
+        raise ValueError("Sprint KDA training currently requires FP32 weights; select the GPU optimizer preset")
     cfg["model_family"] = "hf"
     cfg["architecture_type"] = "sprint"
+    cfg["generation_eval"] = normalize_generation_evaluation(cfg.get("generation_eval"), objective=cfg["objective"])
     return cfg
+
+
+def _validate_fixed_token_mix(cfg: Mapping[str, Any]) -> None:
+    """A materialized fixed allocation is a distinct, non-cycling data contract."""
+    mix = cfg["fixed_token_mix"]
+    required = {"version", "seed", "rows_by_corpus", "pool_sha256", "dedup"}
+    if (not isinstance(mix, dict) or set(mix) != required
+            or mix.get("version") != "fixed_token_rows_v1" or mix.get("dedup") != "global_exact_text_v1"):
+        raise ValueError("unsupported Sprint fixed_token_mix descriptor")
+    _positive_int(mix["seed"], "fixed_token_mix.seed", zero=True)
+    rows, hashes = mix["rows_by_corpus"], mix["pool_sha256"]
+    if (not isinstance(rows, dict) or not isinstance(hashes, dict)
+            or set(rows) != set(cfg["corpora"]) or set(hashes) != set(rows)):
+        raise ValueError("fixed_token_mix must specify rows and pool hashes for every selected corpus")
+    total = sum(_positive_int(value, "fixed_token_mix row allocation") for value in rows.values())
+    if any(not isinstance(value, str) or len(value) != 64
+           or any(char not in "0123456789abcdef" for char in value) for value in hashes.values()):
+        raise ValueError("fixed_token_mix pool hashes must be SHA256 digests")
+    if int(cfg["max_rows"]) > total or cfg.get("epochs", 0) not in (0, 1):
+        raise ValueError("fixed_token_mix does not cover the requested token budget without repetition")
+    if (cfg.get("objective") != "causal_lm" or cfg.get("splits") != ["train"]
+            or not cfg.get("cross_corpus_dedup") or cfg.get("corpus_mix") != "concatenate"
+            or cfg.get("corpus_weights") or cfg.get("source_max_ratio")):
+        raise ValueError("fixed_token_mix requires deduplicated causal train data with no additional source scheduling")
 
 
 def _packed_identity(cfg: Mapping[str, Any], tokenizer: Any) -> dict:
     keys = ("corpora", "domains", "splits", "corpus_mix", "cross_corpus_dedup", "corpus_weights",
             "source_max_ratio", "objective", "seq_len", "seed", "shuffle_buffer", "shuffle_buffer_bytes")
-    return {
+    identity = {
         "schema": PACKED_SCHEMA,
         "selection": {key: cfg.get(key) for key in keys},
         "max_rows": int(cfg["max_rows"]),
@@ -187,10 +277,52 @@ def _packed_identity(cfg: Mapping[str, Any], tokenizer: Any) -> dict:
         "sources": [source_snapshot(cid, verify=str(cfg.get("token_cache_verify_sources", "stat")))
                     for cid in cfg["corpora"]],
     }
+    if cfg.get("fixed_token_mix") is not None:
+        _validate_fixed_token_mix(cfg)
+        identity["selection"]["fixed_token_mix"] = cfg["fixed_token_mix"]
+    from .sprint_mix import MODE as QUOTA_MODE
+    from .sprint_mix import quota_identity
+    if cfg.get("corpus_mix") == QUOTA_MODE:
+        # A finite quota is budget-dependent. A shorter cache prefix has
+        # measured shares but does not necessarily have its new exact quotas.
+        identity["selection"][QUOTA_MODE] = quota_identity(cfg)
+    return identity
+
+
+def _packed_selection(identity: Mapping[str, Any]) -> dict:
+    # The budget limits a deterministic stream; it does not change its rows.
+    return {name: value for name, value in identity.items() if name != "max_rows"}
+
+
+def _compatible_packed_cache(root: Path, identity: dict) -> Path | None:
+    requested = int(identity["max_rows"])
+    selection = _packed_selection(identity)
+    candidates = []
+    for path in root.glob("*/manifest.json"):
+        if path.parent.name.startswith("."):
+            continue  # An interrupted staging directory is never a cache.
+        try:
+            manifest = json.loads(path.read_text("utf-8"))
+            previous = manifest["identity"]
+            rows, cap = int(manifest["rows"]), int(previous["max_rows"])
+            if (manifest.get("schema") != PACKED_SCHEMA or rows < 1 or rows > cap
+                    or _packed_selection(previous) != selection):
+                continue
+            expected_key = hashlib.sha256(_json(previous).encode()).hexdigest()
+            if manifest.get("key") != expected_key or path.parent.name != expected_key:
+                continue
+            # A short source pass is complete. Hitting its old budget is not
+            # evidence of EOF: never cycle that prefix for a larger request.
+            if rows >= requested or rows < cap:
+                candidates.append((rows, expected_key, path.parent))
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    return min(candidates)[2] if candidates else None
 
 
 def prepare_sprint_cache(cfg: Mapping[str, Any], tokenizer: Any, *, progress=print) -> SprintPackedCache:
     """Pack a bounded corpus pass once; subsequent runs only map fixed rows."""
+    started = time.perf_counter()
     identity = _packed_identity(cfg, tokenizer)
     key = hashlib.sha256(_json(identity).encode()).hexdigest()
     root = Path(cfg.get("packed_cache_dir") or PATHS.cache / "sprint-packed")
@@ -201,8 +333,19 @@ def prepare_sprint_cache(cfg: Mapping[str, Any], tokenizer: Any, *, progress=pri
         if cache.manifest["identity"] != identity:
             cache.close()
             raise ValueError("Sprint packed-cache identity mismatch")
-        progress(f"Reusing Sprint packed data: {cache.rows:,} rows")
+        cache.preparation = {"mode": "exact_cache", "seconds": time.perf_counter() - started}
+        progress(f"Reusing Sprint packed data: {cache.rows:,} rows ({cache.preparation['seconds']:.2f}s)")
         return cache
+    compatible = _compatible_packed_cache(root, identity)
+    if compatible is not None:
+        cache = SprintPackedCache(compatible, verify=str(cfg.get("packed_cache_verify", "size")))
+        cache.select_request(identity)
+        cache.preparation = {"mode": "compatible_cache", "seconds": time.perf_counter() - started}
+        progress(f"Reusing compatible Sprint packed data: {cache.rows:,} rows from "
+                 f"{cache.stored_rows:,} cached rows ({cache.preparation['seconds']:.2f}s)")
+        return cache
+    if cfg.get("fixed_token_mix") is not None:
+        raise ValueError("The matching materialized fixed-token dataset is missing; prepare it before training")
     lock = root / f"{key}.lock"
     try:
         fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -215,9 +358,20 @@ def prepare_sprint_cache(cfg: Mapping[str, Any], tokenizer: Any, *, progress=pri
     files = {}
     docs = None
     try:
-        def tokenize(texts):
-            return tokenizer(texts, add_special_tokens=False, return_attention_mask=False, verbose=False)["input_ids"]
-
+        from .sprint_mix import MODE as QUOTA_MODE
+        from .sprint_mix import materialize_quota
+        if cfg.get("corpus_mix") == QUOTA_MODE:
+            payload = materialize_quota(dict(cfg), tokenizer, identity, root, staging, progress=progress)
+            if identity != _packed_identity(cfg, tokenizer):
+                raise ValueError("corpus or tokenizer changed during Sprint quota packing")
+            manifest = {"schema": PACKED_SCHEMA, "key": key, "identity": identity, **payload}
+            _write_json(staging / "manifest.json", manifest)
+            staging.rename(destination)
+            cache = SprintPackedCache(destination, verify=str(cfg.get("packed_cache_verify", "size")))
+            cache.preparation = {"mode": "built_token_quota", "seconds": time.perf_counter() - started}
+            progress(f"Sprint token quotas ready: {cache.rows:,} rows in {cache.preparation['seconds']:.2f}s")
+            return cache
+        tokenize = make_sprint_tokenize(tokenizer)
         reader = prepare_for_training(cfg, tokenizer, tokenize, progress=progress)
         docs = iter_corpus_docs(
             cfg["corpora"], cfg.get("domains"), splits=cfg.get("splits"),
@@ -231,10 +385,15 @@ def prepare_sprint_cache(cfg: Mapping[str, Any], tokenizer: Any, *, progress=pri
         chat = cfg.get("objective") == OBJECTIVE_CHAT_SFT
         pack_opts = dict(seq_len=int(cfg["seq_len"]), micro_batch=1, max_batches=int(cfg["max_rows"]))
         packed = (ChatSFTBatches(docs, tokenizer, **pack_opts) if chat else
-                  PackedBatches(docs, tokenize, eos_token_id=tokenizer.eos_token_id,
-                                tokenize_chunk=int(cfg.get("tokenize_chunk", 8)),
-                                max_text_chars=int(cfg.get("max_text_chars", DEFAULT_TEXT_CHUNK_CHARS)),
-                                **pack_opts))
+                  SprintCausalBatches(
+                      docs, tokenize, seq_len=int(cfg["seq_len"]), max_rows=int(cfg["max_rows"]),
+                      eos_token_id=tokenizer.eos_token_id,
+                      rows_per_chunk=max(1, min(256, 2**20 // int(cfg["seq_len"]))),
+                      tokenize_chunk=int(cfg.get("tokenize_chunk", 8)),
+                      tokenization_batch_size=int(cfg.get("tokenization_batch_size", 128))
+                      if getattr(tokenize, "supports_batched_tokenization", False)
+                      else int(cfg.get("tokenize_chunk", 8)),
+                      max_text_chars=int(cfg.get("max_text_chars", DEFAULT_TEXT_CHUNK_CHARS))))
         vocab = len(tokenizer)
         if vocab > 0x7FFFFFFF:
             raise ValueError("Sprint token vocabulary exceeds the supported int32 label range")
@@ -244,21 +403,32 @@ def prepare_sprint_cache(cfg: Mapping[str, Any], tokenizer: Any, *, progress=pri
         files = {name: (staging / f"{name}.bin").open("wb") for name in specs}
         hashes = {name: hashlib.sha256() for name in specs}
         rows = 0
+        next_progress = 10000
+        packing_started = time.perf_counter()
         progress("Packing Sprint fixed-length training rows")
         for batch in packed:
             ids = np.asarray(batch["input_ids"])
+            if ids.ndim != 2 or ids.shape[1] != int(cfg["seq_len"]) or not len(ids):
+                raise ValueError("Sprint packing requires complete fixed-length rows")
+            count = len(ids)
+            if rows + count > int(cfg["max_rows"]):
+                raise ValueError("Sprint packing exceeded its row budget")
             if ids.min() < 0 or ids.max() >= vocab:
                 raise ValueError("packed token ID lies outside the tokenizer vocabulary")
             for name, dtype in specs.items():
                 values = np.asarray(batch[name], dtype=dtype)
-                if values.shape != (1, int(cfg["seq_len"])):
+                if values.shape != ids.shape:
                     raise ValueError("Sprint packing requires complete fixed-length rows")
                 payload = values.tobytes()
                 files[name].write(payload)
                 hashes[name].update(payload)
-            rows += 1
-            if rows % 10000 == 0:
-                progress(f"Packing Sprint data: {rows:,} rows, {rows * cfg['seq_len']:,} token slots")
+            rows += count
+            if rows >= next_progress:
+                elapsed = time.perf_counter() - packing_started
+                rate = rows * cfg['seq_len'] / max(elapsed, 1e-9)
+                progress(f"Packing Sprint data: {rows:,} rows, {rows * cfg['seq_len']:,} token slots "
+                         f"({rate:,.0f} tokens/s, {elapsed:.1f}s)")
+                next_progress = (rows // 10000 + 1) * 10000
         for stream in files.values():
             stream.flush()
             os.fsync(stream.fileno())
@@ -275,7 +445,10 @@ def prepare_sprint_cache(cfg: Mapping[str, Any], tokenizer: Any, *, progress=pri
         }
         _write_json(staging / "manifest.json", manifest)
         staging.rename(destination)
-        return SprintPackedCache(destination)
+        cache = SprintPackedCache(destination)
+        cache.preparation = {"mode": "built", "seconds": time.perf_counter() - started}
+        progress(f"Sprint packed data ready: {rows:,} rows in {cache.preparation['seconds']:.2f}s")
+        return cache
     finally:
         for stream in files.values():
             stream.close()
@@ -297,9 +470,23 @@ class SprintPackedCache:
         if self.manifest.get("schema") != PACKED_SCHEMA or verify not in {"size", "sha256"}:
             raise ValueError("unsupported Sprint packed cache or verification mode")
         self.rows, self.seq_len = int(self.manifest["rows"]), int(self.manifest["seq_len"])
+        self.stored_rows = self.rows
+        self.key = self.manifest["key"]
+        self.data_stats = self.manifest["data_stats"]
+        self.preparation = {}
         if self.rows < 1 or self.seq_len < 2:
             raise ValueError("invalid Sprint packed-cache dimensions")
+        identity = self.manifest["identity"]
+        if (self.seq_len != int(identity["selection"]["seq_len"])
+                or self.rows > int(identity["max_rows"])
+                or self.key != hashlib.sha256(_json(identity).encode()).hexdigest()):
+            raise ValueError("Sprint packed-cache manifest does not match its identity")
+        fields = {"input_ids", "labels", "attention_mask"} if (
+            identity["selection"]["objective"] == OBJECTIVE_CHAT_SFT) else {"input_ids"}
+        if set(self.manifest["files"]) != fields:
+            raise ValueError("Sprint packed-cache fields do not match its objective")
         self.arrays = {}
+        self.provenance = {}
         self._orders = {}
         try:
             for name, info in self.manifest["files"].items():
@@ -307,6 +494,9 @@ class SprintPackedCache:
                     raise ValueError("invalid Sprint packed-cache field")
                 path = self.root / f"{name}.bin"
                 dtype = np.dtype(info["dtype"])
+                allowed = {"input_ids": {"<u2", "<u4"}, "labels": {"<i4"}, "attention_mask": {"|u1"}}
+                if dtype.str not in allowed[name]:
+                    raise ValueError(f"invalid Sprint packed-cache dtype: {name}")
                 expected = self.rows * self.seq_len * dtype.itemsize
                 if path.stat().st_size != expected or expected != info["bytes"]:
                     raise ValueError(f"Sprint packed-cache size mismatch: {name}")
@@ -317,14 +507,88 @@ class SprintPackedCache:
                 self.arrays[name] = np.memmap(path, dtype=dtype, mode="r", shape=(self.rows, self.seq_len))
             if "input_ids" not in self.arrays or ("labels" in self.arrays) != ("attention_mask" in self.arrays):
                 raise ValueError("incomplete Sprint packed cache")
+            from .sprint_mix import MODE as QUOTA_MODE
+            from .sprint_mix import PROVENANCE_DTYPES, VERSION, _verify_file
+            quota = identity["selection"].get(QUOTA_MODE)
+            provenance = self.manifest.get("row_provenance")
+            if bool(quota) != bool(provenance):
+                raise ValueError("Sprint quota cache is missing its row provenance")
+            if provenance:
+                corpora = identity["selection"]["corpora"]
+                if (provenance.get("version") != VERSION or provenance.get("corpora") != corpora
+                        or set(provenance.get("files", {})) != set(PROVENANCE_DTYPES)
+                        or set(provenance.get("pools", {})) != set(corpora)):
+                    raise ValueError("invalid Sprint quota row provenance")
+                for name, dtype in PROVENANCE_DTYPES.items():
+                    info = provenance["files"][name]
+                    if info["dtype"] != dtype:
+                        raise ValueError("invalid Sprint quota provenance dtype")
+                    path = self.root / f"{name}.bin"
+                    _verify_file(path, info, self.rows * np.dtype(dtype).itemsize, verify=verify)
+                    self.provenance[name] = np.memmap(path, dtype=dtype, mode="r", shape=(self.rows,))
+                sources, positions = self.provenance["row_source"], self.provenance["row_pool_index"]
+                if np.any(sources >= len(corpora)):
+                    raise ValueError("invalid Sprint quota source index")
+                for index, cid in enumerate(corpora):
+                    selected = sources == index
+                    if (np.any(positions[selected] >= int(provenance["pools"][cid]["rows"]))
+                            or int(selected.sum()) != int(quota["rows_by_corpus"][cid])):
+                        raise ValueError("Sprint quota provenance does not match allocated source rows")
         except BaseException:
             self.close()
             raise
+
+    def select_request(self, identity: dict) -> None:
+        """Expose a budget-sized view without copying or changing stored files."""
+        if _packed_selection(identity) != _packed_selection(self.manifest["identity"]):
+            raise ValueError("Sprint packed-cache selection mismatch")
+        requested = int(identity["max_rows"])
+        if requested < 1 or (self.stored_rows < requested
+                             and self.stored_rows >= int(self.manifest["identity"]["max_rows"])):
+            raise ValueError("Sprint packed cache does not cover the requested source pass")
+        self.rows = min(requested, self.stored_rows)
+        self._orders.clear()
+        self.data_stats = self.manifest["data_stats"]
+        # Use the same logical key a fresh pack of this request would receive.
+        # Resume therefore does not depend on which physical cache was found.
+        self.key = hashlib.sha256(_json(identity).encode()).hexdigest()
+        if self.rows < self.stored_rows:
+            slots = self.rows * self.seq_len
+            targets = self.rows * (self.seq_len - 1)
+            tokens = {"forwarded_model_slots": slots, "model_target_slots": targets}
+            if "labels" not in self.arrays:
+                tokens.update(forwarded_real_inputs=slots, covered_rendered_positions=slots,
+                              optimizer_supervised_targets=targets, ignored_target_slots=0,
+                              padding_inputs=0, packing_replay_inputs=0)
+                if self.manifest["identity"]["selection"].get("fixed_token_mix"):
+                    # A sampled prefix can already repeat source-pool positions;
+                    # the aggregate full-mix receipt cannot attribute its repeats.
+                    tokens.pop("covered_rendered_positions")
+                    tokens.pop("packing_replay_inputs")
+            # A v1 cache has no per-row source/rendering counters. Report only
+            # known prefix totals; retain full backing statistics separately.
+            self.data_stats = {
+                "scope": "packed_prefix", "sequences": self.rows, "tokens": tokens,
+                "source_attribution": "unavailable for this cached prefix",
+            }
 
     def close(self) -> None:
         for array in getattr(self, "arrays", {}).values():
             array._mmap.close()
         self.arrays = {}
+        for array in getattr(self, "provenance", {}).values():
+            array._mmap.close()
+        self.provenance = {}
+
+    def prefix_data_stats(self, rows: int) -> dict:
+        """Exact source/replay exposure for a consumed prefix of a quota cache."""
+        from .sprint_mix import quota_prefix_stats
+        if not self.provenance:
+            raise ValueError("this legacy packed cache has no exact per-row source provenance")
+        if isinstance(rows, bool) or int(rows) != rows or not 0 <= rows <= self.rows:
+            raise ValueError("invalid token quota prefix length")
+        receipt = self.manifest["row_provenance"]
+        return quota_prefix_stats(self.provenance, receipt["corpora"], receipt["pools"], self.seq_len, int(rows))
 
     def _indices(self, cursor: int, count: int, seed: int, block_rows: int) -> np.ndarray:
         epoch, offset = divmod(cursor, self.rows)
@@ -367,7 +631,7 @@ class _CacheBatches:
         self.pin_memory = pin_memory
 
     def data_stats(self):
-        return {"next_row": self.cursor, "packed_key": self.cache.manifest["key"]}
+        return {"next_row": self.cursor, "packed_key": self.cache.key}
 
     def __iter__(self):
         while self.cursor < self.limit:
@@ -417,6 +681,7 @@ class SprintStepResult:
     tokens: int
     supervised_tokens: int
     real_tokens: int
+    preclip_grad_norm: torch.Tensor | None = None
 
 
 class SprintCPUOffloadAdamW(CPUOffloadAdamW):
@@ -699,6 +964,8 @@ class SprintStepEngine:
         self.parameter_dtype = {"bf16": "bfloat16", "fp32": "float32"}.get(dtype_name, dtype_name)
         if self.parameter_dtype not in {"float32", "bfloat16"}:
             raise ValueError("Sprint parameter_dtype must be bfloat16 or float32")
+        if getattr(getattr(model, "config", None), "attention_type", "sdpa") == "kda" and self.parameter_dtype != "float32":
+            raise ValueError("Sprint KDA training currently requires FP32 weights; select the GPU optimizer preset")
         self.optimizer_state_offload = str(cfg.get("optimizer_state_offload", "cpu"))
         if self.optimizer_state_offload not in {"cpu", "none"}:
             raise ValueError("Sprint optimizer_state_offload must be cpu or none")
@@ -850,11 +1117,12 @@ class SprintStepEngine:
                 else:
                     loss_sum.add_(weighted.detach())
         clip = float(self.cfg.get("grad_clip", 1.0))
+        grad_norm = None
         if clip > 0:
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), clip, foreach=True)
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), clip, foreach=True)
         self.optimizer.step()
         return SprintStepResult(loss_sum, sum(batch["num_tokens"] for batch in batches), total,
-                                sum(batch["real_tokens"] for batch in batches))
+                                sum(batch["real_tokens"] for batch in batches), grad_norm)
 
     @torch.no_grad()
     def evaluate(self, cpu_batches: Iterable[Mapping[str, Any]], max_batches: int | None = None) -> dict:
@@ -906,7 +1174,11 @@ def _model_contract(config) -> dict:
     keys = ("vocab_size", "hidden_size", "intermediate_size", "num_hidden_layers", "num_attention_heads",
             "max_position_embeddings", "tie_word_embeddings", "mlp_type", "rope_theta", "rms_norm_eps",
             "initializer_range", "loss_backend", "loss_chunk_size", "bos_token_id", "eos_token_id", "pad_token_id")
-    return {key: getattr(config, key, None) for key in keys}
+    return {**{key: getattr(config, key, None) for key in keys},
+            "ple_type": getattr(config, "ple_type", "none"), "ple_lanes": getattr(config, "ple_lanes", 4),
+            "attention_type": getattr(config, "attention_type", "sdpa"),
+            "kda_backend": getattr(config, "kda_backend", "auto"),
+            "kda_disable_recompute": getattr(config, "kda_disable_recompute", True)}
 
 
 def _resume_contract(cfg: Mapping[str, Any], cache: SprintPackedCache, engine: SprintStepEngine) -> dict:
@@ -918,7 +1190,7 @@ def _resume_contract(cfg: Mapping[str, Any], cache: SprintPackedCache, engine: S
                          "cpu_threads": engine.cpu_threads,
                          "offload_bucket_mb": cfg.get("offload_bucket_mb", 32)
                                               if engine.optimizer_state_offload == "cpu" else None},
-            "packed_key": cache.manifest["key"],
+            "packed_key": cache.key,
             "model_config": _model_contract(engine.model.config), "compute_dtype": engine.compute_dtype,
             "parameter_dtype": engine.parameter_dtype, "optimizer_state_offload": engine.optimizer_state_offload}
 
@@ -953,6 +1225,10 @@ def save_sprint_checkpoint(path: str | Path, engine: SprintStepEngine, tokenizer
     try:
         engine.model.save_pretrained(temporary)
         tokenizer.save_pretrained(temporary)
+        from ..infer.prompt_format import PROMPT_FORMAT_FILENAME, build_prompt_format_contract
+
+        _write_json(temporary / PROMPT_FORMAT_FILENAME,
+                    build_prompt_format_contract(state.get("config") or engine.cfg, tokenizer))
         payload = dict(state)
         payload.update(schema=TRAINER_SCHEMA, optimizer=engine.optimizer.state_dict(), rng=_rng_state())
         torch.save(payload, temporary / "trainer.pt")
@@ -982,6 +1258,7 @@ def _checkpoint_reference(initialization: Mapping[str, Any]) -> Path:
 def _load_training_inputs(cfg: dict, resume_path: Path | None):
     from transformers import AutoTokenizer
 
+    from ..infer.prompt_format import build_prompt_format_contract, checkpoint_prompt_format_contract
     from ..models.sprint import SprintConfig, SprintForCausalLM, plan_sprint_model
 
     initialization = cfg["initialization"]
@@ -989,6 +1266,17 @@ def _load_training_inputs(cfg: dict, resume_path: Path | None):
                              if initialization.get("mode") in {"checkpoint", "resume"} else None)
     if parent:
         tokenizer = AutoTokenizer.from_pretrained(parent, local_files_only=True)
+        inherited_format = checkpoint_prompt_format_contract(parent, tokenizer)
+        if (resume_path is not None and inherited_format is not None and "prompt_format_contract" in cfg
+                and cfg["prompt_format_contract"] != inherited_format):
+            raise ValueError("exact resume cannot change the checkpoint prompt-format contract")
+        if "prompt_format_contract" not in cfg:
+            if inherited_format is not None:
+                cfg["prompt_format_contract"] = inherited_format
+        # Resolve/validate before loading weights or preparing any training data.
+        # New chat SFT upgrades a raw contract; an existing chat format must
+        # agree with the actual tokenizer used to render this training run.
+        cfg["prompt_format_contract"] = build_prompt_format_contract(cfg, tokenizer)
         model = SprintForCausalLM.from_pretrained(parent, local_files_only=True, dtype="auto")
         tokenizer_ref = cfg.get("tokenizer_id") or cfg.get("tokenizer_ref") or initialization.get("tokenizer_ref")
         if tokenizer_ref:
@@ -1020,6 +1308,10 @@ def _load_training_inputs(cfg: dict, resume_path: Path | None):
                 mlp_type=str(values.get("mlp_type", "gelu")),
                 tie_word_embeddings=bool(values.get("tie_word_embeddings", True)),
                 profile=cfg.get("shape_profile", "throughput"),
+                ple_type=values.get("ple_type", "none"), ple_lanes=values.get("ple_lanes", 4),
+                attention_type=values.get("attention_type", "sdpa"),
+                kda_backend=values.get("kda_backend", "auto"),
+                kda_disable_recompute=values.get("kda_disable_recompute", True),
             )
             values = {**model_config.to_dict(), **values}
         values.setdefault("max_position_embeddings", cfg["seq_len"])
@@ -1050,6 +1342,10 @@ def _register_checkpoint(cfg: dict, path: Path, engine: SprintStepEngine, metada
     if not identifier:
         return
     parameters = sum(parameter.numel() for parameter in engine.model.parameters())
+    from ..models.sprint import estimate_parameter_breakdown
+
+    metadata = {**metadata, "model_config": engine.model.config.to_dict(),
+                "parameter_breakdown": estimate_parameter_breakdown(engine.model.config)}
     db.execute(
         "INSERT INTO checkpoints(id,name,created_at,kind,source,ref,arch,params_b,hidden_size,num_layers,path,meta_json) "
         "VALUES(?,?,?,'sprint','local',?,'SprintForCausalLM',?,?,?,?,?) "
@@ -1111,6 +1407,20 @@ def run_sprint_training(config: dict, rd: Path) -> dict:
 
     progress("Preparing Sprint model and packed data")
     model, tokenizer, parent = _load_training_inputs(cfg, resume_path)
+    from ..models.sprint import estimate_parameter_breakdown
+
+    # Persist the architecture actually loaded/planned, including inherited PLE.
+    cfg["model_config"] = model.config.to_dict()
+    cfg["parameter_breakdown"] = estimate_parameter_breakdown(model.config)
+    from ..infer.prompt_format import build_prompt_format_contract
+
+    cfg["prompt_format_contract"] = build_prompt_format_contract(cfg, tokenizer)
+    generation_template = None
+    if cfg["generation_eval"]["enabled"] and cfg["generation_eval"]["options"]["prompt_format"] == "tokenizer_chat":
+        if "chat" not in cfg["prompt_format_contract"]["supported_modes"]:
+            raise ValueError("generation_eval tokenizer_chat requires a recorded trained chat format; "
+                             "use plain text for this text-continuation checkpoint")
+        generation_template = cfg["prompt_format_contract"]["chat_template"]
     engine = SprintStepEngine(model, {**cfg, "_restore_optimizer": saved is not None}, device)
     cfg["cpu_threads"] = engine.cpu_threads
     if engine.cpu_optimizer_kernel is not None:
@@ -1123,7 +1433,12 @@ def run_sprint_training(config: dict, rd: Path) -> dict:
         if saved:
             # Checkpoints predating attention tuning used PyTorch's automatic
             # dispatch. Preserve their identity while rejecting a new override.
-            saved_contract = {**saved["contract"], "training": {
+            saved_contract = {**saved["contract"],
+                              "model_config": {"ple_type": "none", "ple_lanes": 4,
+                                               "attention_type": "sdpa", "kda_backend": "auto",
+                                               "kda_disable_recompute": True,
+                                               **saved["contract"]["model_config"]},
+                              "training": {
                 "attention_backend": "auto",
                 "cpu_optimizer_kernel": "native" if engine.optimizer_state_offload == "cpu" else None,
                 "cpu_threads": saved["config"].get("cpu_threads", engine.cpu_threads),
@@ -1144,6 +1459,8 @@ def run_sprint_training(config: dict, rd: Path) -> dict:
             eval_cfg = {**cfg, "corpora": cfg["eval_corpora"], "splits": cfg["eval_splits"],
                         "max_rows": cfg["eval_steps"] * cfg["micro_batch"], "shuffle_buffer": 1,
                         "corpus_mix": "concatenate", "corpus_weights": {}, "source_max_ratio": None}
+            eval_cfg.pop("fixed_token_mix", None)
+            eval_cfg.pop("quota_row_filter", None)
             eval_cache = prepare_sprint_cache(eval_cfg, tokenizer, progress=progress)
         preparation_seconds = time.perf_counter() - started
         runtime = {"device": str(device), "compute_dtype": engine.compute_dtype, "parameter_dtype": engine.parameter_dtype,
@@ -1161,7 +1478,13 @@ def run_sprint_training(config: dict, rd: Path) -> dict:
                    "torch_compile": bool(cfg["torch_compile"]), "compile_mode": cfg["compile_mode"],
                    "gradient_checkpointing": cfg["gradient_checkpointing"],
                    "parameters": sum(p.numel() for p in model.parameters()),
-                   "packed_cache": str(cache.root), "packed_key": cache.manifest["key"],
+                   "ple_type": model.config.ple_type, "ple_lanes": model.config.ple_lanes,
+                   "attention_type": model.config.attention_type, "kda_backend": model.config.kda_backend,
+                   "kda_disable_recompute": model.config.kda_disable_recompute,
+                   "parameter_breakdown": cfg["parameter_breakdown"],
+                   "packed_cache": str(cache.root), "packed_key": cache.key,
+                   "packed_backing_key": cache.manifest["key"], "packed_stored_rows": cache.stored_rows,
+                   "data_preparation": cache.preparation,
                    "packed_rows": cache.rows, "token_budget_unit": "forwarded_model_slots",
                    "requested_token_budget": cfg["token_budget"], "planned_token_slots": limit * cfg["seq_len"],
                    "preparation_seconds": preparation_seconds}
@@ -1181,21 +1504,67 @@ def run_sprint_training(config: dict, rd: Path) -> dict:
         window_targets, window_tokens = 0, 0
         last_loss = float(saved.get("loss", 0.0)) if saved else 0.0
         eval_metrics = {}
+        generation_metrics = {}
+        generation_settings = cfg["generation_eval"]
+        last_generation_step = None
+        gradient_sum = torch.zeros((), device=device)
+        gradient_clipped = torch.zeros((), device=device)
+        gradient_count = 0
+        last_gradient_norm = None
+        gradient_metrics = {}
         last_checkpoint = None
 
         def state():
             return {"config": cfg, "contract": contract, "step": step, "next_row": cursor,
                     "tokens": tokens, "supervised_tokens": supervised, "real_tokens": real_tokens,
-                    "loss": last_loss, "parent_checkpoint": parent}
+                    "loss": last_loss, "parent_checkpoint": parent,
+                    "generation_evaluation": generation_metrics,
+                    "consumed_data_stats": (cache.prefix_data_stats(cursor) if cache.provenance else None)}
+
+        def check_generation():
+            nonlocal generation_metrics, last_generation_step
+            from .sprint_quality import evaluate_sprint_generation
+
+            @contextmanager
+            def context():
+                with engine._attention_context(), engine._autocast():
+                    yield
+
+            receipt = evaluate_sprint_generation(engine.model, tokenizer,
+                config=generation_settings["options"], context_factory=context,
+                chat_template=generation_template)
+            receipt.update(step=step, input_slots=tokens, supervised_targets=supervised)
+            receipt_path = rd / "generation-eval" / f"step-{step:08d}.json"
+            _write_json(receipt_path, receipt)
+            details = receipt["summary"]
+            generation_metrics = {"generation_eval_step": step, "generation_eval_status": details["status"],
+                "generation_eval_path": str(receipt_path), "generation_eval_summary": details}
+            last_generation_step = step
+            if details["nonfinite_outputs"]:
+                raise FloatingPointError("Sprint generated nonfinite logits; see the generation evaluation receipt")
+            if details["repetition_flagged_outputs"]:
+                print(f"Generated-text check at step {step:,}: repetition in "
+                      f"{details['repetition_flagged_outputs']}/{details['outputs']} samples; "
+                      "falling loss does not establish usable quality.", flush=True)
+            return receipt
 
         def publish(stage="train"):
             nonlocal window_loss, window_targets, window_tokens, last_loss
+            nonlocal gradient_sum, gradient_clipped, gradient_count, gradient_metrics
             if window_targets:
                 last_loss = float((window_loss / window_targets).item())
                 if not math.isfinite(last_loss):
                     raise FloatingPointError("Sprint loss is not finite; reduce learning rate or inspect the data")
             elapsed = time.perf_counter() - training_start
             train_elapsed = max(1e-9, elapsed - overhead_seconds)
+            if gradient_count:
+                latest, mean, fraction = torch.stack((last_gradient_norm,
+                    gradient_sum / gradient_count, gradient_clipped / gradient_count)).detach().cpu().tolist()
+                if not all(math.isfinite(value) for value in (latest, mean, fraction)):
+                    raise FloatingPointError("Sprint pre-clipping gradient norm is not finite")
+                gradient_metrics = {"gradient_norm": latest, "gradient_norm_mean": mean,
+                    "gradient_clip_fraction": fraction, "gradient_norm_steps": gradient_count,
+                    "gradient_clip_coefficient": min(1.0, cfg["grad_clip"] / (latest + 1e-6))}
             result = {"stage": stage, "step": step, "max_steps": cfg["max_steps"], "loss": last_loss,
                       "lr": engine.optimizer.param_groups[0]["lr"], "tokens": tokens,
                       "forwarded_model_tokens": tokens, "supervised_tokens": supervised,
@@ -1204,12 +1573,18 @@ def run_sprint_training(config: dict, rd: Path) -> dict:
                       "end_to_end_tokens_per_second": (tokens - initial_tokens) / max(elapsed + preparation_seconds, 1e-9),
                       "training_seconds": train_elapsed, "elapsed_seconds": elapsed,
                       "next_row": cursor, "epoch": cursor // cache.rows,
-                      "msg": f"{tokens:,} token slots; {step:,} optimizer steps", **eval_metrics}
+                      "msg": f"{tokens:,} token slots; {step:,} optimizer steps", **eval_metrics,
+                      **gradient_metrics, **generation_metrics}
+            if generation_metrics.get("generation_eval_status") == "repetition_detected":
+                result["msg"] += "; generated text is repeating — inspect the saved samples"
             _write_json(rd / "progress.json", result)
             with (rd / "metrics.jsonl").open("a", encoding="utf-8") as stream:
                 stream.write(_json(result) + "\n")
             window_loss = torch.zeros((), device=device)
             window_targets, window_tokens = 0, 0
+            gradient_sum = torch.zeros((), device=device)
+            gradient_clipped = torch.zeros((), device=device)
+            gradient_count = 0
             return result
 
         with batch_stream(batches) as iterator:
@@ -1231,22 +1606,35 @@ def run_sprint_training(config: dict, rd: Path) -> dict:
                 window_loss.add_(result.loss * result.supervised_tokens)
                 window_targets += result.supervised_tokens
                 window_tokens += result.tokens
+                if result.preclip_grad_norm is not None:
+                    last_gradient_norm = result.preclip_grad_norm.detach()
+                    gradient_sum.add_(last_gradient_norm)
+                    gradient_clipped.add_(last_gradient_norm > cfg["grad_clip"])
+                    gradient_count += 1
                 evaluate = eval_cache is not None and step % cfg["eval_interval"] == 0
+                generate = generation_settings["enabled"] and step % generation_settings["interval"] == 0
                 save = cfg["save_interval"] and step % cfg["save_interval"] == 0
-                if step % cfg["log_interval"] == 0 or evaluate or save:
+                if step % cfg["log_interval"] == 0 or evaluate or generate or save:
                     publish()
-                if evaluate or save:
+                if evaluate or generate or save:
                     if device.type == "cuda":
                         torch.cuda.synchronize(device)
                     overhead_start = time.perf_counter()
                     if evaluate:
                         eval_source = _CacheBatches(eval_cache, cfg, 0, eval_cache.rows, pin_memory=pin)
                         eval_metrics = engine.evaluate(eval_source, max_batches=cfg["eval_steps"])
+                        eval_metrics["eval_step"] = step
+                    if generate:
+                        check_generation()
                     if save:
                         last_checkpoint = save_sprint_checkpoint(rd / "checkpoints" / f"step-{step:08d}",
                                                                  engine, tokenizer, state())
                         _write_json(rd / "latest_checkpoint.json", {"path": str(last_checkpoint), "step": step})
                     overhead_seconds += time.perf_counter() - overhead_start
+                    # Publish the completed evaluation at its actual step, even
+                    # when stopping immediately after this checkpoint boundary.
+                    if evaluate or generate:
+                        publish()
                 if (rd / "STOP").exists():
                     break
         if device.type == "cuda":
@@ -1254,6 +1642,10 @@ def run_sprint_training(config: dict, rd: Path) -> dict:
         train_seconds = time.perf_counter() - training_start - overhead_seconds
         if step == 0:
             raise ValueError("Sprint consumed no trainable data")
+        if generation_settings["enabled"] and last_generation_step != step:
+            evaluation_start = time.perf_counter()
+            check_generation()
+            overhead_seconds += time.perf_counter() - evaluation_start
         summary = publish("complete")
         save_start = time.perf_counter()
         save_sprint_checkpoint(output, engine, tokenizer, state())
@@ -1264,7 +1656,9 @@ def run_sprint_training(config: dict, rd: Path) -> dict:
                         "sequence_length": cfg["seq_len"], "training_seconds": train_seconds,
                         "preparation_seconds": preparation_seconds,
                         "checkpoint_seconds": time.perf_counter() - save_start,
-                        "runtime": runtime, "packed_data_stats": cache.manifest["data_stats"],
+                        "runtime": runtime, "packed_data_stats": cache.data_stats,
+                        "packed_backing_data_stats": cache.manifest["data_stats"],
+                        "consumed_data_stats": (cache.prefix_data_stats(cursor) if cache.provenance else None),
                         "stop_reason": "stop_file" if (rd / "STOP").exists() else
                                        "data_exhausted" if cursor >= limit and limit < cfg["max_rows"] else "budget_complete",
                         "last_periodic_checkpoint": str(last_checkpoint) if last_checkpoint else None})

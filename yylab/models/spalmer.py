@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Iterable, Mapping, Sequence
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -382,7 +383,10 @@ def _scanned_expert_precision(
         reason = f"checkpoint declares unsupported expert precision pair {weight!r}/{activation!r}"
     elif backend not in {"auto", "native"}:
         reason = f"checkpoint declares unsupported expert backend {backend!r}"
-    elif master != ("float32" if weight == "float32" else "bfloat16"):
+    elif master != ("float32" if weight == "float32" else "bfloat16") and not (
+        master == "float32"
+        and (weight, activation) in {("bfloat16", "bfloat16"), ("nvfp4", "nvfp4")}
+    ):
         reason = (
             "checkpoint expert master dtype does not match its execution pair: "
             f"{master!r} for {weight!r}/{activation!r}"
@@ -404,6 +408,13 @@ def _scanned_expert_precision(
         "ple_backend": ple_backend,
         "executable": not reason,
         "rejection_reason": reason or None,
+        "training_recipe": (
+            "torchao_nvfp4_training_sm120_fp32_master"
+            if (master, weight, activation) == ("float32", "nvfp4", "nvfp4")
+            else "fp32_master_bf16_amp"
+            if (master, weight, activation) == ("float32", "bfloat16", "bfloat16")
+            else None
+        ),
     }
 
 
@@ -424,6 +435,25 @@ def _require_native_precision_capability(
     """Require the checkpoint's exact pair and dispatch mode on this device."""
 
     precision = _plain_dict(scanned.get("expert_precision"), "expert_precision")
+    if (
+        precision.get("master_dtype"),
+        precision.get("weight_format"),
+        precision.get("activation_format"),
+    ) == ("float32", "nvfp4", "nvfp4"):
+        if precision.get("execution") != "loop":
+            raise RuntimeError("standard NVFP4 training requires dense per-expert execution")
+        from spalmer.experts.standard_nvfp4 import require_standard_nvfp4
+
+        return {
+            "provider_id": require_standard_nvfp4(device),
+            "weight_format": "nvfp4",
+            "activation_format": "nvfp4",
+            "forward_available": True,
+            "backward_available": True,
+            "grouped_available": False,
+            "verified": True,
+            "detail": "FP32 masters; upstream NVFP4 training with SM120 stochastic rounding",
+        }
     from spalmer.precision import detect_precision_capabilities
 
     report = detect_precision_capabilities(device)
@@ -602,6 +632,17 @@ class _ForwardOutputFacade:
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._output, name)
+
+
+def _native_compute_context(model: nn.Module):
+    """Keep SPALMER optional until a model declares a standard AMP recipe."""
+
+    experts = getattr(getattr(model, "residency", None), "config", None)
+    if getattr(experts, "expert_master_dtype", None) != "float32":
+        return nullcontext()
+    from spalmer.runtime import model_compute_context
+
+    return model_compute_context(model)
 
 
 class SpalmerCausalLMFacade(nn.Module):
@@ -835,41 +876,44 @@ class SpalmerCausalLMFacade(nn.Module):
         return_dict: bool | None = None,
         **kwargs: Any,
     ) -> object:
-        del use_cache, return_dict
+        del return_dict
+        if use_cache is not None:
+            kwargs["use_cache"] = use_cache
         if self.recurrent:
             # NLL scoring and context compaction call the facade directly; they
             # must run at the loaded depth rather than the checkpoint default.
             kwargs.setdefault("recurrence_steps", self.recurrence_steps)
-        if not output_hidden_states:
-            return self.model(
-                input_ids,
-                attention_mask=attention_mask,
-                labels=labels,
-                **kwargs,
-            )
+        with _native_compute_context(self.model):
+            if not output_hidden_states:
+                return self.model(
+                    input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                    **kwargs,
+                )
 
-        lm_head = getattr(self.model, "lm_head", None)
-        if not isinstance(lm_head, nn.Module):
-            raise TypeError("SPALMER model does not expose its language-model head")
-        captured: list[Tensor] = []
+            lm_head = getattr(self.model, "lm_head", None)
+            if not isinstance(lm_head, nn.Module):
+                raise TypeError("SPALMER model does not expose its language-model head")
+            captured: list[Tensor] = []
 
-        def capture_hidden(_module: nn.Module, args: tuple[object, ...]) -> None:
-            if args and isinstance(args[0], Tensor):
-                captured.append(args[0])
+            def capture_hidden(_module: nn.Module, args: tuple[object, ...]) -> None:
+                if args and isinstance(args[0], Tensor):
+                    captured.append(args[0])
 
-        handle = lm_head.register_forward_pre_hook(capture_hidden)
-        try:
-            output = self.model(
-                input_ids,
-                attention_mask=attention_mask,
-                labels=labels,
-                **kwargs,
-            )
-        finally:
-            handle.remove()
-        if not captured:
-            raise RuntimeError("SPALMER language-model head did not receive hidden states")
-        return _ForwardOutputFacade(output, captured[-1])
+            handle = lm_head.register_forward_pre_hook(capture_hidden)
+            try:
+                output = self.model(
+                    input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                    **kwargs,
+                )
+            finally:
+                handle.remove()
+            if not captured:
+                raise RuntimeError("SPALMER language-model head did not receive hidden states")
+            return _ForwardOutputFacade(output, captured[-1])
 
     @torch.inference_mode()
     def generate(
@@ -980,90 +1024,91 @@ class SpalmerCausalLMFacade(nn.Module):
         ran_prefill = False
         self.model.eval()
         try:
-            if streamer is not None:
-                streamer.put(generated.detach().cpu())
-            if max_new_tokens == 0:
-                return generated
-
-            if self.full_pool_routing:
-                # Native paging is a physical placement policy only.  The
-                # router must see the full trained pool, and the selected rows
-                # are materialized by the layer-local cache on demand.
-                output = self.model(generated, attention_mask=mask, **prefill_kwargs)
-                self.last_routing_telemetry = _full_pool_routing_telemetry(
-                    self.model,
-                    expert_paging=self.expert_paging,
-                )
-            elif use_dynamic:
-                from spalmer.experts import choose_inference_residency
-
-                # The kwarg is omitted for flat checkpoints so residency
-                # controllers that predate recurrence keep their signature.
-                decision = choose_inference_residency(
-                    self.model,
-                    generated,
-                    **({"recurrence_steps": steps} if self.recurrent else {}),
-                )
-                output = decision.output
-                request_open = True
-                # Publish the request receipt as soon as residency selection
-                # finishes so chat can display it while recurrent decoding is
-                # still streaming, rather than only after the final token.
-                self.last_routing_telemetry = _residency_telemetry(self.model, decision)
-            else:
-                output = self.model(generated, attention_mask=mask, **prefill_kwargs)
-                self.last_routing_telemetry = _fixed_residency_telemetry(self.model)
-            ran_prefill = True
-            prefill_steps_run = _output_recurrence_steps(output)
-            token_states = output.token_mixer_states
-            channel_states = output.channel_mixer_states
-
-            for index in range(max_new_tokens):
-                scores = output.logits[:, -1]
-                scores = _apply_repetition_guards(
-                    generated,
-                    scores,
-                    repetition_penalty=float(repetition_penalty),
-                    no_repeat_ngram_size=int(no_repeat_ngram_size),
-                )
-                scores = _apply_logits_processors(logits_processor, generated, scores)
-                next_token = _select_token(
-                    scores,
-                    do_sample=do_sample,
-                    temperature=temperature,
-                    top_p=top_p,
-                    top_k=top_k,
-                    generator=generator,
-                )
-                generated = torch.cat((generated, next_token), dim=-1)
+            with _native_compute_context(self.model):
                 if streamer is not None:
-                    streamer.put(next_token.detach().cpu())
-                reached_eos = bool(eos_ids and int(next_token.item()) in eos_ids)
-                externally_stopped = _stopping_requested(
-                    stopping_criteria,
-                    generated,
-                    scores,
-                )
-                if reached_eos or externally_stopped or index + 1 == max_new_tokens:
-                    break
-                step_kwargs = dict(decode_kwargs)
-                if use_warm_start:
-                    latent = getattr(output, "latent_states", None)
-                    if latent is not None:
-                        step_kwargs["latent_init"] = latent[:, -1:, :]
-                output = self.model(
-                    next_token,
-                    token_mixer_states=token_states,
-                    channel_mixer_states=channel_states,
-                    execution_mode="decode",
-                    **step_kwargs,
-                )
-                steps_run = _output_recurrence_steps(output)
-                if steps_run is not None:
-                    decode_steps.append(steps_run)
+                    streamer.put(generated.detach().cpu())
+                if max_new_tokens == 0:
+                    return generated
+
+                if self.full_pool_routing:
+                    # Native paging is a physical placement policy only.  The
+                    # router must see the full trained pool, and the selected rows
+                    # are materialized by the layer-local cache on demand.
+                    output = self.model(generated, attention_mask=mask, **prefill_kwargs)
+                    self.last_routing_telemetry = _full_pool_routing_telemetry(
+                        self.model,
+                        expert_paging=self.expert_paging,
+                    )
+                elif use_dynamic:
+                    from spalmer.experts import choose_inference_residency
+
+                    # The kwarg is omitted for flat checkpoints so residency
+                    # controllers that predate recurrence keep their signature.
+                    decision = choose_inference_residency(
+                        self.model,
+                        generated,
+                        **prefill_kwargs,
+                    )
+                    output = decision.output
+                    request_open = True
+                    # Publish the request receipt as soon as residency selection
+                    # finishes so chat can display it while recurrent decoding is
+                    # still streaming, rather than only after the final token.
+                    self.last_routing_telemetry = _residency_telemetry(self.model, decision)
+                else:
+                    output = self.model(generated, attention_mask=mask, **prefill_kwargs)
+                    self.last_routing_telemetry = _fixed_residency_telemetry(self.model)
+                ran_prefill = True
+                prefill_steps_run = _output_recurrence_steps(output)
                 token_states = output.token_mixer_states
                 channel_states = output.channel_mixer_states
-            return generated
+
+                for index in range(max_new_tokens):
+                    scores = output.logits[:, -1]
+                    scores = _apply_repetition_guards(
+                        generated,
+                        scores,
+                        repetition_penalty=float(repetition_penalty),
+                        no_repeat_ngram_size=int(no_repeat_ngram_size),
+                    )
+                    scores = _apply_logits_processors(logits_processor, generated, scores)
+                    next_token = _select_token(
+                        scores,
+                        do_sample=do_sample,
+                        temperature=temperature,
+                        top_p=top_p,
+                        top_k=top_k,
+                        generator=generator,
+                    )
+                    generated = torch.cat((generated, next_token), dim=-1)
+                    if streamer is not None:
+                        streamer.put(next_token.detach().cpu())
+                    reached_eos = bool(eos_ids and int(next_token.item()) in eos_ids)
+                    externally_stopped = _stopping_requested(
+                        stopping_criteria,
+                        generated,
+                        scores,
+                    )
+                    if reached_eos or externally_stopped or index + 1 == max_new_tokens:
+                        break
+                    step_kwargs = dict(decode_kwargs)
+                    if use_warm_start:
+                        latent = getattr(output, "latent_states", None)
+                        if latent is not None:
+                            step_kwargs["latent_init"] = latent[:, -1:, :]
+                    output = self.model(
+                        next_token,
+                        token_mixer_states=token_states,
+                        channel_mixer_states=channel_states,
+                        execution_mode="decode",
+                        **step_kwargs,
+                    )
+                    steps_run = _output_recurrence_steps(output)
+                    if steps_run is not None:
+                        decode_steps.append(steps_run)
+                    token_states = output.token_mixer_states
+                    channel_states = output.channel_mixer_states
+                return generated
         finally:
             if self.recurrent and ran_prefill:
                 self.last_recurrence_telemetry = self._recurrence_receipt(

@@ -1,0 +1,614 @@
+{
+  "kind": "cpu_data_delivery_benchmark",
+  "tokenizer_fingerprint": "da123040eb08135d26b3d012173cb9e048c9ca1ef91036e5e19255ed0657dd8e",
+  "config": {
+    "corpora": [
+      "cor_20260904_230255_cb24da"
+    ],
+    "seq_len": 512,
+    "micro_batch": 1,
+    "grad_accum": 1,
+    "splits": [
+      "train"
+    ],
+    "seed": 42
+  },
+  "consumer_ms": 0,
+  "note": "No model/GPU training. OS page cache is not flushed. First setup includes preparation; later setups reuse tokens. Delivery throughput excludes consumer/hash work; drain time includes it. RSS is sampled, not a guaranteed process peak.",
+  "cases": [
+    {
+      "shard_mib": null,
+      "prefetch": 0,
+      "runs": [
+        {
+          "setup_seconds": 4.6600005589425564e-05,
+          "drain_seconds": 0.3714762000599876,
+          "next_batch_wait_seconds": 0.34350370115134865,
+          "batches": 2048,
+          "input_tokens": 1048576,
+          "delivery_tokens_per_second": 3052590.107429424,
+          "next_batch_p50_ms": 0.006600050255656242,
+          "next_batch_p95_ms": 0.02502999850548801,
+          "sha256": "968781d8420cd99dea1081f4af928eee06f8c4eac59bda5546f6cb03507a347e",
+          "sampled_peak_process_rss_bytes": 836403200,
+          "prepared_tokens": {}
+        },
+        {
+          "setup_seconds": 4.2599975131452084e-05,
+          "drain_seconds": 0.2942750999936834,
+          "next_batch_wait_seconds": 0.26653100235853344,
+          "batches": 2048,
+          "input_tokens": 1048576,
+          "delivery_tokens_per_second": 3934161.4698520945,
+          "next_batch_p50_ms": 0.006600050255656242,
+          "next_batch_p95_ms": 0.02442999393679199,
+          "sha256": "968781d8420cd99dea1081f4af928eee06f8c4eac59bda5546f6cb03507a347e",
+          "sampled_peak_process_rss_bytes": 846446592,
+          "prepared_tokens": {}
+        },
+        {
+          "setup_seconds": 3.120000474154949e-05,
+          "drain_seconds": 0.30096110003069043,
+          "next_batch_wait_seconds": 0.2728364992653951,
+          "batches": 2048,
+          "input_tokens": 1048576,
+          "delivery_tokens_per_second": 3843239.4596150536,
+          "next_batch_p50_ms": 0.0066999346017837524,
+          "next_batch_p95_ms": 0.024394993670284706,
+          "sha256": "968781d8420cd99dea1081f4af928eee06f8c4eac59bda5546f6cb03507a347e",
+          "sampled_peak_process_rss_bytes": 852344832,
+          "prepared_tokens": {}
+        }
+      ]
+    },
+    {
+      "shard_mib": null,
+      "prefetch": 2,
+      "runs": [
+        {
+          "setup_seconds": 3.6199926398694515e-05,
+          "drain_seconds": 0.3387248000362888,
+          "next_batch_wait_seconds": 0.3025530985323712,
+          "batches": 2048,
+          "input_tokens": 1048576,
+          "delivery_tokens_per_second": 3465758.5894391662,
+          "next_batch_p50_ms": 0.02694997237995267,
+          "next_batch_p95_ms": 0.13999997754581273,
+          "sha256": "968781d8420cd99dea1081f4af928eee06f8c4eac59bda5546f6cb03507a347e",
+          "sampled_peak_process_rss_bytes": 858570752,
+          "prepared_tokens": {}
+        },
+        {
+          "setup_seconds": 2.9799994081258774e-05,
+          "drain_seconds": 0.33836920000612736,
+          "next_batch_wait_seconds": 0.30241359933279455,
+          "batches": 2048,
+          "input_tokens": 1048576,
+          "delivery_tokens_per_second": 3467357.295814208,
+          "next_batch_p50_ms": 0.029799994081258774,
+          "next_batch_p95_ms": 0.13896496966481206,
+          "sha256": "968781d8420cd99dea1081f4af928eee06f8c4eac59bda5546f6cb03507a347e",
+          "sampled_peak_process_rss_bytes": 861102080,
+          "prepared_tokens": {}
+        },
+        {
+          "setup_seconds": 3.0800001695752144e-05,
+          "drain_seconds": 0.33360280003398657,
+          "next_batch_wait_seconds": 0.2970074029872194,
+          "batches": 2048,
+          "input_tokens": 1048576,
+          "delivery_tokens_per_second": 3530470.9224541504,
+          "next_batch_p50_ms": 0.029449991416186094,
+          "next_batch_p95_ms": 0.14172995579428968,
+          "sha256": "968781d8420cd99dea1081f4af928eee06f8c4eac59bda5546f6cb03507a347e",
+          "sampled_peak_process_rss_bytes": 862457856,
+          "prepared_tokens": {}
+        }
+      ]
+    },
+    {
+      "shard_mib": 1,
+      "prefetch": 0,
+      "runs": [
+        {
+          "setup_seconds": 4.0910935999127105,
+          "drain_seconds": 0.07589330000337213,
+          "next_batch_wait_seconds": 0.049561800668016076,
+          "batches": 2048,
+          "input_tokens": 1048576,
+          "delivery_tokens_per_second": 21156939.13188836,
+          "next_batch_p50_ms": 0.006400048732757568,
+          "next_batch_p95_ms": 0.022400013403967023,
+          "sha256": "968781d8420cd99dea1081f4af928eee06f8c4eac59bda5546f6cb03507a347e",
+          "sampled_peak_process_rss_bytes": 865955840,
+          "prepared_tokens": {
+            "cor_20260904_230255_cb24da": {
+              "directory": "C:\\Users\\engin\\Desktop\\yy\\yyLab\\artifacts\\cache\\prepared-tokens\\7429da411586b27ded39dbab13dcedf7a46f0990732544996b4b6c18381e3893",
+              "documents": 1577,
+              "tokens": 4136621
+            }
+          }
+        },
+        {
+          "setup_seconds": 0.02420210000127554,
+          "drain_seconds": 0.07366809993982315,
+          "next_batch_wait_seconds": 0.04743920115288347,
+          "batches": 2048,
+          "input_tokens": 1048576,
+          "delivery_tokens_per_second": 22103576.25164742,
+          "next_batch_p50_ms": 0.006400048732757568,
+          "next_batch_p95_ms": 0.022099935449659824,
+          "sha256": "968781d8420cd99dea1081f4af928eee06f8c4eac59bda5546f6cb03507a347e",
+          "sampled_peak_process_rss_bytes": 866410496,
+          "prepared_tokens": {
+            "cor_20260904_230255_cb24da": {
+              "directory": "C:\\Users\\engin\\Desktop\\yy\\yyLab\\artifacts\\cache\\prepared-tokens\\7429da411586b27ded39dbab13dcedf7a46f0990732544996b4b6c18381e3893",
+              "documents": 1577,
+              "tokens": 4136621
+            }
+          }
+        },
+        {
+          "setup_seconds": 0.023920100065879524,
+          "drain_seconds": 0.07717319997027516,
+          "next_batch_wait_seconds": 0.050515600363723934,
+          "batches": 2048,
+          "input_tokens": 1048576,
+          "delivery_tokens_per_second": 20757468.830420934,
+          "next_batch_p50_ms": 0.006600050255656242,
+          "next_batch_p95_ms": 0.023900024825707078,
+          "sha256": "968781d8420cd99dea1081f4af928eee06f8c4eac59bda5546f6cb03507a347e",
+          "sampled_peak_process_rss_bytes": 866402304,
+          "prepared_tokens": {
+            "cor_20260904_230255_cb24da": {
+              "directory": "C:\\Users\\engin\\Desktop\\yy\\yyLab\\artifacts\\cache\\prepared-tokens\\7429da411586b27ded39dbab13dcedf7a46f0990732544996b4b6c18381e3893",
+              "documents": 1577,
+              "tokens": 4136621
+            }
+          }
+        }
+      ]
+    },
+    {
+      "shard_mib": 1,
+      "prefetch": 2,
+      "runs": [
+        {
+          "setup_seconds": 0.027631300035864115,
+          "drain_seconds": 0.12433050002437085,
+          "next_batch_wait_seconds": 0.0900816983776167,
+          "batches": 2048,
+          "input_tokens": 1048576,
+          "delivery_tokens_per_second": 11640277.868701328,
+          "next_batch_p50_ms": 0.028499984182417393,
+          "next_batch_p95_ms": 0.13679499388672406,
+          "sha256": "968781d8420cd99dea1081f4af928eee06f8c4eac59bda5546f6cb03507a347e",
+          "sampled_peak_process_rss_bytes": 866430976,
+          "prepared_tokens": {
+            "cor_20260904_230255_cb24da": {
+              "directory": "C:\\Users\\engin\\Desktop\\yy\\yyLab\\artifacts\\cache\\prepared-tokens\\7429da411586b27ded39dbab13dcedf7a46f0990732544996b4b6c18381e3893",
+              "documents": 1577,
+              "tokens": 4136621
+            }
+          }
+        },
+        {
+          "setup_seconds": 0.023889000061899424,
+          "drain_seconds": 0.13180899992585182,
+          "next_batch_wait_seconds": 0.09693299897480756,
+          "batches": 2048,
+          "input_tokens": 1048576,
+          "delivery_tokens_per_second": 10817533.874841942,
+          "next_batch_p50_ms": 0.02654996933415532,
+          "next_batch_p95_ms": 0.13972994056530294,
+          "sha256": "968781d8420cd99dea1081f4af928eee06f8c4eac59bda5546f6cb03507a347e",
+          "sampled_peak_process_rss_bytes": 866439168,
+          "prepared_tokens": {
+            "cor_20260904_230255_cb24da": {
+              "directory": "C:\\Users\\engin\\Desktop\\yy\\yyLab\\artifacts\\cache\\prepared-tokens\\7429da411586b27ded39dbab13dcedf7a46f0990732544996b4b6c18381e3893",
+              "documents": 1577,
+              "tokens": 4136621
+            }
+          }
+        },
+        {
+          "setup_seconds": 0.02624809998087585,
+          "drain_seconds": 0.12667230004444718,
+          "next_batch_wait_seconds": 0.09235509869176894,
+          "batches": 2048,
+          "input_tokens": 1048576,
+          "delivery_tokens_per_second": 11353742.401375975,
+          "next_batch_p50_ms": 0.02794997999444604,
+          "next_batch_p95_ms": 0.1329249644186344,
+          "sha256": "968781d8420cd99dea1081f4af928eee06f8c4eac59bda5546f6cb03507a347e",
+          "sampled_peak_process_rss_bytes": 866426880,
+          "prepared_tokens": {
+            "cor_20260904_230255_cb24da": {
+              "directory": "C:\\Users\\engin\\Desktop\\yy\\yyLab\\artifacts\\cache\\prepared-tokens\\7429da411586b27ded39dbab13dcedf7a46f0990732544996b4b6c18381e3893",
+              "documents": 1577,
+              "tokens": 4136621
+            }
+          }
+        }
+      ]
+    },
+    {
+      "shard_mib": 4,
+      "prefetch": 0,
+      "runs": [
+        {
+          "setup_seconds": 3.933854299946688,
+          "drain_seconds": 0.07978830009233207,
+          "next_batch_wait_seconds": 0.052839997224509716,
+          "batches": 2048,
+          "input_tokens": 1048576,
+          "delivery_tokens_per_second": 19844361.3754321,
+          "next_batch_p50_ms": 0.0065999338403344154,
+          "next_batch_p95_ms": 0.024929997744038673,
+          "sha256": "968781d8420cd99dea1081f4af928eee06f8c4eac59bda5546f6cb03507a347e",
+          "sampled_peak_process_rss_bytes": 867819520,
+          "prepared_tokens": {
+            "cor_20260904_230255_cb24da": {
+              "directory": "C:\\Users\\engin\\Desktop\\yy\\yyLab\\artifacts\\cache\\prepared-tokens\\e880c72671cc12fcec877d07eca8683a82bd696cc3d6fd855a8f82c3d743d2c2",
+              "documents": 1577,
+              "tokens": 4136621
+            }
+          }
+        },
+        {
+          "setup_seconds": 0.028822500025853515,
+          "drain_seconds": 0.07551260001491755,
+          "next_batch_wait_seconds": 0.04898659896571189,
+          "batches": 2048,
+          "input_tokens": 1048576,
+          "delivery_tokens_per_second": 21405364.3677927,
+          "next_batch_p50_ms": 0.006400048732757568,
+          "next_batch_p95_ms": 0.022499938495457172,
+          "sha256": "968781d8420cd99dea1081f4af928eee06f8c4eac59bda5546f6cb03507a347e",
+          "sampled_peak_process_rss_bytes": 871768064,
+          "prepared_tokens": {
+            "cor_20260904_230255_cb24da": {
+              "directory": "C:\\Users\\engin\\Desktop\\yy\\yyLab\\artifacts\\cache\\prepared-tokens\\e880c72671cc12fcec877d07eca8683a82bd696cc3d6fd855a8f82c3d743d2c2",
+              "documents": 1577,
+              "tokens": 4136621
+            }
+          }
+        },
+        {
+          "setup_seconds": 0.024865500046871603,
+          "drain_seconds": 0.07421029999386519,
+          "next_batch_wait_seconds": 0.04814939992502332,
+          "batches": 2048,
+          "input_tokens": 1048576,
+          "delivery_tokens_per_second": 21777550.740669843,
+          "next_batch_p50_ms": 0.006399932317435741,
+          "next_batch_p95_ms": 0.021700048819184303,
+          "sha256": "968781d8420cd99dea1081f4af928eee06f8c4eac59bda5546f6cb03507a347e",
+          "sampled_peak_process_rss_bytes": 872423424,
+          "prepared_tokens": {
+            "cor_20260904_230255_cb24da": {
+              "directory": "C:\\Users\\engin\\Desktop\\yy\\yyLab\\artifacts\\cache\\prepared-tokens\\e880c72671cc12fcec877d07eca8683a82bd696cc3d6fd855a8f82c3d743d2c2",
+              "documents": 1577,
+              "tokens": 4136621
+            }
+          }
+        }
+      ]
+    },
+    {
+      "shard_mib": 4,
+      "prefetch": 2,
+      "runs": [
+        {
+          "setup_seconds": 0.024650500039570034,
+          "drain_seconds": 0.12782399996649474,
+          "next_batch_wait_seconds": 0.09108880022540689,
+          "batches": 2048,
+          "input_tokens": 1048576,
+          "delivery_tokens_per_second": 11511579.880349841,
+          "next_batch_p50_ms": 0.02405000850558281,
+          "next_batch_p95_ms": 0.14962501591071478,
+          "sha256": "968781d8420cd99dea1081f4af928eee06f8c4eac59bda5546f6cb03507a347e",
+          "sampled_peak_process_rss_bytes": 872501248,
+          "prepared_tokens": {
+            "cor_20260904_230255_cb24da": {
+              "directory": "C:\\Users\\engin\\Desktop\\yy\\yyLab\\artifacts\\cache\\prepared-tokens\\e880c72671cc12fcec877d07eca8683a82bd696cc3d6fd855a8f82c3d743d2c2",
+              "documents": 1577,
+              "tokens": 4136621
+            }
+          }
+        },
+        {
+          "setup_seconds": 0.02538869995623827,
+          "drain_seconds": 0.12821200001053512,
+          "next_batch_wait_seconds": 0.09276459901593626,
+          "batches": 2048,
+          "input_tokens": 1048576,
+          "delivery_tokens_per_second": 11303622.40686086,
+          "next_batch_p50_ms": 0.009899958968162537,
+          "next_batch_p95_ms": 0.14944997383281575,
+          "sha256": "968781d8420cd99dea1081f4af928eee06f8c4eac59bda5546f6cb03507a347e",
+          "sampled_peak_process_rss_bytes": 872501248,
+          "prepared_tokens": {
+            "cor_20260904_230255_cb24da": {
+              "directory": "C:\\Users\\engin\\Desktop\\yy\\yyLab\\artifacts\\cache\\prepared-tokens\\e880c72671cc12fcec877d07eca8683a82bd696cc3d6fd855a8f82c3d743d2c2",
+              "documents": 1577,
+              "tokens": 4136621
+            }
+          }
+        },
+        {
+          "setup_seconds": 0.02474280004389584,
+          "drain_seconds": 0.14252290001604706,
+          "next_batch_wait_seconds": 0.10395299550145864,
+          "batches": 2048,
+          "input_tokens": 1048576,
+          "delivery_tokens_per_second": 10087020.532133551,
+          "next_batch_p50_ms": 0.01025001984089613,
+          "next_batch_p95_ms": 0.18711002776399235,
+          "sha256": "968781d8420cd99dea1081f4af928eee06f8c4eac59bda5546f6cb03507a347e",
+          "sampled_peak_process_rss_bytes": 872501248,
+          "prepared_tokens": {
+            "cor_20260904_230255_cb24da": {
+              "directory": "C:\\Users\\engin\\Desktop\\yy\\yyLab\\artifacts\\cache\\prepared-tokens\\e880c72671cc12fcec877d07eca8683a82bd696cc3d6fd855a8f82c3d743d2c2",
+              "documents": 1577,
+              "tokens": 4136621
+            }
+          }
+        }
+      ]
+    },
+    {
+      "shard_mib": 16,
+      "prefetch": 0,
+      "runs": [
+        {
+          "setup_seconds": 3.934609799995087,
+          "drain_seconds": 0.07933819992467761,
+          "next_batch_wait_seconds": 0.053105000290088356,
+          "batches": 2048,
+          "input_tokens": 1048576,
+          "delivery_tokens_per_second": 19745334.60638562,
+          "next_batch_p50_ms": 0.006499933078885078,
+          "next_batch_p95_ms": 0.02276498125866054,
+          "sha256": "968781d8420cd99dea1081f4af928eee06f8c4eac59bda5546f6cb03507a347e",
+          "sampled_peak_process_rss_bytes": 872534016,
+          "prepared_tokens": {
+            "cor_20260904_230255_cb24da": {
+              "directory": "C:\\Users\\engin\\Desktop\\yy\\yyLab\\artifacts\\cache\\prepared-tokens\\6f77408fa7b3ca5fe7b78f51d3658f04216bab2593ebd8a9ac060c7f11527b5a",
+              "documents": 1577,
+              "tokens": 4136621
+            }
+          }
+        },
+        {
+          "setup_seconds": 0.02399010001681745,
+          "drain_seconds": 0.0789425999391824,
+          "next_batch_wait_seconds": 0.0525328959338367,
+          "batches": 2048,
+          "input_tokens": 1048576,
+          "delivery_tokens_per_second": 19960369.238365307,
+          "next_batch_p50_ms": 0.006400048732757568,
+          "next_batch_p95_ms": 0.022400054149329662,
+          "sha256": "968781d8420cd99dea1081f4af928eee06f8c4eac59bda5546f6cb03507a347e",
+          "sampled_peak_process_rss_bytes": 872513536,
+          "prepared_tokens": {
+            "cor_20260904_230255_cb24da": {
+              "directory": "C:\\Users\\engin\\Desktop\\yy\\yyLab\\artifacts\\cache\\prepared-tokens\\6f77408fa7b3ca5fe7b78f51d3658f04216bab2593ebd8a9ac060c7f11527b5a",
+              "documents": 1577,
+              "tokens": 4136621
+            }
+          }
+        },
+        {
+          "setup_seconds": 0.024956700042821467,
+          "drain_seconds": 0.16907960001844913,
+          "next_batch_wait_seconds": 0.142748101381585,
+          "batches": 2048,
+          "input_tokens": 1048576,
+          "delivery_tokens_per_second": 7345638.855097725,
+          "next_batch_p50_ms": 0.006499933078885078,
+          "next_batch_p95_ms": 0.02220001188106835,
+          "sha256": "968781d8420cd99dea1081f4af928eee06f8c4eac59bda5546f6cb03507a347e",
+          "sampled_peak_process_rss_bytes": 872513536,
+          "prepared_tokens": {
+            "cor_20260904_230255_cb24da": {
+              "directory": "C:\\Users\\engin\\Desktop\\yy\\yyLab\\artifacts\\cache\\prepared-tokens\\6f77408fa7b3ca5fe7b78f51d3658f04216bab2593ebd8a9ac060c7f11527b5a",
+              "documents": 1577,
+              "tokens": 4136621
+            }
+          }
+        }
+      ]
+    },
+    {
+      "shard_mib": 16,
+      "prefetch": 2,
+      "runs": [
+        {
+          "setup_seconds": 0.02346990001387894,
+          "drain_seconds": 0.1317343000555411,
+          "next_batch_wait_seconds": 0.09354109945707023,
+          "batches": 2048,
+          "input_tokens": 1048576,
+          "delivery_tokens_per_second": 11209789.13104644,
+          "next_batch_p50_ms": 0.02524995943531394,
+          "next_batch_p95_ms": 0.1680399989709256,
+          "sha256": "968781d8420cd99dea1081f4af928eee06f8c4eac59bda5546f6cb03507a347e",
+          "sampled_peak_process_rss_bytes": 872538112,
+          "prepared_tokens": {
+            "cor_20260904_230255_cb24da": {
+              "directory": "C:\\Users\\engin\\Desktop\\yy\\yyLab\\artifacts\\cache\\prepared-tokens\\6f77408fa7b3ca5fe7b78f51d3658f04216bab2593ebd8a9ac060c7f11527b5a",
+              "documents": 1577,
+              "tokens": 4136621
+            }
+          }
+        },
+        {
+          "setup_seconds": 0.02561089990194887,
+          "drain_seconds": 0.13236899999901652,
+          "next_batch_wait_seconds": 0.09605009923689067,
+          "batches": 2048,
+          "input_tokens": 1048576,
+          "delivery_tokens_per_second": 10916969.46000932,
+          "next_batch_p50_ms": 0.02164999023079872,
+          "next_batch_p95_ms": 0.16642498667351893,
+          "sha256": "968781d8420cd99dea1081f4af928eee06f8c4eac59bda5546f6cb03507a347e",
+          "sampled_peak_process_rss_bytes": 872542208,
+          "prepared_tokens": {
+            "cor_20260904_230255_cb24da": {
+              "directory": "C:\\Users\\engin\\Desktop\\yy\\yyLab\\artifacts\\cache\\prepared-tokens\\6f77408fa7b3ca5fe7b78f51d3658f04216bab2593ebd8a9ac060c7f11527b5a",
+              "documents": 1577,
+              "tokens": 4136621
+            }
+          }
+        },
+        {
+          "setup_seconds": 0.0240522000240162,
+          "drain_seconds": 0.13390480005182326,
+          "next_batch_wait_seconds": 0.09550370229408145,
+          "batches": 2048,
+          "input_tokens": 1048576,
+          "delivery_tokens_per_second": 10979427.75842505,
+          "next_batch_p50_ms": 0.025600020308047533,
+          "next_batch_p95_ms": 0.16501501668244586,
+          "sha256": "968781d8420cd99dea1081f4af928eee06f8c4eac59bda5546f6cb03507a347e",
+          "sampled_peak_process_rss_bytes": 872525824,
+          "prepared_tokens": {
+            "cor_20260904_230255_cb24da": {
+              "directory": "C:\\Users\\engin\\Desktop\\yy\\yyLab\\artifacts\\cache\\prepared-tokens\\6f77408fa7b3ca5fe7b78f51d3658f04216bab2593ebd8a9ac060c7f11527b5a",
+              "documents": 1577,
+              "tokens": 4136621
+            }
+          }
+        }
+      ]
+    },
+    {
+      "shard_mib": 64,
+      "prefetch": 0,
+      "runs": [
+        {
+          "setup_seconds": 3.830065399990417,
+          "drain_seconds": 0.07822839997243136,
+          "next_batch_wait_seconds": 0.051916198688559234,
+          "batches": 2048,
+          "input_tokens": 1048576,
+          "delivery_tokens_per_second": 20197472.590208624,
+          "next_batch_p50_ms": 0.006400048732757568,
+          "next_batch_p95_ms": 0.022100011119619012,
+          "sha256": "968781d8420cd99dea1081f4af928eee06f8c4eac59bda5546f6cb03507a347e",
+          "sampled_peak_process_rss_bytes": 872501248,
+          "prepared_tokens": {
+            "cor_20260904_230255_cb24da": {
+              "directory": "C:\\Users\\engin\\Desktop\\yy\\yyLab\\artifacts\\cache\\prepared-tokens\\b0dee87c2932d62708f76b8094253ad43263c11a52bf7a7b6f901bba464709ae",
+              "documents": 1577,
+              "tokens": 4136621
+            }
+          }
+        },
+        {
+          "setup_seconds": 0.024819600046612322,
+          "drain_seconds": 0.07753819995559752,
+          "next_batch_wait_seconds": 0.05135789979249239,
+          "batches": 2048,
+          "input_tokens": 1048576,
+          "delivery_tokens_per_second": 20417034.268081248,
+          "next_batch_p50_ms": 0.006399932317435741,
+          "next_batch_p95_ms": 0.02219993621110916,
+          "sha256": "968781d8420cd99dea1081f4af928eee06f8c4eac59bda5546f6cb03507a347e",
+          "sampled_peak_process_rss_bytes": 872493056,
+          "prepared_tokens": {
+            "cor_20260904_230255_cb24da": {
+              "directory": "C:\\Users\\engin\\Desktop\\yy\\yyLab\\artifacts\\cache\\prepared-tokens\\b0dee87c2932d62708f76b8094253ad43263c11a52bf7a7b6f901bba464709ae",
+              "documents": 1577,
+              "tokens": 4136621
+            }
+          }
+        },
+        {
+          "setup_seconds": 0.02413669996894896,
+          "drain_seconds": 0.07805300003383309,
+          "next_batch_wait_seconds": 0.05178239999804646,
+          "batches": 2048,
+          "input_tokens": 1048576,
+          "delivery_tokens_per_second": 20249660.11694241,
+          "next_batch_p50_ms": 0.006400048732757568,
+          "next_batch_p95_ms": 0.022264977451413856,
+          "sha256": "968781d8420cd99dea1081f4af928eee06f8c4eac59bda5546f6cb03507a347e",
+          "sampled_peak_process_rss_bytes": 872497152,
+          "prepared_tokens": {
+            "cor_20260904_230255_cb24da": {
+              "directory": "C:\\Users\\engin\\Desktop\\yy\\yyLab\\artifacts\\cache\\prepared-tokens\\b0dee87c2932d62708f76b8094253ad43263c11a52bf7a7b6f901bba464709ae",
+              "documents": 1577,
+              "tokens": 4136621
+            }
+          }
+        }
+      ]
+    },
+    {
+      "shard_mib": 64,
+      "prefetch": 2,
+      "runs": [
+        {
+          "setup_seconds": 0.02382730005774647,
+          "drain_seconds": 0.14830420003272593,
+          "next_batch_wait_seconds": 0.10795669909566641,
+          "batches": 2048,
+          "input_tokens": 1048576,
+          "delivery_tokens_per_second": 9712931.284336498,
+          "next_batch_p50_ms": 0.01585000427439809,
+          "next_batch_p95_ms": 0.1999700092710552,
+          "sha256": "968781d8420cd99dea1081f4af928eee06f8c4eac59bda5546f6cb03507a347e",
+          "sampled_peak_process_rss_bytes": 872521728,
+          "prepared_tokens": {
+            "cor_20260904_230255_cb24da": {
+              "directory": "C:\\Users\\engin\\Desktop\\yy\\yyLab\\artifacts\\cache\\prepared-tokens\\b0dee87c2932d62708f76b8094253ad43263c11a52bf7a7b6f901bba464709ae",
+              "documents": 1577,
+              "tokens": 4136621
+            }
+          }
+        },
+        {
+          "setup_seconds": 0.024838699959218502,
+          "drain_seconds": 0.13769999996293336,
+          "next_batch_wait_seconds": 0.09884290304034948,
+          "batches": 2048,
+          "input_tokens": 1048576,
+          "delivery_tokens_per_second": 10608510.755415106,
+          "next_batch_p50_ms": 0.00600004568696022,
+          "next_batch_p95_ms": 0.179645011667162,
+          "sha256": "968781d8420cd99dea1081f4af928eee06f8c4eac59bda5546f6cb03507a347e",
+          "sampled_peak_process_rss_bytes": 872525824,
+          "prepared_tokens": {
+            "cor_20260904_230255_cb24da": {
+              "directory": "C:\\Users\\engin\\Desktop\\yy\\yyLab\\artifacts\\cache\\prepared-tokens\\b0dee87c2932d62708f76b8094253ad43263c11a52bf7a7b6f901bba464709ae",
+              "documents": 1577,
+              "tokens": 4136621
+            }
+          }
+        },
+        {
+          "setup_seconds": 0.02426979993470013,
+          "drain_seconds": 0.12458120007067919,
+          "next_batch_wait_seconds": 0.0895678992383182,
+          "batches": 2048,
+          "input_tokens": 1048576,
+          "delivery_tokens_per_second": 11707051.39806837,
+          "next_batch_p50_ms": 0.02559996210038662,
+          "next_batch_p95_ms": 0.1536650059279054,
+          "sha256": "968781d8420cd99dea1081f4af928eee06f8c4eac59bda5546f6cb03507a347e",
+          "sampled_peak_process_rss_bytes": 872525824,
+          "prepared_tokens": {
+            "cor_20260904_230255_cb24da": {
+              "directory": "C:\\Users\\engin\\Desktop\\yy\\yyLab\\artifacts\\cache\\prepared-tokens\\b0dee87c2932d62708f76b8094253ad43263c11a52bf7a7b6f901bba464709ae",
+              "documents": 1577,
+              "tokens": 4136621
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -3,6 +3,15 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 
+def supports_generation_cache(model_or_config) -> bool:
+    """Native Sprint KDA currently generates from full prefixes without a cache."""
+    config = getattr(model_or_config, "config", model_or_config)
+    return not (
+        getattr(config, "model_type", "") == "sprint"
+        and getattr(config, "attention_type", "sdpa") == "kda"
+    )
+
+
 def reject_unverified_checkpoint_quantization(base_cfg) -> None:
     """Reject checkpoint-owned quantizers that bypass yyLab capability probes.
 
@@ -238,5 +247,7 @@ def load_base(
             f"restored {qat_meta.get('format')} QAT numerics on {qat_count} Linear modules "
             f"({execution}{sparsity_note}{backward_note}; high-precision shadow checkpoint)"
         )
-    model.config.use_cache = True
+    model.config.use_cache = supports_generation_cache(model)
+    if not model.config.use_cache:
+        notes.append("Sprint KDA sampling recomputes the full prefix; KV cache settings do not apply.")
     return model, tokenizer, cuda, quant, notes

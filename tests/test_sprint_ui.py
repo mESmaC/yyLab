@@ -37,7 +37,7 @@ def test_sprint_navigation_and_route() -> None:
 
 
 def test_sprint_recipe_retains_data_architecture_and_rounded_budget() -> None:
-    cfg = recipe(corpus_weights={"code": 2}, source_max_ratio=0.75, objective="pretrain")
+    cfg = recipe(corpus_mix="token_balanced", corpus_weights={"code": 2}, source_max_ratio=0.75, objective="pretrain")
     assert cfg["objective"] == "causal_lm"
     assert cfg["corpora"] == ["english", "code"]
     assert cfg["corpus_weights"] == {"code": 2}
@@ -220,7 +220,8 @@ def test_sizing_profile_separates_planner_cache_and_persists_in_recipes(monkeypa
 
     calls = []
 
-    def planner(target, vocab_size, *, max_position_embeddings, profile):
+    def planner(target, vocab_size, *, max_position_embeddings, profile, ple_type, ple_lanes,
+                attention_type, kda_backend, kda_disable_recompute):
         calls.append((target, profile))
         return sprint.SprintConfig(vocab_size=vocab_size, hidden_size=64 if profile == "throughput" else 32,
                                     intermediate_size=128, num_hidden_layers=2, num_attention_heads=2,
@@ -270,7 +271,8 @@ def test_target_loss_selection_does_not_mutate_cached_plan(monkeypatch) -> None:
 
     calls = []
 
-    def planner(target, vocab_size, *, max_position_embeddings, profile):
+    def planner(target, vocab_size, *, max_position_embeddings, profile, ple_type, ple_lanes,
+                attention_type, kda_backend, kda_disable_recompute):
         calls.append((target, vocab_size, max_position_embeddings, profile))
         return sprint.SprintConfig(vocab_size=vocab_size, hidden_size=64, intermediate_size=128,
                                     num_hidden_layers=2, num_attention_heads=2,
@@ -281,12 +283,12 @@ def test_target_loss_selection_does_not_mutate_cached_plan(monkeypatch) -> None:
     try:
         values = {"vocab_size": 128, "context_length": 256, "target_parameters": 1_000_000}
         original = train_sprint.resolve_sprint_shape(**values)
-        cached_json = train_sprint._planned_config(1_000_000, 128, 256, "throughput")
+        cached_json = train_sprint._planned_config(1_000_000, 128, 256, "throughput", "none", 4, "sdpa", "auto", True)
         for backend in ("torch", "liger", "auto"):
             selected = train_sprint.resolve_sprint_shape(**values, loss_backend=backend)
             assert selected["model_config"]["loss_backend"] == backend
             assert selected["parameters"] == original["parameters"]
-            assert train_sprint._planned_config(1_000_000, 128, 256, "throughput") == cached_json
+            assert train_sprint._planned_config(1_000_000, 128, 256, "throughput", "none", 4, "sdpa", "auto", True) == cached_json
         assert train_sprint.resolve_sprint_shape(**values) == original
         assert original["model_config"]["loss_backend"] == "auto"
         assert len(calls) == 1
@@ -335,6 +337,60 @@ def test_target_profile_defaults_and_validation() -> None:
     assert recipe(target_parameters=50_000_000)["shape_profile"] == "throughput"
     with pytest.raises(ValueError, match="sizing profile"):
         recipe(target_parameters=50_000_000, shape_profile="unknown")
+
+
+def test_ple_choices_separate_cached_plans_and_preserve_allocation():
+    values = dict(vocab_size=128, context_length=256, target_parameters=1_000_000)
+    train_sprint._planned_config.cache_clear()
+    try:
+        plans = {kind: train_sprint.resolve_sprint_shape(**values, ple_type=kind) for kind in ("none", "full", "qr")}
+        other_lanes = train_sprint.resolve_sprint_shape(**values, ple_type="qr", ple_lanes=2)
+        assert train_sprint._planned_config.cache_info().misses == 4
+        for kind, plan in plans.items():
+            assert train_sprint.resolve_sprint_shape(**values, ple_type=kind) == plan
+            assert plan["model_config"]["ple_type"] == kind
+            allocation = plan["parameter_breakdown"]
+            assert allocation["total"] == plan["parameters"] <= values["target_parameters"]
+            assert allocation["ple"] == allocation["ple_tables"] + allocation["ple_controls"]
+            assert (allocation["ple"] > 0) == (kind != "none")
+            training = recipe(**plan)
+            benchmark = train_sprint.build_sprint_benchmark_config(
+                model_config=plan["model_config"], seq_len=64, batch_sizes="1", compile_modes=["eager"],
+                effective_batch=1, warmup_steps=1, measure_steps=1)
+            assert training["model_config"] == benchmark["model_config"] == plan["model_config"]
+            assert training["parameter_breakdown"] == benchmark["parameter_breakdown"] == allocation
+        assert other_lanes["model_config"]["ple_lanes"] == 2
+        assert other_lanes["parameter_breakdown"]["ple"] != plans["qr"]["parameter_breakdown"]["ple"]
+    finally:
+        train_sprint._planned_config.cache_clear()
+
+
+def test_ple_recommendations_require_type_and_lanes_and_accept_legacy_none(monkeypatch):
+    config = recipe()["model_config"]
+    legacy = {key: value for key, value in config.items() if key not in {"ple_type", "ple_lanes"}}
+    report = {"model_config": legacy, "sequence_length": 64, "device": "cpu",
+              "execution": train_sprint.sprint_execution_config(),
+              "recommended": {"micro_batch": 2, "grad_accum": 2, "torch_compile": False, "compile_mode": "default"}}
+    monkeypatch.setattr(db, "q", lambda *_: [{"id": "legacy", "metrics_json": json.dumps(report)}])
+    assert train_sprint.latest_sprint_recommendation(config, 64, device="cpu")["run_id"] == "legacy"
+    for updates in ({"ple_type": "full"}, {"ple_type": "qr"}, {"ple_lanes": 2}):
+        with pytest.raises(ValueError, match="No completed benchmark"):
+            train_sprint.latest_sprint_recommendation({**config, **updates}, 64, device="cpu")
+    report["model_config"] = {**config, "ple_type": "qr", "ple_lanes": 2}
+    assert train_sprint.latest_sprint_recommendation(report["model_config"], 64, device="cpu")["run_id"] == "legacy"
+    with pytest.raises(ValueError, match="No completed benchmark"):
+        train_sprint.latest_sprint_recommendation({**config, "ple_type": "qr"}, 64, device="cpu")
+
+
+def test_ple_queue_metadata_preserves_architecture_and_allocation(monkeypatch):
+    monkeypatch.setattr(train_sprint, "launch_worker", lambda _: 123)
+    shape = train_sprint.resolve_sprint_shape(vocab_size=128, context_length=256,
+                                             model_config=recipe()["model_config"], ple_type="full")
+    run_id = train_sprint.queue_sprint_job(recipe(**shape))
+    config = json.loads(db.q1("SELECT config_json FROM runs WHERE id=?", (run_id,))["config_json"])
+    metadata = json.loads(db.q1("SELECT meta_json FROM checkpoints WHERE id=?", (config["out_checkpoint_id"],))["meta_json"])
+    assert config["model_config"]["ple_type"] == metadata["model_config"]["ple_type"] == "full"
+    assert config["parameter_breakdown"] == metadata["parameter_breakdown"] == shape["parameter_breakdown"]
 
 
 def test_queue_creates_run_and_output_atomically_and_preserves_worker_metrics(monkeypatch) -> None:
@@ -491,3 +547,7 @@ def test_page_constructs_with_empty_registry(monkeypatch) -> None:
         assert loss_select.value == "auto"
         assert loss_select.options == train_sprint.LOSS_OPTIONS
         assert set(loss_select.options) == {"auto", "torch", "liger"}
+        ple_select = next(element for element in client.elements.values()
+                          if element._props.get("label") == "Per-layer embeddings (PLE)")
+        assert ple_select.value == "none"
+        assert ple_select.options == {"none": "No PLE", "full": "Regular PLE", "qr": "QR PLE"}

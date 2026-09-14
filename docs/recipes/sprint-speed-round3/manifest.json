@@ -1,0 +1,27 @@
+{
+  "created_at_utc": "2026-09-11T22:57:03.660571+00:00",
+  "scope": "Exact selected recipes; report and consolidated receipts carry measured results and limitations.",
+  "files": {
+    "baseline-b32.json": {
+      "source": "artifacts/sprint-1b-speed-20260911/baseline-b32.json",
+      "sha256": "81fa99b08c30bdfcbba26e64350c72f5dea00385f74e5f4dc1d0540df039eb77",
+      "bytes": 1690
+    },
+    "baseline-b128.json": {
+      "source": "artifacts/sprint-1b-speed-20260911/baseline-b128.json",
+      "sha256": "1c129e1ff4f8ce9cdc7910e611dc09767d219ae463bdf6ecf45c7eb8fa6e68e9",
+      "bytes": 1691
+    },
+    "confirm-bf16-moments-micro8-b32.json": {
+      "source": "artifacts/sprint-1b-speed-20260911/confirm-bf16-moments-micro8-b32.json",
+      "sha256": "0767cf90b8a6fbf7d8d4aece950580fb6be44152620d77f0342c42043b015303",
+      "bytes": 1761
+    },
+    "confirm-bf16-moments-micro8-b128.json": {
+      "source": "artifacts/sprint-1b-speed-20260911/confirm-bf16-moments-micro8-b128.json",
+      "sha256": "ab35cd391b00f93580b4f492350a206b761409520fcf9b0d864f42a88332822a",
+      "bytes": 1762
+    }
+  },
+  "updated_at_utc": "2026-09-11T23:04:44.389853+00:00"
+}

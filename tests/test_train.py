@@ -495,6 +495,7 @@ def test_build_batches_replays_each_epoch(monkeypatch):
     monkeypatch.setattr(worker, "iter_corpus_docs", fake_docs)
     cfg = {
         "corpora": ["corpus"],
+            "token_cache": False,
         "domains": None,
         "epochs": 3,
         "seq_len": 8,
@@ -532,6 +533,7 @@ def test_build_batches_suppresses_raw_length_warning_without_truncating(monkeypa
         worker.build_batches(
             {
                 "corpora": ["corpus"],
+            "token_cache": False,
                 "seq_len": 8,
                 "micro_batch": 1,
                 "grad_accum": 1,
@@ -567,6 +569,7 @@ def test_build_batches_wires_chat_sft_objective_to_labeled_batcher(monkeypatch):
         {
             "objective": "chat_sft",
             "corpora": ["corpus"],
+            "token_cache": False,
             "seq_len": 8,
             "micro_batch": 1,
             "grad_accum": 1,
@@ -575,7 +578,7 @@ def test_build_batches_wires_chat_sft_objective_to_labeled_batcher(monkeypatch):
         TemplateTokenizer(),
         max_steps=3,
     )
-    assert isinstance(batches, ChatSFTBatches)
+    assert isinstance(batches.batches, ChatSFTBatches)
     batch = next(iter(batches))
     assert "labels" in batch
     assert "attention_mask" in batch
@@ -1127,6 +1130,7 @@ def test_run_mole_end_to_end(tmp_path, monkeypatch):
         "top_k": 2,
         "target_modules": ["q_proj", "v_proj"],
         "corpora": [corpus_id],
+        "token_cache": False,
         "domains": None,
         "seq_len": 32,
         "epochs": 1,
@@ -1199,6 +1203,7 @@ def test_run_base_qlora_peft(tmp_path, monkeypatch):
         "rank": 8,
         "alpha": 16,
         "corpora": [corpus_id],
+        "token_cache": False,
         "domains": None,
         "seq_len": 32,
         "epochs": 1,

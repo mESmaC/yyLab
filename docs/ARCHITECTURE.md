@@ -12,7 +12,7 @@ yylab/
   ingest/          corpora pipeline
     adapters/      filetype adapters (add new ones here)
     pipeline.py    walk → extract → normalize → dedup → shard → tokenize
-    dedup.py       sha256 exact + MinHash LSH near-dedup
+    dedup.py       sha256 exact + MinHash LSH near-match detection
     domains.py     code/math/science/web/language classification
     ranker.py      feature ranker, grouped validation, safetensors artifact
     tokenize_stats.py  multi-tokenizer counting registry
@@ -385,8 +385,9 @@ Legacy stage-2 prompt-router training uses the same guarded planner.
    can no longer read the file) fails the corpus.
 3. **Decide** (one coordinator thread, strict file/chunk order,
    `ingest/pipeline.py`): hygiene filter, language/quality quarantine, exact
-   local dedup per split (split-leakage evidence), the MinHash LSH decision
-   from precomputed bands, batched global `doc_hashes`/`rejected_hashes`
+   local dedup per split (cross-split copies are retained as split-leakage evidence),
+   MinHash LSH candidate detection from precomputed bands (candidates are retained),
+   batched global `doc_hashes`/`rejected_hashes`
    checks, shard writing, CDAS catalog rows, and stats. Chunk-local
    `record=`/`row=`/`line=` locators are rebased from the preceding chunks'
    record/line counts, so shards, `stats.json`, and `inventory.sqlite3` are
@@ -405,8 +406,8 @@ on it.
 
 The corpus-library **Fast ingest** action assumes a published dataset is already
 curated and runs discovery, extraction, exact dedup, domain tagging, and
-sharding, with tokenizer stats disabled. Language, quality, and MinHash
-cleaning remain explicit controls in the ingest dialog and can be applied later
+sharding, with tokenizer stats disabled. Language and quality filters and MinHash
+near-match detection remain explicit controls in the ingest dialog and can be applied later
 with **Re-import**.
 
 ### Prepared-document cache and re-import
@@ -644,9 +645,11 @@ keys live under `training` and are mirrored to the recipe root like every other
 alias: `mean_recurrence` (r̄, required whenever a core exists),
 `mean_backprop_depth` (k, default 4), `recurrence_sigma` (default 0.5),
 `recurrence_sampling` (`poisson_lognormal` | `uniform` | `fixed`), and the
-optional `max_recurrence` cap. Each optimizer step samples one `r` from a
-log-normal Poisson with expectation r̄ and backpropagates through only the last
-`k` iterations, so activation memory stays bounded. Setting any of these keys
+optional `max_recurrence` cap. The training form exposes the sampling scheme
+and maximum (0 in the form selects the automatic `4 * ceil(r̄)` cap). Each
+optimizer step samples one `r` using the chosen scheme and backpropagates
+through only the last `min(k,r)` iterations. Clipping can lower the observed
+mean; the uniform scheme rounds its nominal mean. Setting any of these keys
 without a recurrent core — or omitting `mean_recurrence` with one — fails
 closed, in `normalize_spalmer_config` for scratch runs and in
 `_prepare_checkpoint_run` (after the parent is loaded) for continued ones.
@@ -678,6 +681,16 @@ checkpoints page shows it as `N layers (effective M)`. A bundle registered
 through the scanner records the same information as `recurrence_config` and
 `effective_depth`, and readers look for `recurrence`, then `recurrence_config`,
 then `metadata.recurrence`.
+
+Recurrent loss forwards in training now release unused decode caches by
+default. Explicit `use_cache=True` retains them for stateful callers;
+`use_cache=False` returns empty state tuples, and the yyLab facade propagates
+that choice. Evaluation and generation still retain caches by default. This
+bounds unused cache retention rather than checkpointing the retained gradient
+graphs. Native generation honors model-level depth overrides, and dynamic
+residency comparisons reuse the same latent noise for every candidate set.
+See the [implementation audit and CUDA check](../../spalmer/docs/recurrent-depth-audit-2026-09-05.md)
+for the verified behavior and remaining work.
 
 ### SPALMER PLE backends
 

@@ -15,6 +15,7 @@ from ... import db
 from ...artifacts import run_dir
 from ..components import empty_state
 from ..shell import panel, shell
+from ..sprint_health import sprint_health_evidence, sprint_health_status
 
 ACTIVE_RUN_STATUSES = frozenset({"queued", "running"})
 FAST_POLL_SECONDS = 1.0
@@ -116,6 +117,7 @@ def runs_page():
         "log_mtime_ns": None,
         "log_has_content": False,
         "token_view_mtime_ns": None,
+        "sprint_samples_signature": None,
     }
     detail_refs: dict[str, Any] = {}
 
@@ -142,7 +144,8 @@ def runs_page():
                         "created": r["created_at"],
                         "progress": _progress_of(r),
                         "pid": meta.get("pid", ""),
-                        "diagnostic": diagnostic.get("label", ""),
+                        "diagnostic": (sprint_health_status(meta.get("generation_eval_status"))
+                                       if r["kind"] == "sprint" else "") or diagnostic.get("label", ""),
                         "error": (r["error"] or "")[:80],
                     }
                 )
@@ -289,6 +292,7 @@ def runs_page():
             state["log_mtime_ns"] = None
             state["log_has_content"] = False
             state["token_view_mtime_ns"] = None
+            state["sprint_samples_signature"] = None
             if not run_id:
                 update_timer_interval()
                 return
@@ -304,6 +308,16 @@ def runs_page():
                         "Stop", icon="stop", on_click=lambda: stop_selected(run_id)
                     ).props("dense flat no-caps color=negative")
                 progress_label = ui.label("").classes("text-xs text-gray-400 whitespace-pre-wrap")
+                with ui.column().classes("w-full gap-2") as sprint_health:
+                    ui.label("Generated text checks").classes("font-semibold")
+                    health_status = ui.label("").classes("text-sm")
+                    health_details = ui.label("").classes("text-xs text-gray-400")
+                    health_gradient = ui.label("").classes("text-xs text-gray-400")
+                    health_samples = ui.column().classes("w-full gap-1")
+                    ui.label(
+                        "Short samples help reveal problems. Passing this check does not establish model quality."
+                    ).classes("text-xs text-gray-500")
+                sprint_health.visible = r["kind"] == "sprint"
                 try:
                     cfg = orjson.loads(r["config_json"] or b"{}")
                 except orjson.JSONDecodeError:
@@ -339,6 +353,11 @@ def runs_page():
                 error=error_label,
                 token_view_expansion=token_view_expansion,
                 token_view=token_view_label,
+                sprint_health=sprint_health,
+                health_status=health_status,
+                health_details=health_details,
+                health_gradient=health_gradient,
+                health_samples=health_samples,
             )
             refresh_detail(force=True)
             update_timer_interval()
@@ -363,6 +382,39 @@ def runs_page():
                 detail_refs["error"].text = error
                 detail_refs["error"].visible = bool(error)
                 state["detail_signature"] = signature
+
+            if r["kind"] == "sprint":
+                try:
+                    saved_metrics = json.loads(r["metrics_json"] or "{}")
+                except (TypeError, ValueError):
+                    saved_metrics = {}
+                health = sprint_health_evidence(run_dir(run_id), fallback=saved_metrics)
+                detail_refs["health_status"].text = health["status_text"]
+                detail_refs["health_status"].style("color: #fbbf24" if health["warning"] else "color: #d1d5db")
+                detail_refs["health_details"].text = health["details"]
+                detail_refs["health_gradient"].text = health["gradient_text"]
+                detail_refs["health_gradient"].visible = bool(health["gradient_text"])
+                sample_signature = json.dumps([health["step"], health["samples"], health["receipt_path"],
+                                               health["receipt_note"]], sort_keys=True)
+                if force or sample_signature != state["sprint_samples_signature"]:
+                    state["sprint_samples_signature"] = sample_signature
+                    detail_refs["health_samples"].clear()
+                    with detail_refs["health_samples"]:
+                        if health["receipt_note"]:
+                            ui.label(health["receipt_note"]).classes("text-xs text-gray-400")
+                        for index, sample in enumerate(health["samples"]):
+                            title = " · ".join(part for part in (sample["name"], sample["mode"], sample["status"]) if part)
+                            with ui.expansion(title, value=index == 0).classes("w-full"):
+                                ui.label("Prompt").classes("text-xs text-gray-500")
+                                ui.label(sample["prompt"]).classes("text-sm whitespace-pre-wrap break-words")
+                                ui.label("Generated text").classes("text-xs text-gray-500 mt-2")
+                                ui.label(sample["text"] or "No text was generated.").classes(
+                                    "text-sm whitespace-pre-wrap break-words"
+                                )
+                        if health["receipt_path"]:
+                            receipt_path = Path(health["receipt_path"])
+                            ui.button("Download check details", icon="download",
+                                      on_click=lambda _event=None, path=receipt_path: ui.download(path)).props("flat no-caps")
 
             token_view_path = run_dir(run_id) / "tokenized_view_manifest.json"
             try:

@@ -1,0 +1,1535 @@
+{
+  "status": "ok",
+  "scope": "Tiny diagnostic; no optimizer update or throughput claim.",
+  "source_sha256": {
+    "diagnose_weight_cache.py": "cad2ccd544be10c51df5f7c25968aa7f7b1255cda9588505fe39445a5ba8e20a",
+    "weight_cache.py": "0e7cfe3a98b7d6abde30be70c5e724cf795c39d788092466df1350efd032e33b"
+  },
+  "probes": [
+    {
+      "compile_refresh": false,
+      "initial_parameter_differences": [],
+      "payloads": {
+        "layers.0.self_attn.qkv_proj": {
+          "codes": {
+            "cache_vs_eager": {
+              "shape": [
+                384,
+                64
+              ],
+              "different": 0,
+              "elements": 24576,
+              "max_abs": 0.0,
+              "max_ref": 255.0,
+              "relative_l2": 0.0
+            },
+            "cache_vs_compiled": {
+              "shape": [
+                384,
+                64
+              ],
+              "different": 45,
+              "elements": 24576,
+              "max_abs": 16.0,
+              "max_ref": 255.0,
+              "relative_l2": 0.003195205278640416
+            }
+          },
+          "blocked_scales": {
+            "cache_vs_eager": {
+              "shape": [
+                3072
+              ],
+              "different": 0,
+              "elements": 3072,
+              "max_abs": 0.0,
+              "max_ref": 126.0,
+              "relative_l2": 0.0
+            },
+            "cache_vs_compiled": {
+              "shape": [
+                3072
+              ],
+              "different": 0,
+              "elements": 3072,
+              "max_abs": 0.0,
+              "max_ref": 126.0,
+              "relative_l2": 0.0
+            }
+          },
+          "global_scale": {
+            "cache_vs_eager": {
+              "shape": [],
+              "different": 0,
+              "elements": 1,
+              "max_abs": 0.0,
+              "max_ref": 3.160749110975303e-05,
+              "relative_l2": 0.0
+            },
+            "cache_vs_compiled": {
+              "shape": [],
+              "different": 0,
+              "elements": 1,
+              "max_abs": 0.0,
+              "max_ref": 3.160749110975303e-05,
+              "relative_l2": 0.0
+            }
+          }
+        },
+        "layers.0.self_attn.o_proj": {
+          "codes": {
+            "cache_vs_eager": {
+              "shape": [
+                128,
+                64
+              ],
+              "different": 0,
+              "elements": 8192,
+              "max_abs": 0.0,
+              "max_ref": 255.0,
+              "relative_l2": 0.0
+            },
+            "cache_vs_compiled": {
+              "shape": [
+                128,
+                64
+              ],
+              "different": 0,
+              "elements": 8192,
+              "max_abs": 0.0,
+              "max_ref": 255.0,
+              "relative_l2": 0.0
+            }
+          },
+          "blocked_scales": {
+            "cache_vs_eager": {
+              "shape": [
+                1024
+              ],
+              "different": 0,
+              "elements": 1024,
+              "max_abs": 0.0,
+              "max_ref": 126.0,
+              "relative_l2": 0.0
+            },
+            "cache_vs_compiled": {
+              "shape": [
+                1024
+              ],
+              "different": 0,
+              "elements": 1024,
+              "max_abs": 0.0,
+              "max_ref": 126.0,
+              "relative_l2": 0.0
+            }
+          },
+          "global_scale": {
+            "cache_vs_eager": {
+              "shape": [],
+              "different": 0,
+              "elements": 1,
+              "max_abs": 0.0,
+              "max_ref": 3.7238711229292676e-05,
+              "relative_l2": 0.0
+            },
+            "cache_vs_compiled": {
+              "shape": [],
+              "different": 0,
+              "elements": 1,
+              "max_abs": 0.0,
+              "max_ref": 3.7238711229292676e-05,
+              "relative_l2": 0.0
+            }
+          }
+        },
+        "layers.0.up_proj": {
+          "codes": {
+            "cache_vs_eager": {
+              "shape": [
+                256,
+                64
+              ],
+              "different": 0,
+              "elements": 16384,
+              "max_abs": 0.0,
+              "max_ref": 255.0,
+              "relative_l2": 0.0
+            },
+            "cache_vs_compiled": {
+              "shape": [
+                256,
+                64
+              ],
+              "different": 5,
+              "elements": 16384,
+              "max_abs": 16.0,
+              "max_ref": 255.0,
+              "relative_l2": 0.0014442521420026154
+            }
+          },
+          "blocked_scales": {
+            "cache_vs_eager": {
+              "shape": [
+                2048
+              ],
+              "different": 0,
+              "elements": 2048,
+              "max_abs": 0.0,
+              "max_ref": 126.0,
+              "relative_l2": 0.0
+            },
+            "cache_vs_compiled": {
+              "shape": [
+                2048
+              ],
+              "different": 0,
+              "elements": 2048,
+              "max_abs": 0.0,
+              "max_ref": 126.0,
+              "relative_l2": 0.0
+            }
+          },
+          "global_scale": {
+            "cache_vs_eager": {
+              "shape": [],
+              "different": 0,
+              "elements": 1,
+              "max_abs": 0.0,
+              "max_ref": 2.9609316698042676e-05,
+              "relative_l2": 0.0
+            },
+            "cache_vs_compiled": {
+              "shape": [],
+              "different": 0,
+              "elements": 1,
+              "max_abs": 0.0,
+              "max_ref": 2.9609316698042676e-05,
+              "relative_l2": 0.0
+            }
+          }
+        },
+        "layers.0.down_proj": {
+          "codes": {
+            "cache_vs_eager": {
+              "shape": [
+                128,
+                128
+              ],
+              "different": 0,
+              "elements": 16384,
+              "max_abs": 0.0,
+              "max_ref": 255.0,
+              "relative_l2": 0.0
+            },
+            "cache_vs_compiled": {
+              "shape": [
+                128,
+                128
+              ],
+              "different": 0,
+              "elements": 16384,
+              "max_abs": 0.0,
+              "max_ref": 255.0,
+              "relative_l2": 0.0
+            }
+          },
+          "blocked_scales": {
+            "cache_vs_eager": {
+              "shape": [
+                2048
+              ],
+              "different": 0,
+              "elements": 2048,
+              "max_abs": 0.0,
+              "max_ref": 126.0,
+              "relative_l2": 0.0
+            },
+            "cache_vs_compiled": {
+              "shape": [
+                2048
+              ],
+              "different": 0,
+              "elements": 2048,
+              "max_abs": 0.0,
+              "max_ref": 126.0,
+              "relative_l2": 0.0
+            }
+          },
+          "global_scale": {
+            "cache_vs_eager": {
+              "shape": [],
+              "different": 0,
+              "elements": 1,
+              "max_abs": 0.0,
+              "max_ref": 3.178914266754873e-05,
+              "relative_l2": 0.0
+            },
+            "cache_vs_compiled": {
+              "shape": [],
+              "different": 0,
+              "elements": 1,
+              "max_abs": 0.0,
+              "max_ref": 3.178914266754873e-05,
+              "relative_l2": 0.0
+            }
+          }
+        }
+      },
+      "microbatches": [
+        {
+          "index": 0,
+          "loss": {
+            "shape": [],
+            "different": 0,
+            "elements": 1,
+            "max_abs": 0.0,
+            "max_ref": 5.572522163391113,
+            "relative_l2": 0.0
+          },
+          "stages": {
+            "layers.0.input_layernorm": {
+              "input": {
+                "shape": [
+                  2,
+                  128,
+                  128
+                ],
+                "different": 0,
+                "elements": 32768,
+                "max_abs": 0.0,
+                "max_ref": 0.0810546875,
+                "relative_l2": 0.0
+              },
+              "output": {
+                "shape": [
+                  2,
+                  128,
+                  128
+                ],
+                "different": 0,
+                "elements": 32768,
+                "max_abs": 0.0,
+                "max_ref": 4.03125,
+                "relative_l2": 0.0
+              }
+            },
+            "layers.0.self_attn.qkv_proj": {
+              "input": {
+                "shape": [
+                  2,
+                  128,
+                  128
+                ],
+                "different": 0,
+                "elements": 32768,
+                "max_abs": 0.0,
+                "max_ref": 4.03125,
+                "relative_l2": 0.0
+              },
+              "output": {
+                "shape": [
+                  2,
+                  128,
+                  384
+                ],
+                "different": 0,
+                "elements": 98304,
+                "max_abs": 0.0,
+                "max_ref": 0.9453125,
+                "relative_l2": 0.0
+              }
+            },
+            "layers.0.self_attn.o_proj": {
+              "input": {
+                "shape": [
+                  2,
+                  128,
+                  128
+                ],
+                "different": 0,
+                "elements": 32768,
+                "max_abs": 0.0,
+                "max_ref": 0.6484375,
+                "relative_l2": 0.0
+              },
+              "output": {
+                "shape": [
+                  2,
+                  128,
+                  128
+                ],
+                "different": 0,
+                "elements": 32768,
+                "max_abs": 0.0,
+                "max_ref": 0.173828125,
+                "relative_l2": 0.0
+              }
+            },
+            "layers.0.post_attention_layernorm": {
+              "input": {
+                "shape": [
+                  2,
+                  128,
+                  128
+                ],
+                "different": 0,
+                "elements": 32768,
+                "max_abs": 0.0,
+                "max_ref": 0.181640625,
+                "relative_l2": 0.0
+              },
+              "output": {
+                "shape": [
+                  2,
+                  128,
+                  128
+                ],
+                "different": 0,
+                "elements": 32768,
+                "max_abs": 0.0,
+                "max_ref": 4.28125,
+                "relative_l2": 0.0
+              }
+            },
+            "layers.0.up_proj": {
+              "input": {
+                "shape": [
+                  2,
+                  128,
+                  128
+                ],
+                "different": 0,
+                "elements": 32768,
+                "max_abs": 0.0,
+                "max_ref": 4.28125,
+                "relative_l2": 0.0
+              },
+              "output": {
+                "shape": [
+                  2,
+                  128,
+                  256
+                ],
+                "different": 0,
+                "elements": 65536,
+                "max_abs": 0.0,
+                "max_ref": 0.9921875,
+                "relative_l2": 0.0
+              }
+            },
+            "layers.0.down_proj": {
+              "input": {
+                "shape": [
+                  2,
+                  128,
+                  256
+                ],
+                "different": 0,
+                "elements": 65536,
+                "max_abs": 0.0,
+                "max_ref": 0.80078125,
+                "relative_l2": 0.0
+              },
+              "output": {
+                "shape": [
+                  2,
+                  128,
+                  128
+                ],
+                "different": 0,
+                "elements": 32768,
+                "max_abs": 0.0,
+                "max_ref": 0.1728515625,
+                "relative_l2": 0.0
+              }
+            },
+            "norm": {
+              "input": {
+                "shape": [
+                  2,
+                  128,
+                  128
+                ],
+                "different": 0,
+                "elements": 32768,
+                "max_abs": 0.0,
+                "max_ref": 0.251953125,
+                "relative_l2": 0.0
+              },
+              "output": {
+                "shape": [
+                  2,
+                  128,
+                  128
+                ],
+                "different": 0,
+                "elements": 32768,
+                "max_abs": 0.0,
+                "max_ref": 3.875,
+                "relative_l2": 0.0
+              }
+            }
+          },
+          "first_output_difference": null
+        },
+        {
+          "index": 1,
+          "loss": {
+            "shape": [],
+            "different": 0,
+            "elements": 1,
+            "max_abs": 0.0,
+            "max_ref": 5.537838459014893,
+            "relative_l2": 0.0
+          },
+          "stages": {
+            "layers.0.input_layernorm": {
+              "input": {
+                "shape": [
+                  2,
+                  128,
+                  128
+                ],
+                "different": 0,
+                "elements": 32768,
+                "max_abs": 0.0,
+                "max_ref": 0.0810546875,
+                "relative_l2": 0.0
+              },
+              "output": {
+                "shape": [
+                  2,
+                  128,
+                  128
+                ],
+                "different": 0,
+                "elements": 32768,
+                "max_abs": 0.0,
+                "max_ref": 4.0,
+                "relative_l2": 0.0
+              }
+            },
+            "layers.0.self_attn.qkv_proj": {
+              "input": {
+                "shape": [
+                  2,
+                  128,
+                  128
+                ],
+                "different": 0,
+                "elements": 32768,
+                "max_abs": 0.0,
+                "max_ref": 4.0,
+                "relative_l2": 0.0
+              },
+              "output": {
+                "shape": [
+                  2,
+                  128,
+                  384
+                ],
+                "different": 0,
+                "elements": 98304,
+                "max_abs": 0.0,
+                "max_ref": 1.0078125,
+                "relative_l2": 0.0
+              }
+            },
+            "layers.0.self_attn.o_proj": {
+              "input": {
+                "shape": [
+                  2,
+                  128,
+                  128
+                ],
+                "different": 0,
+                "elements": 32768,
+                "max_abs": 0.0,
+                "max_ref": 0.58984375,
+                "relative_l2": 0.0
+              },
+              "output": {
+                "shape": [
+                  2,
+                  128,
+                  128
+                ],
+                "different": 0,
+                "elements": 32768,
+                "max_abs": 0.0,
+                "max_ref": 0.220703125,
+                "relative_l2": 0.0
+              }
+            },
+            "layers.0.post_attention_layernorm": {
+              "input": {
+                "shape": [
+                  2,
+                  128,
+                  128
+                ],
+                "different": 0,
+                "elements": 32768,
+                "max_abs": 0.0,
+                "max_ref": 0.1806640625,
+                "relative_l2": 0.0
+              },
+              "output": {
+                "shape": [
+                  2,
+                  128,
+                  128
+                ],
+                "different": 0,
+                "elements": 32768,
+                "max_abs": 0.0,
+                "max_ref": 4.34375,
+                "relative_l2": 0.0
+              }
+            },
+            "layers.0.up_proj": {
+              "input": {
+                "shape": [
+                  2,
+                  128,
+                  128
+                ],
+                "different": 0,
+                "elements": 32768,
+                "max_abs": 0.0,
+                "max_ref": 4.34375,
+                "relative_l2": 0.0
+              },
+              "output": {
+                "shape": [
+                  2,
+                  128,
+                  256
+                ],
+                "different": 0,
+                "elements": 65536,
+                "max_abs": 0.0,
+                "max_ref": 1.0078125,
+                "relative_l2": 0.0
+              }
+            },
+            "layers.0.down_proj": {
+              "input": {
+                "shape": [
+                  2,
+                  128,
+                  256
+                ],
+                "different": 0,
+                "elements": 65536,
+                "max_abs": 0.0,
+                "max_ref": 0.8515625,
+                "relative_l2": 0.0
+              },
+              "output": {
+                "shape": [
+                  2,
+                  128,
+                  128
+                ],
+                "different": 0,
+                "elements": 32768,
+                "max_abs": 0.0,
+                "max_ref": 0.1640625,
+                "relative_l2": 0.0
+              }
+            },
+            "norm": {
+              "input": {
+                "shape": [
+                  2,
+                  128,
+                  128
+                ],
+                "different": 0,
+                "elements": 32768,
+                "max_abs": 0.0,
+                "max_ref": 0.205078125,
+                "relative_l2": 0.0
+              },
+              "output": {
+                "shape": [
+                  2,
+                  128,
+                  128
+                ],
+                "different": 0,
+                "elements": 32768,
+                "max_abs": 0.0,
+                "max_ref": 4.3125,
+                "relative_l2": 0.0
+              }
+            }
+          },
+          "first_output_difference": null
+        }
+      ],
+      "identical_input_linear_dispatch": {
+        "layers.0.self_attn.qkv_proj": {
+          "cached_2d": {
+            "shape": [
+              256,
+              384
+            ],
+            "different": 0,
+            "elements": 98304,
+            "max_abs": 0.0,
+            "max_ref": 1.0078125,
+            "relative_l2": 0.0
+          },
+          "cached_flat": {
+            "shape": [
+              256,
+              384
+            ],
+            "different": 0,
+            "elements": 98304,
+            "max_abs": 0.0,
+            "max_ref": 1.0078125,
+            "relative_l2": 0.0
+          }
+        },
+        "layers.0.self_attn.o_proj": {
+          "cached_2d": {
+            "shape": [
+              256,
+              128
+            ],
+            "different": 0,
+            "elements": 32768,
+            "max_abs": 0.0,
+            "max_ref": 0.220703125,
+            "relative_l2": 0.0
+          },
+          "cached_flat": {
+            "shape": [
+              256,
+              128
+            ],
+            "different": 0,
+            "elements": 32768,
+            "max_abs": 0.0,
+            "max_ref": 0.220703125,
+            "relative_l2": 0.0
+          }
+        },
+        "layers.0.up_proj": {
+          "cached_2d": {
+            "shape": [
+              256,
+              256
+            ],
+            "different": 0,
+            "elements": 65536,
+            "max_abs": 0.0,
+            "max_ref": 1.0078125,
+            "relative_l2": 0.0
+          },
+          "cached_flat": {
+            "shape": [
+              256,
+              256
+            ],
+            "different": 0,
+            "elements": 65536,
+            "max_abs": 0.0,
+            "max_ref": 1.0078125,
+            "relative_l2": 0.0
+          }
+        },
+        "layers.0.down_proj": {
+          "cached_2d": {
+            "shape": [
+              256,
+              128
+            ],
+            "different": 0,
+            "elements": 32768,
+            "max_abs": 0.0,
+            "max_ref": 0.1640625,
+            "relative_l2": 0.0
+          },
+          "cached_flat": {
+            "shape": [
+              256,
+              128
+            ],
+            "different": 0,
+            "elements": 32768,
+            "max_abs": 0.0,
+            "max_ref": 0.1640625,
+            "relative_l2": 0.0
+          }
+        }
+      }
+    },
+    {
+      "compile_refresh": true,
+      "initial_parameter_differences": [],
+      "payloads": {
+        "layers.0.self_attn.qkv_proj": {
+          "codes": {
+            "cache_vs_eager": {
+              "shape": [
+                384,
+                64
+              ],
+              "different": 45,
+              "elements": 24576,
+              "max_abs": 16.0,
+              "max_ref": 255.0,
+              "relative_l2": 0.003195491582333499
+            },
+            "cache_vs_compiled": {
+              "shape": [
+                384,
+                64
+              ],
+              "different": 0,
+              "elements": 24576,
+              "max_abs": 0.0,
+              "max_ref": 255.0,
+              "relative_l2": 0.0
+            }
+          },
+          "blocked_scales": {
+            "cache_vs_eager": {
+              "shape": [
+                3072
+              ],
+              "different": 0,
+              "elements": 3072,
+              "max_abs": 0.0,
+              "max_ref": 126.0,
+              "relative_l2": 0.0
+            },
+            "cache_vs_compiled": {
+              "shape": [
+                3072
+              ],
+              "different": 0,
+              "elements": 3072,
+              "max_abs": 0.0,
+              "max_ref": 126.0,
+              "relative_l2": 0.0
+            }
+          },
+          "global_scale": {
+            "cache_vs_eager": {
+              "shape": [],
+              "different": 0,
+              "elements": 1,
+              "max_abs": 0.0,
+              "max_ref": 3.160749110975303e-05,
+              "relative_l2": 0.0
+            },
+            "cache_vs_compiled": {
+              "shape": [],
+              "different": 0,
+              "elements": 1,
+              "max_abs": 0.0,
+              "max_ref": 3.160749110975303e-05,
+              "relative_l2": 0.0
+            }
+          }
+        },
+        "layers.0.self_attn.o_proj": {
+          "codes": {
+            "cache_vs_eager": {
+              "shape": [
+                128,
+                64
+              ],
+              "different": 0,
+              "elements": 8192,
+              "max_abs": 0.0,
+              "max_ref": 255.0,
+              "relative_l2": 0.0
+            },
+            "cache_vs_compiled": {
+              "shape": [
+                128,
+                64
+              ],
+              "different": 0,
+              "elements": 8192,
+              "max_abs": 0.0,
+              "max_ref": 255.0,
+              "relative_l2": 0.0
+            }
+          },
+          "blocked_scales": {
+            "cache_vs_eager": {
+              "shape": [
+                1024
+              ],
+              "different": 0,
+              "elements": 1024,
+              "max_abs": 0.0,
+              "max_ref": 126.0,
+              "relative_l2": 0.0
+            },
+            "cache_vs_compiled": {
+              "shape": [
+                1024
+              ],
+              "different": 0,
+              "elements": 1024,
+              "max_abs": 0.0,
+              "max_ref": 126.0,
+              "relative_l2": 0.0
+            }
+          },
+          "global_scale": {
+            "cache_vs_eager": {
+              "shape": [],
+              "different": 0,
+              "elements": 1,
+              "max_abs": 0.0,
+              "max_ref": 3.7238711229292676e-05,
+              "relative_l2": 0.0
+            },
+            "cache_vs_compiled": {
+              "shape": [],
+              "different": 0,
+              "elements": 1,
+              "max_abs": 0.0,
+              "max_ref": 3.7238711229292676e-05,
+              "relative_l2": 0.0
+            }
+          }
+        },
+        "layers.0.up_proj": {
+          "codes": {
+            "cache_vs_eager": {
+              "shape": [
+                256,
+                64
+              ],
+              "different": 5,
+              "elements": 16384,
+              "max_abs": 16.0,
+              "max_ref": 255.0,
+              "relative_l2": 0.0014442591960316725
+            },
+            "cache_vs_compiled": {
+              "shape": [
+                256,
+                64
+              ],
+              "different": 0,
+              "elements": 16384,
+              "max_abs": 0.0,
+              "max_ref": 255.0,
+              "relative_l2": 0.0
+            }
+          },
+          "blocked_scales": {
+            "cache_vs_eager": {
+              "shape": [
+                2048
+              ],
+              "different": 0,
+              "elements": 2048,
+              "max_abs": 0.0,
+              "max_ref": 126.0,
+              "relative_l2": 0.0
+            },
+            "cache_vs_compiled": {
+              "shape": [
+                2048
+              ],
+              "different": 0,
+              "elements": 2048,
+              "max_abs": 0.0,
+              "max_ref": 126.0,
+              "relative_l2": 0.0
+            }
+          },
+          "global_scale": {
+            "cache_vs_eager": {
+              "shape": [],
+              "different": 0,
+              "elements": 1,
+              "max_abs": 0.0,
+              "max_ref": 2.9609316698042676e-05,
+              "relative_l2": 0.0
+            },
+            "cache_vs_compiled": {
+              "shape": [],
+              "different": 0,
+              "elements": 1,
+              "max_abs": 0.0,
+              "max_ref": 2.9609316698042676e-05,
+              "relative_l2": 0.0
+            }
+          }
+        },
+        "layers.0.down_proj": {
+          "codes": {
+            "cache_vs_eager": {
+              "shape": [
+                128,
+                128
+              ],
+              "different": 0,
+              "elements": 16384,
+              "max_abs": 0.0,
+              "max_ref": 255.0,
+              "relative_l2": 0.0
+            },
+            "cache_vs_compiled": {
+              "shape": [
+                128,
+                128
+              ],
+              "different": 0,
+              "elements": 16384,
+              "max_abs": 0.0,
+              "max_ref": 255.0,
+              "relative_l2": 0.0
+            }
+          },
+          "blocked_scales": {
+            "cache_vs_eager": {
+              "shape": [
+                2048
+              ],
+              "different": 0,
+              "elements": 2048,
+              "max_abs": 0.0,
+              "max_ref": 126.0,
+              "relative_l2": 0.0
+            },
+            "cache_vs_compiled": {
+              "shape": [
+                2048
+              ],
+              "different": 0,
+              "elements": 2048,
+              "max_abs": 0.0,
+              "max_ref": 126.0,
+              "relative_l2": 0.0
+            }
+          },
+          "global_scale": {
+            "cache_vs_eager": {
+              "shape": [],
+              "different": 0,
+              "elements": 1,
+              "max_abs": 0.0,
+              "max_ref": 3.178914266754873e-05,
+              "relative_l2": 0.0
+            },
+            "cache_vs_compiled": {
+              "shape": [],
+              "different": 0,
+              "elements": 1,
+              "max_abs": 0.0,
+              "max_ref": 3.178914266754873e-05,
+              "relative_l2": 0.0
+            }
+          }
+        }
+      },
+      "microbatches": [
+        {
+          "index": 0,
+          "loss": {
+            "shape": [],
+            "different": 1,
+            "elements": 1,
+            "max_abs": 0.002036571502685547,
+            "max_ref": 5.572522163391113,
+            "relative_l2": 0.00036546673893284395
+          },
+          "stages": {
+            "layers.0.input_layernorm": {
+              "input": {
+                "shape": [
+                  2,
+                  128,
+                  128
+                ],
+                "different": 0,
+                "elements": 32768,
+                "max_abs": 0.0,
+                "max_ref": 0.0810546875,
+                "relative_l2": 0.0
+              },
+              "output": {
+                "shape": [
+                  2,
+                  128,
+                  128
+                ],
+                "different": 0,
+                "elements": 32768,
+                "max_abs": 0.0,
+                "max_ref": 4.03125,
+                "relative_l2": 0.0
+              }
+            },
+            "layers.0.self_attn.qkv_proj": {
+              "input": {
+                "shape": [
+                  2,
+                  128,
+                  128
+                ],
+                "different": 0,
+                "elements": 32768,
+                "max_abs": 0.0,
+                "max_ref": 4.03125,
+                "relative_l2": 0.0
+              },
+              "output": {
+                "shape": [
+                  2,
+                  128,
+                  384
+                ],
+                "different": 9339,
+                "elements": 98304,
+                "max_abs": 0.05859375,
+                "max_ref": 0.9453125,
+                "relative_l2": 0.013248022978017799
+              }
+            },
+            "layers.0.self_attn.o_proj": {
+              "input": {
+                "shape": [
+                  2,
+                  128,
+                  128
+                ],
+                "different": 15866,
+                "elements": 32768,
+                "max_abs": 0.01953125,
+                "max_ref": 0.6484375,
+                "relative_l2": 0.009794643606726479
+              },
+              "output": {
+                "shape": [
+                  2,
+                  128,
+                  128
+                ],
+                "different": 27171,
+                "elements": 32768,
+                "max_abs": 0.0087890625,
+                "max_ref": 0.173828125,
+                "relative_l2": 0.039177255340416155
+              }
+            },
+            "layers.0.post_attention_layernorm": {
+              "input": {
+                "shape": [
+                  2,
+                  128,
+                  128
+                ],
+                "different": 23694,
+                "elements": 32768,
+                "max_abs": 0.0087890625,
+                "max_ref": 0.181640625,
+                "relative_l2": 0.01951382207359604
+              },
+              "output": {
+                "shape": [
+                  2,
+                  128,
+                  128
+                ],
+                "different": 23623,
+                "elements": 32768,
+                "max_abs": 0.166015625,
+                "max_ref": 4.28125,
+                "relative_l2": 0.016294694932211733
+              }
+            },
+            "layers.0.up_proj": {
+              "input": {
+                "shape": [
+                  2,
+                  128,
+                  128
+                ],
+                "different": 23623,
+                "elements": 32768,
+                "max_abs": 0.166015625,
+                "max_ref": 4.28125,
+                "relative_l2": 0.016294694932211733
+              },
+              "output": {
+                "shape": [
+                  2,
+                  128,
+                  256
+                ],
+                "different": 63450,
+                "elements": 65536,
+                "max_abs": 0.112548828125,
+                "max_ref": 0.9921875,
+                "relative_l2": 0.07215965504541755
+              }
+            },
+            "layers.0.down_proj": {
+              "input": {
+                "shape": [
+                  2,
+                  128,
+                  256
+                ],
+                "different": 62553,
+                "elements": 65536,
+                "max_abs": 0.0810546875,
+                "max_ref": 0.80078125,
+                "relative_l2": 0.07301394183955849
+              },
+              "output": {
+                "shape": [
+                  2,
+                  128,
+                  128
+                ],
+                "different": 32299,
+                "elements": 32768,
+                "max_abs": 0.027587890625,
+                "max_ref": 0.1728515625,
+                "relative_l2": 0.1353752398112101
+              }
+            },
+            "norm": {
+              "input": {
+                "shape": [
+                  2,
+                  128,
+                  128
+                ],
+                "different": 32151,
+                "elements": 32768,
+                "max_abs": 0.026123046875,
+                "max_ref": 0.251953125,
+                "relative_l2": 0.11659926767933076
+              },
+              "output": {
+                "shape": [
+                  2,
+                  128,
+                  128
+                ],
+                "different": 32238,
+                "elements": 32768,
+                "max_abs": 0.57421875,
+                "max_ref": 3.875,
+                "relative_l2": 0.11672742802861977
+              }
+            }
+          },
+          "first_output_difference": "layers.0.self_attn.qkv_proj"
+        },
+        {
+          "index": 1,
+          "loss": {
+            "shape": [],
+            "different": 1,
+            "elements": 1,
+            "max_abs": 7.867813110351562e-05,
+            "max_ref": 5.537838459014893,
+            "relative_l2": 1.4207372007292429e-05
+          },
+          "stages": {
+            "layers.0.input_layernorm": {
+              "input": {
+                "shape": [
+                  2,
+                  128,
+                  128
+                ],
+                "different": 0,
+                "elements": 32768,
+                "max_abs": 0.0,
+                "max_ref": 0.0810546875,
+                "relative_l2": 0.0
+              },
+              "output": {
+                "shape": [
+                  2,
+                  128,
+                  128
+                ],
+                "different": 0,
+                "elements": 32768,
+                "max_abs": 0.0,
+                "max_ref": 4.0,
+                "relative_l2": 0.0
+              }
+            },
+            "layers.0.self_attn.qkv_proj": {
+              "input": {
+                "shape": [
+                  2,
+                  128,
+                  128
+                ],
+                "different": 0,
+                "elements": 32768,
+                "max_abs": 0.0,
+                "max_ref": 4.0,
+                "relative_l2": 0.0
+              },
+              "output": {
+                "shape": [
+                  2,
+                  128,
+                  384
+                ],
+                "different": 9350,
+                "elements": 98304,
+                "max_abs": 0.052734375,
+                "max_ref": 1.0078125,
+                "relative_l2": 0.013458745009374405
+              }
+            },
+            "layers.0.self_attn.o_proj": {
+              "input": {
+                "shape": [
+                  2,
+                  128,
+                  128
+                ],
+                "different": 15838,
+                "elements": 32768,
+                "max_abs": 0.01904296875,
+                "max_ref": 0.58984375,
+                "relative_l2": 0.012565723898167284
+              },
+              "output": {
+                "shape": [
+                  2,
+                  128,
+                  128
+                ],
+                "different": 28502,
+                "elements": 32768,
+                "max_abs": 0.00927734375,
+                "max_ref": 0.220703125,
+                "relative_l2": 0.037211539539067445
+              }
+            },
+            "layers.0.post_attention_layernorm": {
+              "input": {
+                "shape": [
+                  2,
+                  128,
+                  128
+                ],
+                "different": 24944,
+                "elements": 32768,
+                "max_abs": 0.00927734375,
+                "max_ref": 0.1806640625,
+                "relative_l2": 0.018530983975442252
+              },
+              "output": {
+                "shape": [
+                  2,
+                  128,
+                  128
+                ],
+                "different": 24895,
+                "elements": 32768,
+                "max_abs": 0.16162109375,
+                "max_ref": 4.34375,
+                "relative_l2": 0.01578923614778891
+              }
+            },
+            "layers.0.up_proj": {
+              "input": {
+                "shape": [
+                  2,
+                  128,
+                  128
+                ],
+                "different": 24895,
+                "elements": 32768,
+                "max_abs": 0.16162109375,
+                "max_ref": 4.34375,
+                "relative_l2": 0.01578923614778891
+              },
+              "output": {
+                "shape": [
+                  2,
+                  128,
+                  256
+                ],
+                "different": 56969,
+                "elements": 65536,
+                "max_abs": 0.119140625,
+                "max_ref": 1.0078125,
+                "relative_l2": 0.061392389786307684
+              }
+            },
+            "layers.0.down_proj": {
+              "input": {
+                "shape": [
+                  2,
+                  128,
+                  256
+                ],
+                "different": 56228,
+                "elements": 65536,
+                "max_abs": 0.0908203125,
+                "max_ref": 0.8515625,
+                "relative_l2": 0.062270207265006323
+              },
+              "output": {
+                "shape": [
+                  2,
+                  128,
+                  128
+                ],
+                "different": 32227,
+                "elements": 32768,
+                "max_abs": 0.0256805419921875,
+                "max_ref": 0.1640625,
+                "relative_l2": 0.12008698172130142
+              }
+            },
+            "norm": {
+              "input": {
+                "shape": [
+                  2,
+                  128,
+                  128
+                ],
+                "different": 32004,
+                "elements": 32768,
+                "max_abs": 0.0262451171875,
+                "max_ref": 0.205078125,
+                "relative_l2": 0.10281214219786983
+              },
+              "output": {
+                "shape": [
+                  2,
+                  128,
+                  128
+                ],
+                "different": 32107,
+                "elements": 32768,
+                "max_abs": 0.671875,
+                "max_ref": 4.3125,
+                "relative_l2": 0.10293436675430119
+              }
+            }
+          },
+          "first_output_difference": "layers.0.self_attn.qkv_proj"
+        }
+      ],
+      "identical_input_linear_dispatch": {
+        "layers.0.self_attn.qkv_proj": {
+          "cached_2d": {
+            "shape": [
+              256,
+              384
+            ],
+            "different": 9350,
+            "elements": 98304,
+            "max_abs": 0.052734375,
+            "max_ref": 1.0078125,
+            "relative_l2": 0.013458745009374405
+          },
+          "cached_flat": {
+            "shape": [
+              256,
+              384
+            ],
+            "different": 9350,
+            "elements": 98304,
+            "max_abs": 0.052734375,
+            "max_ref": 1.0078125,
+            "relative_l2": 0.013458745009374405
+          }
+        },
+        "layers.0.self_attn.o_proj": {
+          "cached_2d": {
+            "shape": [
+              256,
+              128
+            ],
+            "different": 0,
+            "elements": 32768,
+            "max_abs": 0.0,
+            "max_ref": 0.220703125,
+            "relative_l2": 0.0
+          },
+          "cached_flat": {
+            "shape": [
+              256,
+              128
+            ],
+            "different": 0,
+            "elements": 32768,
+            "max_abs": 0.0,
+            "max_ref": 0.220703125,
+            "relative_l2": 0.0
+          }
+        },
+        "layers.0.up_proj": {
+          "cached_2d": {
+            "shape": [
+              256,
+              256
+            ],
+            "different": 1076,
+            "elements": 65536,
+            "max_abs": 0.0107421875,
+            "max_ref": 1.0078125,
+            "relative_l2": 0.002135864085281915
+          },
+          "cached_flat": {
+            "shape": [
+              256,
+              256
+            ],
+            "different": 1076,
+            "elements": 65536,
+            "max_abs": 0.0107421875,
+            "max_ref": 1.0078125,
+            "relative_l2": 0.002135864085281915
+          }
+        },
+        "layers.0.down_proj": {
+          "cached_2d": {
+            "shape": [
+              256,
+              128
+            ],
+            "different": 0,
+            "elements": 32768,
+            "max_abs": 0.0,
+            "max_ref": 0.1640625,
+            "relative_l2": 0.0
+          },
+          "cached_flat": {
+            "shape": [
+              256,
+              128
+            ],
+            "different": 0,
+            "elements": 32768,
+            "max_abs": 0.0,
+            "max_ref": 0.1640625,
+            "relative_l2": 0.0
+          }
+        }
+      }
+    }
+  ],
+  "torch_version": "2.11.0+cu128"
+}

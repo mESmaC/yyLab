@@ -30,7 +30,7 @@ from torch import Tensor, nn
 
 from .. import db
 from ..artifacts import adapter_dir, run_dir, write_json
-from ..models.loading import load_base
+from ..models.loading import load_base, supports_generation_cache
 from ..train.antidoom import (
     FTPOPair,
     find_inner_repetition,
@@ -544,7 +544,7 @@ def _generate_batch(
             attention_mask=attention_mask,
             max_new_tokens=int(cfg["max_new_tokens"]),
             do_sample=False,
-            use_cache=True,
+            use_cache=supports_generation_cache(model),
             pad_token_id=int(tokenizer.pad_token_id),
             eos_token_id=int(tokenizer.eos_token_id),
             return_dict_in_generate=True,
@@ -723,7 +723,7 @@ def evaluate_qualitative(
             "attention_mask": attention_mask,
             "max_new_tokens": int(cfg["qualitative_max_new_tokens"]),
             "do_sample": sampled,
-            "use_cache": True,
+            "use_cache": supports_generation_cache(model),
             "pad_token_id": int(tokenizer.pad_token_id),
             "eos_token_id": int(tokenizer.eos_token_id),
             "return_dict_in_generate": True,
@@ -1261,6 +1261,20 @@ def _training_batch(
     }
 
 
+def resolve_target_modules(model: nn.Module, requested: Sequence[str]) -> list[str]:
+    """Map a full Q/K/V target request to Sprint's single packed projection."""
+    targets = list(requested)
+    if getattr(model.config, "model_type", "") != "sprint":
+        return targets
+    split_qkv = {"q_proj", "k_proj", "v_proj"}
+    selected = split_qkv.intersection(targets)
+    if selected and selected != split_qkv:
+        raise ValueError("Sprint packs Q/K/V together; use qkv_proj instead of individual q_proj/k_proj/v_proj targets")
+    if selected:
+        targets = ["qkv_proj" if name in split_qkv else name for name in targets]
+    return list(dict.fromkeys(targets))
+
+
 def train_ftpo(
     base_model: nn.Module,
     tokenizer: Any,
@@ -1271,13 +1285,14 @@ def train_ftpo(
     from peft import LoraConfig, get_peft_model
     from transformers import get_scheduler
 
+    target_modules = resolve_target_modules(base_model, cfg["target_modules"])
     lora = LoraConfig(
         r=int(cfg["rank"]),
         lora_alpha=int(cfg["alpha"]),
         lora_dropout=float(cfg["dropout"]),
         bias="none",
         task_type="CAUSAL_LM",
-        target_modules=list(cfg["target_modules"]),
+        target_modules=target_modules,
         # This adapter intentionally changes the output projection without
         # changing the tied input embedding.  It must remain adapter-only and
         # must never be merged back into the tied base tensor.
@@ -1468,6 +1483,7 @@ def train_ftpo(
         "trainable_parameters": trainable,
         "loaded_parameters": total,
         "trainable_dtypes": dict(trainable_dtypes),
+        "target_modules": target_modules,
         "optimizer_master": master_summary,
         "elapsed_s": round(time.perf_counter() - started, 3),
     }
@@ -1554,7 +1570,7 @@ def run_antidoom(cfg: dict[str, Any], rd: Path) -> dict[str, Any]:
             f"AntiDoom requires {required_context} positions but the checkpoint supports "
             f"only {max_positions}"
         )
-    model.config.use_cache = True
+    model.config.use_cache = supports_generation_cache(model)
     model.eval()
     for note in notes:
         log(f"note: {note}")
@@ -1625,7 +1641,7 @@ def run_antidoom(cfg: dict[str, Any], rd: Path) -> dict[str, Any]:
     if reload_tokenizer.pad_token_id is None:
         reload_tokenizer.pad_token = reload_tokenizer.eos_token
     reload_tokenizer.padding_side = "left"
-    model.config.use_cache = True
+    model.config.use_cache = supports_generation_cache(model)
     model.eval()
     post = evaluate_loop_rate(model, reload_tokenizer, eval_prompts, cfg)
     post_nll = evaluate_causal_nll(model, reload_tokenizer, eval_prompts, cfg)

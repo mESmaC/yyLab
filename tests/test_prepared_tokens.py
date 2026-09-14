@@ -218,6 +218,21 @@ def test_prefetch_consumption_stats_early_close_and_errors(depth):
         list(BufferedBatches(Batches(), depth))
 
 
+def test_worker_defaults_to_prepared_reuses_across_packing_configs(corpus_factory, tmp_path):
+    from yylab.workers.train import build_batches
+
+    corpus_factory("a", [{"text": "example training stream " * 30}])
+    tokenizer = ByteTokenizer()
+    cfg = {"corpora": ["a"], "seq_len": 16, "micro_batch": 1, "grad_accum": 1, "token_cache_dir": str(tmp_path / "cache")}
+    first = build_batches(cfg, tokenizer, 3)
+    assert len(list(first)) == 3
+    calls = tokenizer.calls
+    cached = build_batches({**cfg, "seq_len": 9, "seed": 12, "epochs": 2}, tokenizer, 7)
+    live = build_batches({**cfg, "token_cache": False, "seq_len": 9, "seed": 12, "epochs": 2}, tokenizer, 7)
+    actual = list(cached)
+    assert tokenizer.calls == calls
+    assert actual == list(live)
+    assert cached.data_stats()["prepared_tokens"]["a"]["tokens"] > 0
 
 
 def test_text_pointer_snapshot_tracks_original_files(corpus_factory, tmp_path):
@@ -250,3 +265,29 @@ def test_gccf_snapshot_uses_absolute_sources_and_selection(corpus_factory, tmp_p
     (root / "gccf-source.json").write_text(json.dumps({"index_directory": str(index), "source": "selected"}))
     snapshot = prepared.source_snapshot("gccf")
     assert [row["path"] for row in snapshot["sources"]] == [str(source)]
+
+
+def test_native_builder_preserves_n_plus_one_width_and_resume(corpus_factory, tmp_path):
+    from spalmer.training import CausalBatch
+    from test_spalmer_training import _config
+
+    from yylab.train.spalmer import build_spalmer_batch_source
+
+    corpus_factory("a", [{"text": "repeatable training data " * 80}])
+    tokenizer = ByteTokenizer()
+    tokenizer.special_tokens = SimpleNamespace(eos_id=1)
+    tokenizer.tokenizer = tokenizer.__call__
+    cfg = _config(corpora=["a"], max_steps=8, grad_accum=2, token_cache_dir=str(tmp_path / "cache"))
+    first = build_spalmer_batch_source(cfg, tokenizer, causal_batch_type=CausalBatch)
+    batch = first.next_batch(batch_size=1, sequence_length=8)
+    assert batch.input_ids.shape == (1, 9)
+    state = first.state_dict()
+    expected = [first.next_batch(batch_size=1, sequence_length=8).input_ids.tolist() for _ in range(5)]
+    first.close()
+    calls = tokenizer.calls
+    resumed = build_spalmer_batch_source(cfg, tokenizer, causal_batch_type=CausalBatch)
+    resumed.load_state_dict(state)
+    assert [resumed.next_batch(batch_size=1, sequence_length=8).input_ids.tolist() for _ in range(5)] == expected
+    assert resumed.consumed_batches == 6
+    assert tokenizer.calls == calls
+    resumed.close()

@@ -12,6 +12,7 @@ from ... import db
 from ...config import get_settings
 from ...hw import best_gpu
 from ...infer.engine import ENGINE, LoadSpec
+from ...infer.prompt_format import PromptFormat
 from ...jobs import JOBS
 from ...models.bitsandbytes_capabilities import (
     available_bitsandbytes_quantizations,
@@ -101,6 +102,12 @@ def _user_message(text: str, *, atxy_t: object = "", atxy_x: object = "", atxy_y
     if any(address.values()):
         message["atxy"] = address
     return message
+
+
+def _prompt_mode_settings(prompt_format: PromptFormat) -> tuple[dict[str, str], str, str]:
+    """Only established formats are offered for checkpoints with a record."""
+
+    return prompt_format.options(), prompt_format.default_mode, prompt_format.note
 
 
 def _generation_snapshot(history: list[dict], current: dict, prompt_mode: str) -> list[dict]:
@@ -462,9 +469,9 @@ def chat_page():
             with ui.row().classes("w-full gap-3 mt-2 items-end"):
                 prompt_mode = (
                     ui.select(
-                        CHAT_PROMPT_MODES,
-                        value="chat",
-                        label="Prompt mode",
+                        ENGINE.prompt_format.options(),
+                        value=ENGINE.prompt_format.default_mode,
+                        label="Input format",
                     )
                     .props("dense outlined")
                     .classes("w-40")
@@ -506,9 +513,7 @@ def chat_page():
             context_lbl = ui.label("Context usage will appear after the first message.").classes(
                 "text-xs text-gray-500 mt-1"
             )
-            prompt_mode_lbl = ui.label(
-                "Chat template applies the checkpoint tokenizer's role/control-token format and reuses prior turns."
-            ).classes("text-xs text-gray-500 mt-1")
+            prompt_mode_lbl = ui.label(ENGINE.prompt_format.note).classes("text-xs text-gray-500 mt-1")
             routing_lbl = ui.label("").classes("text-xs text-cyan-300 mt-1")
             routing_lbl.visible = False
             atxy_panel = ui.expansion("ATXY address A=(T,X,Y) · optional", icon="hub").classes(
@@ -785,6 +790,9 @@ def chat_page():
             load_btn.props(remove="loading").enable()
             if job.status == "done":
                 ui.notify(f"Loaded: {ENGINE.status()}", type="positive")
+                options, default_mode, _ = _prompt_mode_settings(ENGINE.prompt_format)
+                prompt_mode.set_options(options, value=default_mode)
+                on_prompt_mode_change()
                 for n in ENGINE.notes[-4:]:
                     ui.notify(n, type="info")
                 resolved = ENGINE.spec.settings if ENGINE.spec else {}
@@ -831,6 +839,9 @@ def chat_page():
 
         def on_unload() -> None:
             ENGINE.unload()
+            options, default_mode, _ = _prompt_mode_settings(ENGINE.prompt_format)
+            prompt_mode.set_options(options, value=default_mode)
+            on_prompt_mode_change()
             status_lbl.text = ENGINE.status()
             context_lbl.text = "Context usage will appear after the first message."
             routing_lbl.text = ""
@@ -977,16 +988,15 @@ def chat_page():
                 context_strategy.disable()
                 atxy_panel.visible = False
                 prompt_mode_lbl.text = (
-                    "Raw completion sends each prompt verbatim and independently. History, ATXY retrieval, "
-                    "and automatic compaction are not used; oversized prompts are rejected, not truncated."
+                    ENGINE.prompt_format.note + " Each passage is sent exactly as entered, without conversation "
+                    "history. Shorten passages that do not fit the available context."
                 )
             else:
                 auto_compact.enable()
                 context_strategy.enable()
                 atxy_panel.visible = True
                 prompt_mode_lbl.text = (
-                    "Chat template applies the checkpoint tokenizer's role/control-token format and reuses "
-                    "prior turns."
+                    ENGINE.prompt_format.note + " Prior conversation turns are included."
                 )
             on_clear()
 
@@ -999,6 +1009,7 @@ def chat_page():
         unload_btn.on_click(on_unload)
         clear_btn.on_click(on_clear)
         prompt_mode.on_value_change(on_prompt_mode_change)
+        on_prompt_mode_change()
         inp.on("keydown.enter", lambda e: on_send() if not e.args.get("shiftKey") else None)
         ui.timer(0.05, drain)
         ui.timer(0.25, refresh_routing_telemetry)

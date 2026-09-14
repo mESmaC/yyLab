@@ -7,6 +7,8 @@ import threading
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field, replace
 
+from .prompt_format import PromptFormat, resolve_prompt_format
+
 
 @dataclass
 class LoadSpec:
@@ -82,7 +84,10 @@ class ChatContextPlan:
         }
 
 
-def format_messages(tokenizer, messages: list[dict], *, prompt_mode: str = "chat") -> str:
+def format_messages(
+    tokenizer, messages: list[dict], *, prompt_mode: str | None = None,
+    prompt_format: PromptFormat | None = None,
+) -> str:
     """Render one generation prompt in chat-template or raw-completion mode.
 
     Raw completion deliberately accepts exactly one payload. Treating a list
@@ -90,6 +95,8 @@ def format_messages(tokenizer, messages: list[dict], *, prompt_mode: str = "chat
     multi-turn semantics that a base pretrained checkpoint has not learned.
     """
 
+    contract = prompt_format or PromptFormat()
+    prompt_mode = contract.resolve_mode(prompt_mode)
     if prompt_mode == "raw":
         if len(messages) != 1:
             raise ValueError("Raw completion requires exactly one independent prompt.")
@@ -99,6 +106,17 @@ def format_messages(tokenizer, messages: list[dict], *, prompt_mode: str = "chat
         return content
     if prompt_mode != "chat":
         raise ValueError(f"unknown prompt mode: {prompt_mode}")
+    if contract.chat_template is not None:
+        try:
+            rendered = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True,
+                chat_template=contract.chat_template,
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError("The checkpoint's recorded conversation format could not be applied.") from exc
+        if not isinstance(rendered, str):
+            raise ValueError("The checkpoint's recorded conversation format did not render text.")
+        return rendered
     try:
         return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     except Exception:  # noqa: BLE001
@@ -408,6 +426,7 @@ class Engine:
         self._generation_lock = threading.RLock()
         self._cancel = threading.Event()
         self.adaptive_runtime = None
+        self.prompt_format = PromptFormat()
 
     def cancel(self) -> None:
         self._cancel.set()
@@ -494,16 +513,36 @@ class Engine:
             return "increase the configured native SPALMER context limit"
         return "use YaRN"
 
-    def _prompt_tokens(self, messages: list[dict], *, prompt_mode: str = "chat") -> int:
-        prompt = format_messages(self.tokenizer, messages, prompt_mode=prompt_mode)
-        return _encoded_length(self.tokenizer(prompt))
+    def _resolve_prompt_mode(self, prompt_mode: str | None = None) -> str:
+        mode = self.prompt_format.resolve_mode(prompt_mode)
+        if mode not in self.prompt_format.supported_modes:
+            note = (
+                "Conversation mode was explicitly requested, but this checkpoint has no verified "
+                "conversation format. Its default remains text continuation."
+            )
+            if note not in self.notes:
+                self.notes.append(note)
+        return mode
+
+    def _encode_messages(self, messages: list[dict], *, prompt_mode: str | None = None, **kwargs):
+        mode = self._resolve_prompt_mode(prompt_mode)
+        prompt = format_messages(self.tokenizer, messages, prompt_mode=mode, prompt_format=self.prompt_format)
+        # Templates already supply their control tokens. Raw causal packing
+        # likewise encodes document text without a second automatic BOS/EOS.
+        # External/legacy raw models may rely on their tokenizer's BOS policy.
+        if mode == "raw" and self.prompt_format.source == "unknown":
+            return self.tokenizer(prompt, **kwargs)
+        return self.tokenizer(prompt, add_special_tokens=False, **kwargs)
+
+    def _prompt_tokens(self, messages: list[dict], *, prompt_mode: str | None = "chat") -> int:
+        return _encoded_length(self._encode_messages(messages, prompt_mode=prompt_mode))
 
     def plan_context(
         self,
         messages: list[dict],
         *,
         max_new_tokens: int,
-        prompt_mode: str = "chat",
+        prompt_mode: str | None = None,
         compact: bool = True,
         strategy: str | None = None,
         recent_turns: int | None = None,
@@ -515,6 +554,7 @@ class Engine:
     ) -> ChatContextPlan:
         """Plan either conversational context or one literal completion prompt."""
 
+        prompt_mode = self._resolve_prompt_mode(prompt_mode)
         if prompt_mode == "chat":
             return self.plan_chat_context(
                 messages,
@@ -950,6 +990,7 @@ class Engine:
             self.spec = None
             self.notes = []
             self.adaptive_runtime = None
+            self.prompt_format = PromptFormat()
             try:
                 import torch
 
@@ -970,6 +1011,8 @@ class Engine:
             load_mole_config,
             load_mole_weights,
         )
+        # Validate explicit metadata before replacing a loaded model.
+        resolve_prompt_format(spec.ref, adapter_path=spec.adapter_path)
         model_family = spec.model_family or family_from_reference(spec.ref)
         if model_family == SPALMER_MODEL_FAMILY:
             return self._load_spalmer(replace(spec, model_family=model_family))
@@ -1005,7 +1048,9 @@ class Engine:
             )
             if preset_context and str(spec.settings.get("context_mode")) == "native":
                 notes.append(f"Native checkpoint context: {preset_context:,} positions.")
-            model.config.use_cache = True
+            from ..models.loading import supports_generation_cache
+
+            model.config.use_cache = supports_generation_cache(model)
             if spec.adapter_path and spec.adapter_arch == "mole":
                 adapter_cfg = load_mole_config(spec.adapter_path, expected_base_ref=spec.ref)
                 adapter_router_type = adapter_cfg.get("config", {}).get("router_type", "per_layer")
@@ -1064,6 +1109,8 @@ class Engine:
                 )
                 notes.append("PEFT LoRA adapter applied.")
             model.eval()
+            prompt_format = resolve_prompt_format(spec.ref, adapter_path=spec.adapter_path, tokenizer=tokenizer)
+            notes.append(prompt_format.note)
             self.model = model
             self.tokenizer = tokenizer
             self.spec = spec
@@ -1071,6 +1118,7 @@ class Engine:
             self.cuda = cuda
             self.device = "cuda" if cuda else "cpu"
             self.adaptive_runtime = adaptive_runtime
+            self.prompt_format = prompt_format
             try:
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
@@ -1181,6 +1229,9 @@ class Engine:
             self.tokenizer = facade.tokenizer
             self.spec = spec
             self.notes = list(facade.notes)
+            self.prompt_format = resolve_prompt_format(spec.ref, tokenizer=facade.tokenizer)
+            if self.prompt_format.source != "unknown":
+                self.notes.append(self.prompt_format.note)
             self.cuda = bool(facade.cuda_available)
             self.device = "cuda" if self.cuda else "cpu"
             return list(self.notes)
@@ -1209,9 +1260,16 @@ class Engine:
         from ..models.families import SPALMER_MODEL_FAMILY
 
         spalmer = bool(self.spec and self.spec.model_family == SPALMER_MODEL_FAMILY)
+        from ..models.loading import supports_generation_cache
+
+        cache_supported = supports_generation_cache(self.model)
         if spalmer:
             cache_kwargs, cache_notes = {}, [
                 "SPALMER generation uses native recurrent KDA/MLA state; Transformers KV cache settings do not apply."
+            ]
+        elif not cache_supported:
+            cache_kwargs, cache_notes = {"use_cache": False}, [
+                "Sprint KDA sampling recomputes the full prefix; KV cache settings do not apply."
             ]
         else:
             cache_kwargs, cache_notes = _cache_kwargs(settings, self.cuda)
@@ -1219,6 +1277,7 @@ class Engine:
         kwargs.update(cache_kwargs)
         if (
             not spalmer
+            and cache_supported
             and str(settings.get("cache_implementation") or "dynamic")
             == "quantized_offloaded"
         ):
@@ -1261,7 +1320,7 @@ class Engine:
         top_p: float = 0.9,
         max_new_tokens: int = 512,
         telemetry_callback: Callable[[dict[str, object]], None] | None = None,
-        prompt_mode: str = "chat",
+        prompt_mode: str | None = None,
     ) -> Iterator[str]:
         # Adaptive occupancy is model-attached mutable state. Serializing all
         # generation also prevents fixed-route adapters and the global cancel
@@ -1271,8 +1330,7 @@ class Engine:
                 raise RuntimeError("no model loaded")
             self._cancel.clear()
 
-            prompt = format_messages(self.tokenizer, messages, prompt_mode=prompt_mode)
-            enc = self.tokenizer(prompt, return_tensors="pt")
+            enc = self._encode_messages(messages, prompt_mode=prompt_mode, return_tensors="pt")
             input_ids = enc["input_ids"].to(self.model.device)
             attention_mask = enc["attention_mask"].to(self.model.device)
             runtime = self.adaptive_runtime

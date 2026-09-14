@@ -176,6 +176,54 @@ def test_spalmer_scan_rejects_unknown_precision_pair_as_metadata_only(tmp_path: 
     assert is_spalmer_checkpoint(checkpoint)
 
 
+@pytest.mark.parametrize(
+    ("compute", "recipe"),
+    [
+        ("bfloat16", "fp32_master_bf16_amp"),
+        ("nvfp4", "torchao_nvfp4_training_sm120_fp32_master"),
+    ],
+)
+def test_scan_identifies_standard_fp32_master_recipe(tmp_path, compute, recipe):
+    payload = _checkpoint_payload()
+    payload["model_parameter_dtype"] = "float32"
+    payload["experts_config"].update(
+        expert_master_dtype="float32", expert_weight_format=compute,
+        expert_activation_format=compute, expert_execution="loop",
+    )
+    payload["model_state"] = {name: value.float() for name, value in payload["model_state"].items()}
+    path = tmp_path / "standard.pt"
+    torch.save(payload, path)
+    scanned = scan_spalmer_checkpoint(path)
+    assert scanned["precision_executable"]
+    assert scanned["expert_precision"]["training_recipe"] == recipe
+    payload["experts_config"]["expert_fake_quantization"] = True
+    torch.save(payload, path)
+    assert not scan_spalmer_checkpoint(path)["precision_executable"]
+
+
+def test_standard_nvfp4_readiness_uses_its_recipe_probe(monkeypatch):
+    from yylab.models.spalmer import _require_native_precision_capability
+
+    calls = []
+    module = types.ModuleType("spalmer.experts.standard_nvfp4")
+    module.require_standard_nvfp4 = lambda device: (
+        calls.append(device) or "torchao_nvfp4_training_sm120_fp32_master"
+    )
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    scanned = {"expert_precision": {
+        "master_dtype": "float32", "weight_format": "nvfp4",
+        "activation_format": "nvfp4", "execution": "loop",
+    }}
+    result = _require_native_precision_capability(scanned, torch.device("cuda:0"))
+    assert calls == [torch.device("cuda:0")]
+    assert result["provider_id"] == "torchao_nvfp4_training_sm120_fp32_master"
+    assert result["verified"] and not result["grouped_available"]
+    scanned["expert_precision"]["execution"] = "grouped"
+    with pytest.raises(RuntimeError, match="dense per-expert"):
+        _require_native_precision_capability(scanned, torch.device("cuda:0"))
+    assert len(calls) == 1
+
+
 def test_spalmer_scan_reads_nested_training_context_metadata(tmp_path: Path) -> None:
     payload = _checkpoint_payload()
     payload["metadata"] = {"training_config": {"sequence_length": 1536}}
@@ -431,6 +479,39 @@ def _fake_spalmer_module(monkeypatch, model, tokenizer, metadata) -> None:
             "grouped_available": True,
         },
     )
+
+
+def test_standard_amp_facade_covers_scoring_hidden_states_prefill_and_decode():
+    class Probe(_FakeSpalmerModel):
+        def __init__(self):
+            super().__init__(dtype=torch.float32)
+            self.residency.config.expert_master_dtype = "float32"
+            self.residency.config.expert_weight_format = "bfloat16"
+            self.residency.config.expert_activation_format = "bfloat16"
+            self.execution_device = torch.device("cpu")
+            self.lm_head = nn.Linear(4, 8, bias=False)
+            self.observed = []
+
+        def forward(self, input_ids, **kwargs):
+            self.observed.append((
+                torch.is_autocast_enabled("cpu"), kwargs.get("execution_mode"),
+            ))
+            logits = self.lm_head(torch.ones((*input_ids.shape, 4)))
+            return SimpleNamespace(
+                logits=logits, token_mixer_states=(), channel_mixer_states=(),
+            )
+
+    model = Probe()
+    facade = _facade(model, tokenizer=SimpleNamespace(eos_token_id=None))
+    ids = torch.tensor([[1, 3]])
+    assert facade(ids, labels=ids).logits.dtype == torch.bfloat16
+    hidden = facade(ids, output_hidden_states=True)
+    assert hidden.logits.dtype == torch.bfloat16
+    assert hidden.hidden_states[0].dtype == torch.float32
+    facade.generate(ids, max_new_tokens=3)
+    assert model.observed == [(True, None)] * 3 + [(True, "decode")] * 2
+    assert all(parameter.dtype == torch.float32 for parameter in model.parameters())
+    assert not torch.is_autocast_enabled("cpu")
 
 
 def test_load_spalmer_runtime_is_lazy_and_wraps_a_generic_tokenizer(tmp_path, monkeypatch) -> None:
@@ -1392,6 +1473,17 @@ def test_facade_forward_injects_default_recurrence_steps() -> None:
     runtime.forward(torch.tensor([[1, 2]]), recurrence_steps=2)
     assert model.forward_kwargs[-1]["recurrence_steps"] == 2
 
+
+@pytest.mark.parametrize("use_cache", [None, False, True])
+def test_facade_forwards_explicit_cache_policy(use_cache):
+    model = _RecurrentFakeSpalmerModel()
+    runtime = _facade(model)
+    runtime(torch.tensor([[1, 2]]), use_cache=use_cache)
+    if use_cache is None:
+        assert "use_cache" not in model.forward_kwargs[-1]
+    else:
+        assert model.forward_kwargs[-1]["use_cache"] is use_cache
+
     flat = _FakeSpalmerModel()
     _facade(flat).forward(torch.tensor([[1, 2]]))
     assert flat.calls == 1
@@ -1443,7 +1535,8 @@ def test_load_spalmer_runtime_rejects_recurrence_for_a_flat_bundle(tmp_path, mon
     assert all("Recurrent depth" not in note for note in runtime.notes)
 
 
-def test_dynamic_generation_passes_recurrence_steps_to_residency_controller(monkeypatch) -> None:
+@pytest.mark.parametrize("seed", [None, 57])
+def test_dynamic_generation_passes_recurrence_steps_to_residency_controller(monkeypatch, seed) -> None:
     model = _RecurrentFakeSpalmerModel([4, 2])
     runtime = _facade(model, dynamic=True)
     initial = model(torch.tensor([[1]]), recurrence_steps=4)
@@ -1461,8 +1554,8 @@ def test_dynamic_generation_passes_recurrence_steps_to_residency_controller(monk
     )
     seen: list[dict] = []
 
-    def choose(selected_model, prompt, *, recurrence_steps):
-        seen.append({"model": selected_model, "recurrence_steps": recurrence_steps})
+    def choose(selected_model, prompt, *, recurrence_steps, **kwargs):
+        seen.append({"model": selected_model, "recurrence_steps": recurrence_steps, **kwargs})
         return decision
 
     experts = types.ModuleType("spalmer.experts")
@@ -1472,8 +1565,12 @@ def test_dynamic_generation_passes_recurrence_steps_to_residency_controller(monk
     monkeypatch.setitem(sys.modules, "spalmer", package)
     monkeypatch.setitem(sys.modules, "spalmer.experts", experts)
 
-    runtime.generate(torch.tensor([[1]]), max_new_tokens=2, eos_token_id=2)
+    runtime.generate(torch.tensor([[1]]), max_new_tokens=2, eos_token_id=2, seed=seed)
 
+    if seed is not None:
+        generator = seen[0].pop("latent_generator")
+        assert generator.initial_seed() == seed
+        assert model.forward_kwargs[-1]["latent_generator"] is generator
     assert seen == [{"model": model, "recurrence_steps": 4}]
 
     # A flat checkpoint must still work with a controller that predates the

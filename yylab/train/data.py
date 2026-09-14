@@ -685,7 +685,9 @@ def iter_corpus_docs(
                         line[CORPUS_ID_FIELD] = corpus_id
                     yield line
         finally:
-            records.close()
+            close = getattr(records, "close", None)
+            if close is not None:
+                close()
 
     def shuffled_stream(
         items: Iterator[dict],

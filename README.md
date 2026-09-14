@@ -9,6 +9,9 @@ frozen bases, with chat inference.
 
 Keep the SPALMER checkout beside yyLab as `../spalmer`; uv uses that editable
 dependency for the shared model and [GCCF receipt ingestion](docs/GCCF_INGESTION.md).
+This training update also depends on the SPALMER changes preserved in the
+[companion patch and setup instructions](docs/patches/README.md). Apply that patch
+to its recorded clean base when setting up a checkout that lacks those changes.
 
 ```powershell
 uv sync
@@ -33,27 +36,27 @@ Artifacts live in `./artifacts` (override with `YYLAB_HOME`).
 
 - **GCCF classified corpora** — import a GCCF receipt, honor approved-file and
   bad-record decisions, preserve held-out splits and training provenance, and
-  read each classified source directly from the original datasets. Processed
-  copies require an explicit option.
+  read each classified source directly from the original datasets. Receipt imports
+  build metadata indexes without copying corpus text.
 
 - **Corpora intake** — point at a folder; adapter plugins per filetype,
-  streaming JSONL/Parquet normalization, exact + bounded-memory MinHash dedup,
+  streaming JSONL/Parquet normalization, exact dedup and compact MinHash near-match detection,
   domain tagging, zstd JSONL shards,
   token counts across GPT-2/tiktoken, Llama 3.x, Qwen 2.5, Phi-3, Gemma,
   Mistral tokenizers; mixture charts + live stats table. JSON-encoded message
   columns are retained structurally, accepted-document token counts are
   accumulated inline, and compressed output is not reread after ingest. The
   dataset-library button uses a preservation-oriented fast path for published
-  corpora: canonical global dedup only, with MinHash/language/quality cleaning
-  reserved for the explicit ingest dialog. When enabled, MinHash retains the
-  same 9×13 band decision in a compact fingerprint index rather than keeping
-  document keys and candidate sets for every row. Extraction and analysis run
+  corpora: canonical global dedup only, with near-match detection and language/quality
+  filters reserved for the explicit ingest dialog. When enabled, MinHash flags
+  similar records as review evidence and retains them in the corpus. It uses
+  9×13 bands in a compact fingerprint index. Extraction and analysis run
   across parallel worker processes (large JSONL and Parquet files are split
   into chunks) while one coordinator decides in file order, so the output is
   identical to a single-worker run; the worker count is per run or a setting.
   Every extracted document is kept in a per-corpus prepared cache so
   **Re-import** applies changed policies (accepted file types, selection
-  profile, language/quality/MinHash cleaning, tokenizers) to an existing corpus
+  profile, language/quality filters, MinHash detection, tokenizers) to an existing corpus
   without extracting unchanged files again; the corpus keeps its id and stays
   usable until the new output is published.
 - **Human-trained corpus ranker** — every review swipe is committed immediately

@@ -181,6 +181,133 @@ def test_cache_change_identity_and_truncation_refusal(training_fixture):
         sprint.SprintPackedCache(old_root)
 
 
+def test_larger_packed_cache_reuses_exact_prefix_with_logical_identity(training_fixture, monkeypatch, tmp_path):
+    raw, tokenizer, write_source, records = training_fixture
+    write_source([{**records[0], "text": records[0]["text"] * 50}])
+    cfg = sprint.normalize_sprint_config({**raw, "eval_interval": 0})
+    large = sprint.prepare_sprint_cache(cfg, tokenizer, progress=lambda _: None)
+    backing_root, backing_key = large.root, large.key
+    expected = large.read_batch(0, 3)["input_ids"]
+    original_manifest = (large.root / "manifest.json").read_bytes()
+    large.close()
+    small_cfg = {**cfg, "max_rows": 3}
+    # A fresh small build must have the same logical identity and row stream.
+    fresh = sprint.prepare_sprint_cache({**small_cfg, "packed_cache_dir": str(tmp_path / "fresh")},
+                                       tokenizer, progress=lambda _: None)
+    expected_key = fresh.key
+    torch.testing.assert_close(fresh.read_batch(0, 3)["input_ids"], expected)
+    fresh.close()
+    monkeypatch.setattr(sprint, "iter_corpus_docs", lambda *a, **k: pytest.fail("prefix reuse repacked"))
+    reused = sprint.prepare_sprint_cache(small_cfg, tokenizer, progress=lambda _: None)
+    try:
+        assert reused.root == backing_root
+        assert reused.rows == 3 and reused.stored_rows == 16
+        assert reused.key == expected_key and reused.key != backing_key
+        assert reused.preparation["mode"] == "compatible_cache"
+        assert reused.data_stats["sequences"] == 3
+        assert reused.data_stats["tokens"]["forwarded_model_slots"] == 24
+        assert "docs_seen" not in reused.data_stats and "per_corpus" not in reused.data_stats
+        stream = sprint._CacheBatches(reused, cfg, 0, 7, pin_memory=False)
+        actual = torch.cat([batch["input_ids"] for batch in stream])
+        torch.testing.assert_close(actual, expected.repeat(3, 1)[:7])
+        assert (backing_root / "manifest.json").read_bytes() == original_manifest
+    finally:
+        reused.close()
+
+
+def test_complete_packed_pass_reused_for_larger_budget(training_fixture, monkeypatch):
+    raw, tokenizer, _, _ = training_fixture
+    cfg = sprint.normalize_sprint_config(raw)
+    original = sprint.prepare_sprint_cache(cfg, tokenizer, progress=lambda _: None)
+    root, key, rows = original.root, original.key, original.rows
+    assert rows < cfg["max_rows"]
+    original.close()
+    monkeypatch.setattr(sprint, "iter_corpus_docs", lambda *a, **k: pytest.fail("complete pass repacked"))
+    reused = sprint.prepare_sprint_cache({**cfg, "max_rows": 50}, tokenizer, progress=lambda _: None)
+    try:
+        assert reused.root == root and reused.rows == rows
+        assert reused.key != key
+        assert reused.data_stats == reused.manifest["data_stats"]
+    finally:
+        reused.close()
+
+
+def test_truncated_packed_pass_cannot_satisfy_larger_budget(training_fixture):
+    raw, tokenizer, _, _ = training_fixture
+    cfg = sprint.normalize_sprint_config(raw)
+    truncated = sprint.prepare_sprint_cache({**cfg, "max_rows": 1}, tokenizer, progress=lambda _: None)
+    root = truncated.root
+    with pytest.raises(ValueError, match="does not cover"):
+        truncated.select_request(sprint._packed_identity(cfg, tokenizer))
+    truncated.close()
+    complete = sprint.prepare_sprint_cache(cfg, tokenizer, progress=lambda _: None)
+    try:
+        assert complete.root != root
+        assert complete.rows == 2
+        assert complete.preparation["mode"] == "built"
+    finally:
+        complete.close()
+
+
+def test_custom_tokenizer_keeps_original_call_boundaries(training_fixture, monkeypatch):
+    raw, tokenizer, write_source, records = training_fixture
+    write_source([records[0]] * 12)
+    cfg = sprint.normalize_sprint_config(raw)
+    calls = []
+
+    def batch_sensitive(texts):
+        calls.append(len(texts))
+        return [[4 + index % 3] * 7 for index in range(len(texts))]
+
+    monkeypatch.setattr(sprint, "make_sprint_tokenize", lambda _: batch_sensitive)
+    cache = sprint.prepare_sprint_cache({**cfg, "max_rows": 12}, tokenizer, progress=lambda _: None)
+    try:
+        assert calls == [8, 4]
+        assert cache.read_batch(8, 1)["input_ids"].tolist() == [[4] * 7 + [tokenizer.eos_token_id]]
+    finally:
+        cache.close()
+
+
+@pytest.mark.parametrize("change", [{"seed": 5}, {"seq_len": 4}, {"splits": ["validation"]},
+                                   {"cross_corpus_dedup": True}, {"max_text_chars": 9}])
+def test_compatible_cache_preserves_data_selection(training_fixture, change):
+    raw, tokenizer, _, _ = training_fixture
+    cfg = sprint.normalize_sprint_config(raw)
+    cache = sprint.prepare_sprint_cache(cfg, tokenizer, progress=lambda _: None)
+    root = cache.root
+    cache.close()
+    changed = sprint.prepare_sprint_cache({**cfg, **change, "max_rows": 1}, tokenizer, progress=lambda _: None)
+    try:
+        assert changed.root != root
+        assert changed.preparation["mode"] == "built"
+    finally:
+        changed.close()
+
+
+def test_resume_with_compatible_cache_matches_fresh_training(training_fixture, tmp_path):
+    raw, tokenizer, write_source, records = training_fixture
+    write_source([{**records[0], "text": records[0]["text"] * 50}])
+    cfg = {**raw, "eval_interval": 0, "max_steps": 2, "save_interval": 1}
+    large_cfg = sprint.normalize_sprint_config({**cfg, "max_steps": 8})
+    cache = sprint.prepare_sprint_cache(large_cfg, tokenizer, progress=lambda _: None)
+    cache.close()
+    full = sprint.run_sprint_training(cfg, tmp_path / "prefix-full")
+    assert full["runtime"]["data_preparation"]["mode"] == "compatible_cache"
+    fresh = sprint.run_sprint_training({**cfg, "packed_cache_dir": str(tmp_path / "new-physical-cache")},
+                                      tmp_path / "fresh-full")
+    assert full["runtime"]["packed_key"] == fresh["runtime"]["packed_key"]
+    # Resume can use a different physical cache when its logical rows match.
+    resumed = sprint.run_sprint_training({"resume_from": str(tmp_path / "prefix-full" / "checkpoints" /
+                                                              "step-00000001"),
+                                         "packed_cache_dir": str(tmp_path / "new-physical-cache")},
+                                        tmp_path / "prefix-resumed")
+    expected = SprintForCausalLM.from_pretrained(full["checkpoint_path"]).state_dict()
+    for result in (fresh, resumed):
+        actual = SprintForCausalLM.from_pretrained(result["checkpoint_path"]).state_dict()
+        for name in expected:
+            torch.testing.assert_close(actual[name], expected[name], rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("parameter_dtype", ["float32", "bfloat16"])
 def test_real_training_registry_eval_and_exact_resume(training_fixture, tmp_path, parameter_dtype):
     cfg, _, _, _ = training_fixture
@@ -260,6 +387,49 @@ def test_chat_cache_preserves_assistant_masks_and_padding(training_fixture, tmp_
     result = sprint.run_sprint_training(resolved, tmp_path / "chat")
     assert result["supervised_tokens"] == 12
     assert result["padding_tokens"] == 8
+
+
+def test_chat_prefix_reuse_preserves_labels_and_does_not_invent_statistics(training_fixture, monkeypatch):
+    cfg, tokenizer, write_source, _ = training_fixture
+    tokenizer.chat_template = (
+        "{% for message in messages %}{% if message['role'] == 'assistant' %}"
+        "{% generation %}{{ message['content'] + eos_token }}{% endgeneration %}"
+        "{% else %}{{ message['content'] + eos_token }}{% endif %}{% endfor %}"
+    )
+    write_source([{"text": "chat fixture", "split": "train", "domain": "code", "messages": [
+        {"role": "user", "content": "alpha beta"}, {"role": "assistant", "content": "gamma delta"}]}] * 3)
+    resolved = sprint.normalize_sprint_config({**cfg, "objective": "chat_sft", "eval_interval": 0})
+    full = sprint.prepare_sprint_cache(resolved, tokenizer, progress=lambda _: None)
+    expected = full.read_batch(0, 1)
+    full.close()
+    monkeypatch.setattr(sprint, "iter_corpus_docs", lambda *a, **k: pytest.fail("SFT prefix repacked"))
+    prefix = sprint.prepare_sprint_cache({**resolved, "max_rows": 1}, tokenizer, progress=lambda _: None)
+    try:
+        actual = prefix.read_batch(0, 1)
+        for field in ("input_ids", "labels", "attention_mask"):
+            torch.testing.assert_close(actual[field], expected[field])
+        assert actual["num_targets"] == 3 and actual["real_tokens"] == 6
+        assert "optimizer_supervised_targets" not in prefix.data_stats["tokens"]
+        assert prefix.data_stats["tokens"]["forwarded_model_slots"] == 8
+    finally:
+        prefix.close()
+
+
+@pytest.mark.parametrize("damage", ["seq_len", "fields", "dtype"])
+def test_packed_manifest_rejects_inconsistent_metadata(training_fixture, damage):
+    raw, tokenizer, _, _ = training_fixture
+    cache = sprint.prepare_sprint_cache(sprint.normalize_sprint_config(raw), tokenizer, progress=lambda _: None)
+    root, manifest = cache.root, cache.manifest
+    cache.close()
+    if damage == "seq_len":
+        manifest["seq_len"] *= 2
+    elif damage == "fields":
+        manifest["files"]["labels"] = dict(manifest["files"]["input_ids"])
+    else:
+        manifest["files"]["input_ids"]["dtype"] = "<i2"
+    (root / "manifest.json").write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="identity|objective|dtype"):
+        sprint.SprintPackedCache(root)
 
 
 def test_activation_checkpointing_alias_and_cpu_dtype_contract():

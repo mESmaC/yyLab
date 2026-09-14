@@ -1,0 +1,7 @@
+{
+  "elapsed_seconds": 231.636591,
+  "pid": 17564,
+  "reason": "Stopped without completed timing under persistent shared GPU memory pressure. No throughput is accepted. The matched microbatch8 B128 baseline completed; prioritize testing BF16 moment state at that smaller microbatch.",
+  "recorded_at_utc": "2026-09-11T22:59:17.9876772Z",
+  "observed_shared_gpu_bytes": 1839202304
+}

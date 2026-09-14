@@ -2,7 +2,7 @@
 
 import pytest
 
-from yylab.models.sprint import estimate_parameter_count, plan_sprint_model
+from yylab.models.sprint import SprintConfig, estimate_parameter_count, plan_sprint_model
 
 
 def _shape(config):
@@ -12,9 +12,9 @@ def _shape(config):
 
 @pytest.mark.parametrize("target,expected", [
     (10_000_000, (512, 2, 4, 1792, 9_964_032)),
-    (50_000_000, (1024, 4, 8, 3008, 49_816_576)),
-    (100_000_000, (1280, 5, 10, 4416, 99_792_640)),
-    (500_000_000, (2304, 9, 18, 6976, 499_329_792)),
+    (50_000_000, (1024, 4, 8, 2944, 49_292_288)),
+    (100_000_000, (1280, 5, 10, 4352, 98_973_440)),
+    (500_000_000, (2304, 9, 18, 6912, 496_675_584)),
     (1_000_000_000, (2816, 11, 22, 10112, 998_505_728)),
 ])
 def test_throughput_default_shapes_are_aligned_and_fit_budget(target, expected):
@@ -23,7 +23,7 @@ def test_throughput_default_shapes_are_aligned_and_fit_budget(target, expected):
     assert _shape(plan_sprint_model(target, 8192, profile="throughput")) == expected
     assert config.hidden_size % 256 == 0
     assert config.head_dim == 128
-    assert config.intermediate_size % 64 == 0
+    assert config.intermediate_size % 128 == 0
     assert 0.98 * target <= estimate_parameter_count(config) <= target
 
 
@@ -75,7 +75,7 @@ def test_defaults_below_ten_million_keep_balanced_proportions(target):
 def test_small_throughput_profile_preserves_budget_alignment_and_loss_default(target):
     config = plan_sprint_model(target, 8192)
     assert config.num_hidden_layers >= 2
-    assert config.hidden_size % 256 == config.intermediate_size % 64 == 0
+    assert config.hidden_size % 256 == config.intermediate_size % 128 == 0
     assert config.head_dim == 128
     assert config.loss_backend == "auto"
     assert 0.98 * target <= estimate_parameter_count(config) <= target
@@ -88,6 +88,40 @@ def test_vocabulary_floor_falls_back_to_balanced_without_oversizing():
     # Even the smallest 256-wide untied embedding exceeds this whole budget.
     assert throughput.hidden_size < 256
     assert throughput.to_dict() == balanced.to_dict()
+
+
+@pytest.mark.parametrize("vocabulary", [257, 8193, 32769, 128001])
+@pytest.mark.parametrize("mlp,tied", [("gelu", True), ("swiglu", False)])
+def test_billion_parameter_alignment_does_not_pad_vocabulary(vocabulary, mlp, tied):
+    target = 1_000_000_000
+    config = plan_sprint_model(target, vocabulary, mlp_type=mlp, tie_word_embeddings=tied)
+    assert config.vocab_size == vocabulary  # The actual tokenizer stays authoritative.
+    assert config.hidden_size % 256 == 0
+    assert config.intermediate_size % 128 == 0
+    assert config.head_dim == 128
+    assert 0.98 * target <= estimate_parameter_count(config) <= target
+
+
+def test_wide_six_layer_billion_shape_rounds_down_to_stay_within_budget():
+    # The measured wide-six-layer family has a different shape from the default
+    # planner. Of its adjacent 128-aligned FFNs, only 11392 fits a strict 1B cap.
+    options = dict(vocab_size=8192, hidden_size=4096, num_hidden_layers=6, num_attention_heads=32)
+    lower = SprintConfig(intermediate_size=11392, **options)
+    upper = SprintConfig(intermediate_size=11520, **options)
+    assert estimate_parameter_count(lower) == 996_200_448
+    assert 0.98 * 1_000_000_000 <= estimate_parameter_count(lower) <= 1_000_000_000
+    assert estimate_parameter_count(upper) == 1_002_491_904
+
+
+def test_saved_unaligned_ffn_config_is_not_replanned(tmp_path):
+    # Loading an existing model must not change its parameter or optimizer shapes.
+    original = SprintConfig(vocab_size=8192, hidden_size=4096, intermediate_size=11456,
+                            num_hidden_layers=6, num_attention_heads=32)
+    original.save_pretrained(tmp_path)
+    restored = SprintConfig.from_pretrained(tmp_path, local_files_only=True)
+    assert _shape(restored) == _shape(original)
+    assert restored.intermediate_size == 11456
+    assert estimate_parameter_count(restored) == 999_346_176
 
 
 def test_invalid_profile_is_rejected_even_for_small_models():

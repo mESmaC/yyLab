@@ -137,7 +137,7 @@ def corpora_page():
                 hint(
                     "Fast ingest preserves dataset records, inventories provenance, and excludes obvious "
                     "dataset sidecars (README/license/config/CSS/SVG/XML). Use Re-import on an ingested "
-                    "folder to change the asset policy or enable language, quality, and MinHash cleaning "
+                    "folder to change the asset policy, enable language or quality filters, or detect near duplicates "
                     "without extracting unchanged files again."
                 )
                 for f in folders:
@@ -558,11 +558,11 @@ def corpora_page():
                 ["auto"] + DOMAINS, value="auto", label="Domain override"
             ).props("dense outlined").classes("w-full")
             with ui.row().classes("w-full gap-6"):
-                nd_chk = ui.checkbox("Near-duplicate removal (MinHash)", value=True)
+                nd_chk = ui.checkbox("Near-duplicate detection (MinHash)", value=True)
                 gd_chk = ui.checkbox("Global exact dedup", value=True)
             hint(
-                "MinHash is a full-corpus CPU and memory pass. Leave it off for published datasets "
-                "that already document near-duplicate removal."
+                "MinHash flags similar records for review and keeps them in the corpus. "
+                "Exact copies are handled separately. Detection scans the full corpus and uses CPU and memory."
             )
             with ui.row().classes("w-full gap-6"):
                 lang_chk = ui.checkbox("English-only (non-English kept in side bucket)", value=True)
@@ -755,10 +755,9 @@ def corpora_page():
             ui.label("Import classified corpora").classes("text-lg font-semibold")
             hint(
                 "Reads the files approved by GCCF, removes listed bad records, and preserves "
-                "held-out splits. Text stays in the original datasets by default."
+                "held-out splits. Uses the original datasets without copying their text."
             )
             gccf_path = ui.input("GCCF receipt JSON path").props("outlined dense").classes("w-full")
-            gccf_copy = ui.checkbox("Create a processed copy (uses additional disk space)", value=False)
 
             def begin_gccf() -> None:
                 if busy():
@@ -770,9 +769,7 @@ def corpora_page():
                     return
                 from ...ingest.gccf import run_gccf_ingest
 
-                state["job"] = JOBS.submit(
-                    "gccf-ingest", run_gccf_ingest, path, materialize=bool(gccf_copy.value)
-                )
+                state["job"] = JOBS.submit("gccf-ingest", run_gccf_ingest, path)
                 progress_row.visible = True
                 plabel.text = "queued · GCCF import"
                 gccf_dialog.close()

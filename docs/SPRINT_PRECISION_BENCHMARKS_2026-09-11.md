@@ -84,6 +84,7 @@ the loss implementation retain their usual BF16/FP32 execution.
 | `nvfp4_mxfp8_fast` | Native NVFP4 | Native MXFP8 / MXFP8, with fused column conversion |
 | `bitnet_b158_int8` | Native INT8, INT32 accumulation, FP32 rescaling | Dense BF16 / BF16 with straight-through estimators |
 | `nvfp4_all_portable` | Native NVFP4 with TorchAO's training transforms | Native NVFP4 / NVFP4 with portable stochastic rounding |
+| `nvfp4_all_portable_sr4` | Native NVFP4 with TorchAO's training transforms | Native NVFP4 / NVFP4 with four outputs per Philox stochastic-rounding call |
 
 For the two mixed NVFP4 modes, backward uses the saved BF16 shadow tensors,
 converted to the requested backward format when needed. It does not reconstruct
@@ -275,6 +276,25 @@ matrix multiplications. Passing these checks does not establish convergence.
 The repeated default-compiled backward test also verifies fresh stochastic
 rounding with unchanged weights, inputs, and output gradients. Explicit CUDA
 graph replay was not tested.
+
+The explicit `nvfp4_all_portable_sr4` mode adds the SR4 experiment from September
+12. It uses all four outputs of each ten-round Philox4x32 call for four adjacent
+elements. Each element still receives a 24-bit uniform value and the same
+distance-proportional adjacent-level rounding. Its random layout differs from
+both the original portable mode and hardware stochastic rounding, so it is not
+bitwise equivalent to either. Hadamard transforms, two-dimensional weight
+scaling, GEMMs, BF16 parameters, and optimizer selection stay the same.
+
+SR4 is opt-in through the precision benchmark's `--precisions` argument or the
+precision adapter. It is absent from the default precision sweep and does not
+change ordinary Sprint training defaults. The original portable mode remains
+available for comparison. Each variant owns an independently cached provider
+class, custom operation, and cloned function globals, allowing both modes in a
+single benchmark process without replacing the other mode's rounding kernel.
+Receipts identify the random layout, ten-round/four-output recipe, 24-bit
+uniforms, reviewed candidate hash, current implementation hash, and upstream
+provider hashes. Saved parameters alone do not identify this gradient recipe;
+retain the precision metadata with experimental training results.
 
 ### Screening results
 

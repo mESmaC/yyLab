@@ -47,3 +47,21 @@ def test_original_prose_available_to_training_with_raw_provenance_and_holdouts(t
     (source / "train.txt").unlink()
     with pytest.raises(FileNotFoundError):
         list(iter_corpus_docs([cid], splits=["train"]))
+
+
+def test_cleaning_profile_cannot_reuse_raw_index_and_defaults_to_preprocessed_text(tmp_path):
+    source = tmp_path / "books"
+    source.mkdir()
+    raw = b"A book paragraph has Windows line endings.\r\n\r\n\r\n\r\nSecond paragraph.\r\n"
+    (source / "book.txt").write_bytes(raw)
+    old = run_text_source(lambda *args: None, source, output=tmp_path / "raw", preprocessing=None)
+    with pytest.raises(ValueError, match="requested source selection"):
+        run_text_source(lambda *args: None, source, output=tmp_path / "raw")
+    new = run_text_source(lambda *args: None, source, output=tmp_path / "clean")
+    assert old["corpus_id"] != new["corpus_id"]
+    old_text = next(iter_corpus_docs([old["corpus_id"]]))["text"]
+    clean = next(iter_corpus_docs([new["corpus_id"]]))
+    assert old_text == raw.decode()
+    assert clean["text"] == "A book paragraph has Windows line endings.\n\nSecond paragraph.\n"
+    assert clean["provenance"]["preprocessing"] == new["preprocessing"]
+    assert (source / "book.txt").read_bytes() == raw

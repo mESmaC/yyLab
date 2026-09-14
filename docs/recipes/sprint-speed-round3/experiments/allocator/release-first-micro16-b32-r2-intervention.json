@@ -1,0 +1,7 @@
+{
+  "observed_shared_gpu_bytes": 1933574144,
+  "recorded_at_utc": "2026-09-11T22:55:24.9952590Z",
+  "elapsed_seconds": 412.3365625,
+  "pid": 28088,
+  "reason": "Stopped without a completed timing after more than six minutes. The one-time release after first warmup did not produce an acceptable completed confirmation in this attempt; no throughput is accepted."
+}

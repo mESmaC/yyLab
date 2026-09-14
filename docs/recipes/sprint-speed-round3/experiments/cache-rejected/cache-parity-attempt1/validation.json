@@ -1,0 +1,12 @@
+{
+  "command": ".venv/Scripts/python.exe -m pytest artifacts/sprint-1b-speed-20260911/test_bf16_moments_candidate.py artifacts/sprint-1b-speed-20260911/test_weight_cache.py -q -s",
+  "exit_code": 1,
+  "tests_passed": 9,
+  "tests_failed": 2,
+  "seconds": 71.62,
+  "bf16_moments_cpu_oracles": "6 passed",
+  "cache_packed_payload_and_validity": "3 passed",
+  "cache_full_model_parity": "failed eager and compiled variants; not approved for benchmark",
+  "eager_first_observed_loss_mismatch": {"expected": 5.555180549621582, "actual": 5.554201126098633},
+  "evidence": "Summary transcribed from pytest output. Source/test snapshot preserved alongside; this is not a complete pytest log."
+}

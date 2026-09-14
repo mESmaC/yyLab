@@ -763,121 +763,125 @@ def train_loop(
         optimizer.zero_grad(set_to_none=True)
         opt_step += 1
 
-    for batch in batches:
-        ids = torch.tensor(batch["input_ids"], dtype=torch.long, device=device)
-        labels = ids
-        batch_target_slots = ids.shape[0] * max(ids.shape[1] - 1, 0)
-        model_target_slots += int(batch_target_slots)
-        if batch.get("labels") is not None:
-            labels = torch.tensor(batch["labels"], dtype=torch.long, device=device)
-            if labels.shape != ids.shape:
-                raise ValueError("batch labels must have the same shape as input_ids")
-            # Hugging Face causal-LM heads shift internally and optimize
-            # labels[:, 1:]. The first column is context, never a target.
-            supervised_tokens += int(labels[:, 1:].ne(-100).sum().item())
-        else:
-            supervised_tokens += int(batch_target_slots)
-        model_inputs = {"input_ids": ids, "labels": labels}
-        if batch.get("attention_mask") is not None:
-            attention_mask = torch.tensor(batch["attention_mask"], dtype=torch.long, device=device)
-            if attention_mask.shape != ids.shape:
-                raise ValueError("batch attention_mask must have the same shape as input_ids")
-            model_inputs["attention_mask"] = attention_mask
-            real_tokens = int(attention_mask.sum().item())
-        else:
-            real_tokens = int(ids.numel())
-        # Backward stays inside the context because gradient checkpointing
-        # recomputes model forwards during this call.
-        with attention_backend_context(model, device, enabled=opts.prefer_cudnn_sdpa):
-            out = model(**model_inputs)
-            loss_metric = out.loss.detach().float()
-            loss = out.loss / opts.grad_accum
-            aux_metric = None
-            if aux_fn is not None:
-                aux = aux_fn() / opts.grad_accum
-                aux_metric = aux.detach().float()
-                loss = loss + aux
-            if loss_aux_fn is not None:
-                task_aux = loss_aux_fn(out.loss) / opts.grad_accum
-                task_aux_metric = task_aux.detach().float()
-                aux_metric = (
-                    task_aux_metric
-                    if aux_metric is None
-                    else aux_metric + task_aux_metric
-                )
-                loss = loss + task_aux
-            loss.backward()
-        window_loss.add_(loss_metric)
-        if aux_metric is not None:
-            window_aux.add_(aux_metric)
-        window_micro += 1
-        last_loss.copy_(loss_metric)
-        tokens += ids.numel()
-        sequences_forwarded += int(ids.shape[0])
-        forwarded_real_tokens += real_tokens
-        padding_tokens += int(ids.numel()) - real_tokens
-        micro_step += 1
+    from .prefetch import batch_stream
 
-        if micro_step % opts.grad_accum != 0:
-            continue
-        flush_pending(opts.grad_accum)
-
-        if opt_step % opts.log_every == 0 or opt_step == opts.max_steps:
-            elapsed = time.time() - t0
-            rec = {
-                "step": opts.step_offset + opt_step,
-                "stage": opts.stage,
-                "stage_step": opt_step,
-                # Synchronize metrics only at the configured logging cadence,
-                # not between every forward and backward launch.
-                "loss": round((window_loss / max(window_micro, 1)).item(), 4),
-                "aux": round((window_aux / max(window_micro, 1)).item(), 4),
-                "tokens": tokens,
-                "tok_per_s": round(tokens / max(elapsed, 1e-6), 1),
-                "elapsed_s": round(elapsed, 1),
-            }
-            if device.type == "cuda":
-                rec["cuda_peak_allocated_gb"] = round(torch.cuda.max_memory_allocated(device) / 2**30, 3)
-                rec["cuda_peak_reserved_gb"] = round(torch.cuda.max_memory_reserved(device) / 2**30, 3)
-            if metrics_fn is not None:
-                rec.update(metrics_fn())
-            log_metrics(rec)
-            route_status = (
-                f" · route H={rec['router_entropy']:.3f}, dead={rec['dead_experts']}"
-                if "router_entropy" in rec
-                else ""
-            )
-            write_progress(
-                opts.stage,
-                opt_step,
-                rec["loss"],
-                f"{rec['tok_per_s']} tok/s{route_status}",
-            )
-            terminal_fields = [
-                f"{opts.stage}: step {rec['step']}/{opts.total_steps or opts.max_steps}",
-                f"loss={rec['loss']}",
-                f"aux={rec['aux']}",
-                f"{rec['tok_per_s']} tok/s",
-            ]
-            if "router_entropy" in rec:
-                terminal_fields.extend(
-                    (
-                        f"route H={rec['router_entropy']:.3f}",
-                        f"dead={rec['dead_experts']}",
+    with batch_stream(batches) as batch_iterator:
+        for batch in batch_iterator:
+            host_ids = torch.as_tensor(batch["input_ids"], dtype=torch.long, device="cpu")
+            ids = host_ids.to(device, non_blocking=True)
+            labels = ids
+            batch_target_slots = ids.shape[0] * max(ids.shape[1] - 1, 0)
+            model_target_slots += int(batch_target_slots)
+            if batch.get("labels") is not None:
+                host_labels = torch.as_tensor(batch["labels"], dtype=torch.long, device="cpu")
+                if host_labels.shape != host_ids.shape:
+                    raise ValueError("batch labels must have the same shape as input_ids")
+                # Count shifted targets on the host before copying to CUDA.
+                supervised_tokens += int(host_labels[:, 1:].ne(-100).sum())
+                labels = host_labels.to(device, non_blocking=True)
+            else:
+                supervised_tokens += int(batch_target_slots)
+            model_inputs = {"input_ids": ids, "labels": labels}
+            if batch.get("attention_mask") is not None:
+                host_mask = torch.as_tensor(batch["attention_mask"], dtype=torch.long, device="cpu")
+                if host_mask.shape != host_ids.shape:
+                    raise ValueError("batch attention_mask must have the same shape as input_ids")
+                real_tokens = int(host_mask.sum())
+                model_inputs["attention_mask"] = host_mask.to(device, non_blocking=True)
+            else:
+                real_tokens = int(ids.numel())
+            # Backward stays inside the context because gradient checkpointing
+            # recomputes model forwards during this call.
+            with attention_backend_context(model, device, enabled=opts.prefer_cudnn_sdpa):
+                out = model(**model_inputs)
+                loss_metric = out.loss.detach().float()
+                loss = out.loss / opts.grad_accum
+                aux_metric = None
+                if aux_fn is not None:
+                    aux = aux_fn() / opts.grad_accum
+                    aux_metric = aux.detach().float()
+                    loss = loss + aux
+                if loss_aux_fn is not None:
+                    task_aux = loss_aux_fn(out.loss) / opts.grad_accum
+                    task_aux_metric = task_aux.detach().float()
+                    aux_metric = (
+                        task_aux_metric
+                        if aux_metric is None
+                        else aux_metric + task_aux_metric
                     )
+                    loss = loss + task_aux
+                loss.backward()
+            window_loss.add_(loss_metric)
+            if aux_metric is not None:
+                window_aux.add_(aux_metric)
+            window_micro += 1
+            last_loss.copy_(loss_metric)
+            tokens += ids.numel()
+            sequences_forwarded += int(ids.shape[0])
+            forwarded_real_tokens += real_tokens
+            padding_tokens += int(ids.numel()) - real_tokens
+            micro_step += 1
+
+            if micro_step % opts.grad_accum != 0:
+                continue
+            flush_pending(opts.grad_accum)
+
+            if opt_step % opts.log_every == 0 or opt_step == opts.max_steps:
+                elapsed = time.time() - t0
+                rec = {
+                    "step": opts.step_offset + opt_step,
+                    "stage": opts.stage,
+                    "stage_step": opt_step,
+                    # Synchronize metrics only at the configured logging cadence,
+                    # not between every forward and backward launch.
+                    "loss": round((window_loss / max(window_micro, 1)).item(), 4),
+                    "aux": round((window_aux / max(window_micro, 1)).item(), 4),
+                    "tokens": tokens,
+                    "tok_per_s": round(tokens / max(elapsed, 1e-6), 1),
+                    "elapsed_s": round(elapsed, 1),
+                }
+                if device.type == "cuda":
+                    rec["cuda_peak_allocated_gb"] = round(torch.cuda.max_memory_allocated(device) / 2**30, 3)
+                    rec["cuda_peak_reserved_gb"] = round(torch.cuda.max_memory_reserved(device) / 2**30, 3)
+                if metrics_fn is not None:
+                    rec.update(metrics_fn())
+                log_metrics(rec)
+                route_status = (
+                    f" · route H={rec['router_entropy']:.3f}, dead={rec['dead_experts']}"
+                    if "router_entropy" in rec
+                    else ""
                 )
-            if "cuda_peak_allocated_gb" in rec:
-                terminal_fields.append(f"CUDA peak={rec['cuda_peak_allocated_gb']} GB")
-            print(" | ".join(terminal_fields), flush=True)
-            window_loss.zero_()
-            window_aux.zero_()
-            window_micro = 0
-        if after_step_fn is not None:
-            after_step_fn(opt_step, loss_metric)
-        if opts.save_every and save_fn and opt_step % opts.save_every == 0:
-            save_fn(opt_step)
-        if opt_step >= opts.max_steps:
-            break
+                write_progress(
+                    opts.stage,
+                    opt_step,
+                    rec["loss"],
+                    f"{rec['tok_per_s']} tok/s{route_status}",
+                )
+                terminal_fields = [
+                    f"{opts.stage}: step {rec['step']}/{opts.total_steps or opts.max_steps}",
+                    f"loss={rec['loss']}",
+                    f"aux={rec['aux']}",
+                    f"{rec['tok_per_s']} tok/s",
+                ]
+                if "router_entropy" in rec:
+                    terminal_fields.extend(
+                        (
+                            f"route H={rec['router_entropy']:.3f}",
+                            f"dead={rec['dead_experts']}",
+                        )
+                    )
+                if "cuda_peak_allocated_gb" in rec:
+                    terminal_fields.append(f"CUDA peak={rec['cuda_peak_allocated_gb']} GB")
+                print(" | ".join(terminal_fields), flush=True)
+                window_loss.zero_()
+                window_aux.zero_()
+                window_micro = 0
+            if after_step_fn is not None:
+                after_step_fn(opt_step, loss_metric)
+            if opts.save_every and save_fn and opt_step % opts.save_every == 0:
+                save_fn(opt_step)
+            if opt_step >= opts.max_steps:
+                break
 
     if micro_step % opts.grad_accum != 0 and opt_step < opts.max_steps:
         flush_pending(micro_step % opts.grad_accum)

@@ -69,6 +69,78 @@ def _config(**updates):
     return value
 
 
+@pytest.mark.parametrize("weight", ["bfloat16", "nvfp4"])
+def test_standard_fp32_master_recipe_retains_bf16_compute_and_gpu_moments(weight):
+    cfg = _config()
+    cfg["spalmer"].update(expert_weight_format=weight, expert_activation_format=weight)
+    cfg["spalmer"]["experts"].update(
+        expert_master_dtype="float32", expert_activation_format=weight,
+        expert_execution="loop" if weight == "nvfp4" else "grouped",
+    )
+    cfg["training"] = {"parameter_dtype": "float32", "compute_dtype": "bfloat16"}
+    normalized = bridge.normalize_spalmer_config(cfg)
+    assert normalized["optimizer_state_offload"] == "none"
+    resolved = bridge.build_spalmer_training_config(
+        cfg, api=SimpleNamespace(TrainingConfig=lambda **kwargs: SimpleNamespace(**kwargs))
+    )
+    assert resolved.parameter_dtype == "float32"
+    assert resolved.compute_dtype == "bfloat16"
+    assert resolved.optimizer_state_dtype == "float32"
+    assert cfg["spalmer"]["experts"]["expert_master_dtype"] == "float32"
+
+
+def test_standard_recipe_rejects_conflicting_precision_metadata_and_cpu_offload():
+    cfg = _config()
+    cfg["spalmer"]["experts"]["expert_master_dtype"] = "float32"
+    cfg["precision"] = {"parameter_dtype": "bfloat16"}
+    with pytest.raises(ValueError, match="disagrees"):
+        bridge.normalize_spalmer_config(cfg)
+    cfg.pop("precision")
+    cfg["optimizer_state_offload"] = "cpu"
+    with pytest.raises(ValueError, match="requires optimizer_state_offload='none'"):
+        bridge.normalize_spalmer_config(cfg)
+
+
+def test_standard_recipe_refuses_fp32_master_with_historical_mxfp8_backward_tuple():
+    cfg = _config()
+    cfg["spalmer"].update(expert_weight_format="nvfp4", expert_activation_format="mxfp8")
+    cfg["spalmer"]["experts"].update(
+        expert_master_dtype="float32", expert_activation_format="mxfp8"
+    )
+    with pytest.raises(ValueError, match="standard NVFP4/NVFP4"):
+        bridge.normalize_spalmer_config(cfg)
+
+
+def test_standard_nvfp4_capability_cannot_reuse_historical_hybrid(monkeypatch):
+    import sys
+
+    called = []
+    module = SimpleNamespace(standard_nvfp4_provider_capability=lambda device: {
+        "provider_id": "torchao_nvfp4_training_sm120_fp32_master",
+        "verified": False, "selectable": False, "detail": "standard backward failed",
+    })
+    monkeypatch.setitem(sys.modules, "spalmer.experts.standard_nvfp4", module)
+    api = SimpleNamespace(detect_precision_capabilities=lambda device: called.append(device))
+    experts = SimpleNamespace(
+        expert_weight_format="nvfp4", expert_activation_format="nvfp4",
+        expert_master_dtype="float32", expert_execution="loop", expert_qat_backend="auto",
+    )
+    with pytest.raises(RuntimeError, match="standard backward failed"):
+        bridge._validate_native_expert_precision(experts, api, device="cuda:0")
+    assert called == []
+
+
+def test_fp32_optimizer_placement_proof_checks_selected_master_dtype():
+    payload = {"dense": {
+        "initialized": True, "moment_dtype": "float32", "devices": ["cuda:0"],
+        "parameter_devices": ["cuda:0"], "parameter_dtypes": ["float32"],
+        "policy": "none", "moment_bytes": 128,
+    }}
+    bridge._validate_initialized_optimizer_offload(payload, parameter_dtype="float32")
+    with pytest.raises(RuntimeError, match="expected bfloat16"):
+        bridge._validate_initialized_optimizer_offload(payload)
+
+
 def test_normalize_spalmer_config_accepts_ui_contract_without_mutation():
     original = _config()
     normalized = bridge.normalize_spalmer_config(original, require_runtime=True)
@@ -91,7 +163,7 @@ def test_normalize_spalmer_config_accepts_ui_contract_without_mutation():
     assert normalized["optimizer_state_offload"] == "cpu"
 
 
-def test_normalize_spalmer_config_requires_cpu_optimizer_state_offload():
+def test_normalize_spalmer_config_allows_explicit_accelerator_moments():
     config = _config(
         training={
             "compute_dtype": "bfloat16",
@@ -100,8 +172,7 @@ def test_normalize_spalmer_config_requires_cpu_optimizer_state_offload():
             "optimizer_state_offload": "none",
         }
     )
-    with pytest.raises(ValueError, match="optimizer_state_offload='cpu'"):
-        bridge.normalize_spalmer_config(config)
+    assert bridge.normalize_spalmer_config(config)["optimizer_state_offload"] == "none"
 
 
 @pytest.mark.parametrize(
@@ -249,6 +320,34 @@ def test_training_config_enables_cpu_optimizer_state_offload():
     assert training.parameter_dtype == "bfloat16"
     assert training.optimizer_state_dtype == "float32"
     assert training.optimizer_state_offload == "cpu"
+
+
+@pytest.mark.parametrize("policy", ["cpu", "none"])
+def test_training_config_preserves_requested_optimizer_placement(policy):
+    api = SimpleNamespace(TrainingConfig=lambda **values: SimpleNamespace(**values))
+    training = bridge.build_spalmer_training_config(_config(optimizer_state_offload=policy), api=api)
+    assert training.optimizer_state_offload == policy
+    assert training.optimizer_state_dtype == "float32"
+    assert training.stochastic_parameter_rounding is True
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA placement proof")
+@pytest.mark.parametrize("policy", ["cpu", "none"])
+def test_physical_bf16_optimizer_placement_for_both_policies(policy):
+    from spalmer.training.optim import BF16MasterAdamW
+
+    parameter = torch.nn.Parameter(torch.zeros(8, device="cuda", dtype=torch.bfloat16))
+    optimizer = BF16MasterAdamW(
+        [parameter], state_offload=policy, update_chunk_size=4,
+        lr=1e-3, betas=(0.9, 0.95), eps=1e-8, stochastic_rounding=True,
+    )
+    parameter.grad = torch.ones_like(parameter)
+    optimizer.step()
+    payload = {"dense": optimizer.state_placement()}
+    bridge._validate_initialized_optimizer_offload(payload)
+    payload["dense"]["devices"] = ["cuda:0"] if policy == "cpu" else ["cpu"]
+    with pytest.raises(RuntimeError, match="placement proof failed"):
+        bridge._validate_initialized_optimizer_offload(payload)
 
 
 @pytest.mark.parametrize(
@@ -564,6 +663,8 @@ def _native_run(
         deterministic_algorithms=False,
         device="cpu",
         optimizer_update_chunk_size=1_048_576,
+        parameter_dtype="bfloat16",
+        compute_dtype="bfloat16",
         **(training_updates or {}),
     )
     experts = _ConfigObject(
@@ -693,6 +794,7 @@ def test_run_writes_native_artifact_metadata_without_real_training(tmp_path, mon
     assert update_args[0].endswith("spalmer.pt")
     assert metadata["model_family"] == "spalmer"
     assert metadata["precision"] == {
+        "recipe": "spalmer_native_experts_bf16_master_v1",
         "expert_weights": "bfloat16",
         "expert_activations": "bfloat16",
         "master_weights": "bfloat16",
@@ -731,9 +833,7 @@ def _checkpoint_config(**updates):
 
 
 def test_normalize_spalmer_config_checkpoint_mode_inherits_architecture(tmp_path, monkeypatch):
-    bundle = tmp_path / "parent" / "spalmer.pt"
-    bundle.parent.mkdir()
-    bundle.write_bytes(b"bundle")
+    bundle = _parent_bundle(tmp_path / "parent" / "spalmer.pt", tokenizer_source="unused")
     monkeypatch.setattr(bridge.db, "q1", lambda sql, args=(): _parent_row(bundle))
 
     normalized = bridge.normalize_spalmer_config(_checkpoint_config(epochs=3), require_runtime=True)
@@ -770,9 +870,7 @@ def test_normalize_spalmer_config_checkpoint_mode_inherits_architecture(tmp_path
 def test_normalize_spalmer_config_checkpoint_mode_rejections(
     tmp_path, monkeypatch, row_factory, updates, message
 ):
-    bundle = tmp_path / "parent" / "spalmer.pt"
-    bundle.parent.mkdir()
-    bundle.write_bytes(b"bundle")
+    bundle = _parent_bundle(tmp_path / "parent" / "spalmer.pt", tokenizer_source="unused")
     monkeypatch.setattr(bridge.db, "q1", lambda sql, args=(): row_factory(bundle))
 
     with pytest.raises(ValueError, match=message):
@@ -793,7 +891,8 @@ def test_normalize_spalmer_config_rejects_unknown_initialization_mode():
 
 
 def _parent_bundle(
-    path: Path, *, tokenizer_source: str, format_version: int = 8, recurrence=None
+    path: Path, *, tokenizer_source: str, format_version: int = 8, recurrence=None,
+    parameter_dtype: str = "bfloat16",
 ) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     model_config = {"vocab_size": 32, "d_model": 8, "n_layers": 4}
@@ -801,7 +900,7 @@ def _parent_bundle(
         "num_experts": 200,
         "expert_weight_format": "bfloat16",
         "expert_activation_format": "bfloat16",
-        "expert_master_dtype": "bfloat16",
+        "expert_master_dtype": parameter_dtype,
         "expert_qat_backend": "auto",
         "expert_execution": "grouped",
         "expert_promotion_format": "bfloat16",
@@ -821,7 +920,7 @@ def _parent_bundle(
         {
             "format": "spalmer.prototype.checkpoint",
             "format_version": format_version,
-            "model_parameter_dtype": "bfloat16",
+            "model_parameter_dtype": parameter_dtype,
             "model_config": model_config,
             "kda_config": {"hidden_size": 8, "num_heads": 2},
             "mla_config": {"hidden_size": 8, "num_heads": 2},
@@ -840,7 +939,7 @@ def _parent_bundle(
                     "fingerprint": "identity-expected",
                 },
             },
-            "model_state": {"w": torch.zeros(2, dtype=torch.bfloat16)},
+            "model_state": {"w": torch.zeros(2, dtype=getattr(torch, parameter_dtype))},
             "metadata": {
                 "run_id": "run_parent",
                 "plan": {
@@ -862,6 +961,56 @@ def _parent_bundle(
         path,
     )
     return path
+
+
+@pytest.mark.parametrize(("dtype", "policy"), [("bfloat16", "cpu"), ("float32", "none")])
+def test_checkpoint_precision_is_inherited_before_optimizer_defaults(tmp_path, monkeypatch, dtype, policy):
+    bundle = _parent_bundle(
+        tmp_path / "parent.pt", tokenizer_source="unused", parameter_dtype=dtype
+    )
+    monkeypatch.setattr(bridge.db, "q1", lambda sql, args=(): _parent_row(bundle))
+    submitted = _checkpoint_config()
+    normalized = bridge.normalize_spalmer_config(submitted)
+    assert normalized["training"]["parameter_dtype"] == dtype
+    assert normalized["optimizer_state_offload"] == policy
+    assert bridge.normalize_spalmer_config(normalized) == normalized
+    assert "training" not in submitted
+
+
+@pytest.mark.parametrize("field", [
+    "parameter_dtype", "expert_master_dtype", "master_weights", "ple_parameter_dtype",
+])
+def test_checkpoint_precision_rejects_conflicting_metadata(tmp_path, monkeypatch, field):
+    bundle = _parent_bundle(
+        tmp_path / "parent.pt", tokenizer_source="unused", parameter_dtype="float32"
+    )
+    monkeypatch.setattr(bridge.db, "q1", lambda sql, args=(): _parent_row(bundle))
+    with pytest.raises(ValueError, match=f"precision.{field} disagrees"):
+        bridge.normalize_spalmer_config(_checkpoint_config(precision={field: "bfloat16"}))
+
+
+@pytest.mark.parametrize("updates, message", [
+    ({"training": {"parameter_dtype": "bfloat16"}}, "disagrees with parent"),
+    ({"optimizer_state_offload": "cpu"}, "requires optimizer_state_offload='none'"),
+    ({"training": {"optimizer_state_offload": "cpu"}}, "requires optimizer_state_offload='none'"),
+])
+def test_fp32_checkpoint_rejects_explicit_incompatible_training(tmp_path, monkeypatch, updates, message):
+    bundle = _parent_bundle(
+        tmp_path / "parent.pt", tokenizer_source="unused", parameter_dtype="float32"
+    )
+    monkeypatch.setattr(bridge.db, "q1", lambda sql, args=(): _parent_row(bundle))
+    with pytest.raises(ValueError, match=message):
+        bridge.normalize_spalmer_config(_checkpoint_config(**updates))
+
+
+def test_checkpoint_precision_rejects_contradictory_parent_metadata(tmp_path, monkeypatch):
+    bundle = _parent_bundle(tmp_path / "parent.pt", tokenizer_source="unused")
+    payload = torch.load(bundle, weights_only=True)
+    payload["model_parameter_dtype"] = "float32"
+    torch.save(payload, bundle)
+    monkeypatch.setattr(bridge.db, "q1", lambda sql, args=(): _parent_row(bundle))
+    with pytest.raises(ValueError, match="parent checkpoint parameter dtype disagrees"):
+        bridge.normalize_spalmer_config(_checkpoint_config())
 
 
 def _checkpoint_api(load_checkpoint, **extra):
@@ -945,6 +1094,24 @@ def test_prepare_spalmer_run_continues_from_parent_bundle(tmp_path, monkeypatch)
     assert prepared.training.max_steps == 2
 
 
+def test_prepare_fp32_checkpoint_continuation_uses_stock_optimizer_contract(tmp_path, monkeypatch):
+    from spalmer.training.config import TrainingConfig
+
+    bundle = _parent_bundle(
+        tmp_path / "parent.pt", tokenizer_source="unused", parameter_dtype="float32"
+    )
+    monkeypatch.setattr(bridge.db, "q1", lambda sql, args=(): _parent_row(bundle))
+    monkeypatch.setattr("yylab.models.spalmer.relocated_spalmer_tokenizer", lambda binding: None)
+    metadata = torch.load(bundle, weights_only=True)["metadata"]
+    api = _checkpoint_api(lambda *args, **kwargs: (_FakeModel(), _FakeTokenizer(), metadata))
+    api.TrainingConfig = TrainingConfig
+    prepared = bridge.prepare_spalmer_run(_checkpoint_config(), api=api)
+    assert prepared.training.parameter_dtype == "float32"
+    assert prepared.training.compute_dtype == "bfloat16"
+    assert prepared.training.optimizer_state_dtype == "float32"
+    assert prepared.training.optimizer_state_offload == "none"
+
+
 def test_prepare_spalmer_run_skips_override_when_tokenizer_path_exists(tmp_path, monkeypatch):
     present = tmp_path / "tok"
     present.mkdir()
@@ -991,9 +1158,7 @@ class _FakeLoadedModel(_FakeModel):
 
 def test_run_uses_loaded_model_and_records_parent(tmp_path, monkeypatch):
     output = tmp_path / "checkpoint"
-    bundle_path = tmp_path / "parent" / "spalmer.pt"
-    bundle_path.parent.mkdir()
-    bundle_path.write_bytes(b"bundle")
+    bundle_path = _parent_bundle(tmp_path / "parent" / "spalmer.pt", tokenizer_source="unused")
     batches = _FakeBatches()
     training = _ConfigObject(
         max_steps=2,
@@ -1002,6 +1167,8 @@ def test_run_uses_loaded_model_and_records_parent(tmp_path, monkeypatch):
         deterministic_algorithms=False,
         device="cpu",
         optimizer_update_chunk_size=1_048_576,
+        parameter_dtype="bfloat16",
+        compute_dtype="bfloat16",
     )
     experts = _ConfigObject(
         expert_weight_format="bfloat16",

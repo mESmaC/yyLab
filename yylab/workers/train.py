@@ -65,6 +65,8 @@ from ..train.data import (
 )
 from ..train.loop import LoopOpts, make_optimizer, optimizer_runtime_metadata, train_loop
 from ..train.low_precision import LOW_PRECISION_METADATA_KEY, apply_qat, qat_metadata
+from ..train.prefetch import BufferedBatches
+from ..train.prepared import prepare_for_training
 
 
 def log(msg: str) -> None:
@@ -254,8 +256,22 @@ def build_batches(
     domains: list[str] | None = None,
     shard_index: int | None = None,
     num_shards: int | None = None,
-) -> PackedBatches | ChatSFTBatches:
+) -> BufferedBatches:
     selected_domains = domains if domains is not None else cfg.get("domains") or None
+
+    def tokenize(texts: list[str]) -> list[list[int]]:
+        # PackedBatches slices these raw encodings to cfg["seq_len"] before
+        # model execution.  Transformers' model-length warning is therefore
+        # misleading here: no un-packed sequence is ever forwarded.
+        enc = tokenizer(
+            texts,
+            add_special_tokens=False,
+            return_attention_mask=False,
+            verbose=False,
+        )
+        return enc["input_ids"]
+
+    reader = prepare_for_training(cfg, tokenizer, tokenize, progress=log)
 
     def docs():
         for epoch in range(max(1, int(cfg.get("epochs", 1)))):
@@ -273,30 +289,20 @@ def build_batches(
                 corpus_weights=cfg.get("corpus_weights") or None,
                 source_max_ratio=cfg.get("source_max_ratio"),
                 annotate_source=True,
+                corpus_reader=reader,
             )
 
     if normalize_training_objective(cfg.get("objective")) == OBJECTIVE_CHAT_SFT:
-        return ChatSFTBatches(
+        packed = ChatSFTBatches(
             docs(),
             tokenizer,
             seq_len=cfg["seq_len"],
             micro_batch=cfg["micro_batch"],
             max_batches=max_steps * cfg["grad_accum"],
         )
+        return BufferedBatches(packed, int(cfg.get("data_prefetch_batches", 2)), resources=reader)
 
-    def tokenize(texts: list[str]) -> list[list[int]]:
-        # PackedBatches slices these raw encodings to cfg["seq_len"] before
-        # model execution.  Transformers' model-length warning is therefore
-        # misleading here: no un-packed sequence is ever forwarded.
-        enc = tokenizer(
-            texts,
-            add_special_tokens=False,
-            return_attention_mask=False,
-            verbose=False,
-        )
-        return enc["input_ids"]
-
-    return PackedBatches(
+    packed = PackedBatches(
         docs(),
         tokenize,
         seq_len=cfg["seq_len"],
@@ -306,6 +312,8 @@ def build_batches(
         tokenize_chunk=int(cfg.get("tokenize_chunk", 8)),
         max_text_chars=int(cfg.get("max_text_chars", DEFAULT_TEXT_CHUNK_CHARS)),
     )
+
+    return BufferedBatches(packed, int(cfg.get("data_prefetch_batches", 2)), resources=reader)
 
 
 def tokenized_view_manifest(
@@ -367,6 +375,8 @@ def tokenized_view_manifest(
         },
         "tokens": tokens,
         "per_corpus": dict(batcher.get("per_corpus") or {}),
+        "prepared_tokens": dict(batcher.get("prepared_tokens") or {}),
+        "data_prefetch_batches": int(batcher.get("data_prefetch_batches") or 0),
         "reconciliation": reconciliation,
         # Compact compatibility fields for older run/checkpoint consumers.
         "docs_seen": int(batcher.get("docs_seen") or getattr(batches, "docs_seen", 0)),

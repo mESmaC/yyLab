@@ -1,0 +1,58 @@
+{
+  "schema": "yylab-rejected-cache-experiment-archive-v1",
+  "status": "rejected_from_speed_results",
+  "reason": "Eager and compiled full-model strict parity failed; no accepted throughput measurement.",
+  "restoration": "Restore each archived file to original_path from repository root before attempting execution. Scripts rely on the original artifact directory depth and adjacent imports.",
+  "files": {
+    "weight_cache.py": {
+      "original_path": "artifacts/sprint-1b-speed-20260911/weight_cache.py",
+      "sha256": "0e7cfe3a98b7d6abde30be70c5e724cf795c39d788092466df1350efd032e33b",
+      "bytes": 11592
+    },
+    "benchmark_weight_cache.py": {
+      "original_path": "artifacts/sprint-1b-speed-20260911/benchmark_weight_cache.py",
+      "sha256": "cd3a2cf3642fc281d0a4b64b14a1419cce45824a333f75bd3b572d143401c2af",
+      "bytes": 3550
+    },
+    "test_weight_cache.py": {
+      "original_path": "artifacts/sprint-1b-speed-20260911/test_weight_cache.py",
+      "sha256": "7d2d977c2414d0d14841c1177950c23cf2aaba3cf0c3606e84db5c72a84daf50",
+      "bytes": 7832
+    },
+    "diagnose_weight_cache.py": {
+      "original_path": "artifacts/sprint-1b-speed-20260911/diagnose_weight_cache.py",
+      "sha256": "cad2ccd544be10c51df5f7c25968aa7f7b1255cda9588505fe39445a5ba8e20a",
+      "bytes": 9000
+    },
+    "weight-cache-b32.json": {
+      "original_path": "artifacts/sprint-1b-speed-20260911/weight-cache-b32.json",
+      "sha256": "e4afe3a5dd63aa62c1081f7e447556abca7579a8a1129b50f5e274c7845ce4a9",
+      "bytes": 1750
+    },
+    "weight-cache-notes.md": {
+      "original_path": "artifacts/sprint-1b-speed-20260911/weight-cache-notes.md",
+      "sha256": "3e495c8a4c7125863ac7958cebd8d9dd18bd92a96076a08d488d04c91c248bb8",
+      "bytes": 5882
+    },
+    "cache-first-difference.json": {
+      "original_path": "artifacts/sprint-1b-speed-20260911/cache-first-difference.json",
+      "sha256": "e1275567b2f0008f408f01f4f14fdcefec92c18bd79ba53cd2825dd3b0991f1a",
+      "bytes": 43103
+    },
+    "cache-parity-attempt1/weight_cache.py": {
+      "original_path": "artifacts/sprint-1b-speed-20260911/cache-parity-attempt1/weight_cache.py",
+      "sha256": "0e7cfe3a98b7d6abde30be70c5e724cf795c39d788092466df1350efd032e33b",
+      "bytes": 11592
+    },
+    "cache-parity-attempt1/test_weight_cache.py": {
+      "original_path": "artifacts/sprint-1b-speed-20260911/cache-parity-attempt1/test_weight_cache.py",
+      "sha256": "7d2d977c2414d0d14841c1177950c23cf2aaba3cf0c3606e84db5c72a84daf50",
+      "bytes": 7832
+    },
+    "cache-parity-attempt1/validation.json": {
+      "original_path": "artifacts/sprint-1b-speed-20260911/cache-parity-attempt1/validation.json",
+      "sha256": "c45b60dfb1135e9392550f6739a0e60768cf138fd31a0173a812887188fc8ee9",
+      "bytes": 686
+    }
+  }
+}

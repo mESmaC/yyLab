@@ -1,0 +1,204 @@
+{
+  "schema": "yylab-sprint-precision-benchmark-v1",
+  "experimental": true,
+  "status": "running",
+  "created_at_utc": "2026-09-11T22:55:30.491676Z",
+  "source_sha256": {
+    "yylab/train/benchmark_sprint_precision.py": "869eb914876b1c34245e2675f3a3ef7c013d4722b91d3d15e11c231f6c244d61",
+    "yylab/train/sprint_precision.py": "6541c5ac50432b5fdc41bfa856f1efb83c676ff3c3f6207a215c5f7d868c49b3",
+    "yylab/train/mxfp8.py": "5fd5db8cb2be6079fdee3f989a3bc3d33db5412033466dbb47f88a7501f9663c",
+    "yylab/train/mxfp8_fast.py": "98a51fd282218d9d7fd42d32d55b2ae3d8dc757569fa09fc4ac0bc9e52fc243f",
+    "yylab/train/low_precision.py": "97635523c64a10e0ec5cd29db4950a48cdd58aeeccff068c1c0764a7376c8bf8",
+    "yylab/train/bitnet_benchmark.py": "052d1146cbd0982498b3b362007ec3441ee31befd3f7927e581a52ea08d9d6f5",
+    "yylab/train/bitnet_int8_benchmark.py": "af582c255a6d2cf46ba9dc195db4b2596d93553177859487c8fd8601239b086a",
+    "yylab/train/sprint_nvfp4_training.py": "0f4f38346b33a6a43d07b10cf90e9f174facaf8593d3a80b219d00d40157c760",
+    "yylab/train/sprint_nvfp4_portable.py": "e7676d8a8ec0b44bf45bb232a29c7bbdd86e3d22722a10b32b07b6463c3e6a18",
+    "yylab/models/sprint.py": "0e95c1eb83c45febd174c8687022156925168190b11591a14fa3c7997410dd4f",
+    "yylab/train/sprint.py": "d0eca0a219ea122eeabb2ae4b20c86957656414cdd454817b867e74fffee93bd",
+    "yylab/train/sprint_cpu_adam.py": "1e89643be1138eecb54473c08cf99a6fd93c96b4843f6fc6683e530b974e9560",
+    "artifacts/sprint-1b-speed-20260911/benchmark_allocator.py": "b63c9e5fa99c87705150d3b708e8ab33dd60af5079064dfbb4d39ede6375857e"
+  },
+  "runtime_versions": {
+    "torch": "2.11.0+cu128",
+    "torchao": "0.18.0",
+    "transformers": "5.16.1",
+    "triton": "3.7.1.post27"
+  },
+  "recipe": {
+    "model_config": {
+      "transformers_version": "5.16.1",
+      "architectures": [
+        "SprintForCausalLM"
+      ],
+      "output_hidden_states": false,
+      "return_dict": true,
+      "dtype": null,
+      "chunk_size_feed_forward": 0,
+      "is_encoder_decoder": false,
+      "id2label": {
+        "0": "LABEL_0",
+        "1": "LABEL_1"
+      },
+      "label2id": {
+        "LABEL_0": 0,
+        "LABEL_1": 1
+      },
+      "problem_type": null,
+      "_name_or_path": "",
+      "tie_word_embeddings": true,
+      "num_key_value_heads": 32,
+      "head_dim": 128,
+      "model_type": "sprint",
+      "vocab_size": 8192,
+      "hidden_size": 4096,
+      "intermediate_size": 11456,
+      "num_hidden_layers": 6,
+      "num_attention_heads": 32,
+      "max_position_embeddings": 2048,
+      "mlp_type": "gelu",
+      "rope_theta": 10000.0,
+      "rms_norm_eps": 1e-6,
+      "initializer_range": 0.02,
+      "loss_backend": "auto",
+      "loss_chunk_size": 1024,
+      "use_cache": true,
+      "output_attentions": false
+    },
+    "target_parameters": 1000000000,
+    "precisions": [
+      "nvfp4_mxfp8_fast"
+    ],
+    "effective_batch": 128,
+    "seq_len": 512,
+    "batch_sizes": [
+      16
+    ],
+    "compile_modes": [
+      "default"
+    ],
+    "warmup_steps": 5,
+    "measure_steps": 24,
+    "device": "cuda",
+    "cpu_threads": 20,
+    "cpu_optimizer_kernel": "compiled",
+    "offload_bucket_mb": 32,
+    "attention_backend": "cudnn",
+    "gradient_checkpointing": false,
+    "seed": 42,
+    "lr": 0.0003,
+    "parameter_dtype": "bfloat16",
+    "optimizer_state_offload": "cpu",
+    "compute_dtype": "auto",
+    "weight_decay": 0.1,
+    "betas": [
+      0.9,
+      0.95
+    ],
+    "eps": 1e-8,
+    "grad_clip": 1.0,
+    "min_lr_ratio": 0.1,
+    "experimental_allocator": {
+      "config": "backend:native",
+      "release_after_warmup": false,
+      "release_after_first_warmup_step": true
+    }
+  },
+  "optimizer_schedule": {
+    "max_steps": 1000000,
+    "warmup_steps": 0
+  },
+  "device": "cuda",
+  "hardware": "NVIDIA GeForce RTX 5070",
+  "torch_version": "2.11.0+cu128",
+  "host_processor": "Intel64 Family 6 Model 198 Stepping 2, GenuineIntel",
+  "host_logical_cores": 20,
+  "model_config": {
+    "transformers_version": "5.16.1",
+    "architectures": [
+      "SprintForCausalLM"
+    ],
+    "output_hidden_states": false,
+    "return_dict": true,
+    "dtype": null,
+    "chunk_size_feed_forward": 0,
+    "is_encoder_decoder": false,
+    "id2label": {
+      "0": "LABEL_0",
+      "1": "LABEL_1"
+    },
+    "label2id": {
+      "LABEL_0": 0,
+      "LABEL_1": 1
+    },
+    "problem_type": null,
+    "_name_or_path": "",
+    "tie_word_embeddings": true,
+    "num_key_value_heads": 32,
+    "head_dim": 128,
+    "model_type": "sprint",
+    "vocab_size": 8192,
+    "hidden_size": 4096,
+    "intermediate_size": 11456,
+    "num_hidden_layers": 6,
+    "num_attention_heads": 32,
+    "max_position_embeddings": 2048,
+    "mlp_type": "gelu",
+    "rope_theta": 10000.0,
+    "rms_norm_eps": 1e-6,
+    "initializer_range": 0.02,
+    "loss_backend": "auto",
+    "loss_chunk_size": 1024,
+    "use_cache": true,
+    "output_attentions": false
+  },
+  "planned_parameters": 999346176,
+  "sequence_length": 512,
+  "effective_batch": 128,
+  "seed": 42,
+  "warmup_steps": 5,
+  "measure_steps": 24,
+  "comparison": {
+    "precisions": [
+      "nvfp4_mxfp8_fast"
+    ],
+    "batch_sizes": [
+      16
+    ],
+    "compile_modes": [
+      "default"
+    ],
+    "cpu_threads": 20,
+    "offload_bucket_mb": 32,
+    "cpu_optimizer_kernel": "compiled",
+    "attention_backend": "cudnn",
+    "gradient_checkpointing": false,
+    "lr": 0.0003
+  },
+  "initialization": "Every seeded model is rounded to BF16 before its precision adapter and optimizer are created. FP32 CPU masters therefore begin as copies of the same BF16-rounded initialization. BitNet may change the parameter count; each row records the exact result.",
+  "measurement": "Synchronized complete forward, backward, gradient clipping, and optimizer steps on repeated synthetic tokens including CPU-to-device transfer. Initialization, warmup/compilation, parameter-update checks, gradient-norm checks, data preparation, evaluation, and checkpoint writes are excluded from steady-state throughput. Final gradient norms describe the accumulated gradients after clipping. No convergence or final-quality claim.",
+  "cases": [],
+  "allocator_experiment": {
+    "config": "backend:native",
+    "release_after_warmup": false,
+    "release_after_first_warmup_step": true,
+    "variant": "native_allocator_residency_v1",
+    "expected_backend": "native",
+    "expected_per_process_memory_fraction": 1.0,
+    "fraction_attestation_absolute_tolerance": 1e-8,
+    "set_before_torch_import": true,
+    "inherited_environment": {
+      "PYTORCH_ALLOC_CONF": null,
+      "PYTORCH_CUDA_ALLOC_CONF": null
+    },
+    "effective_environment": {
+      "PYTORCH_ALLOC_CONF": "backend:native",
+      "PYTORCH_CUDA_ALLOC_CONF": null
+    },
+    "wrapper_sha256": "b63c9e5fa99c87705150d3b708e8ab33dd60af5079064dfbb4d39ede6375857e",
+    "training_math_unchanged": true,
+    "optimizer_recipe": "FP32 CPU masters and moments",
+    "first_warmup_release_timing_scope": "inside_warmup_after_step_0_before_measured_training",
+    "scope": "Allocation/reservation policy only. Optional release is outside steady-state timing; no update or timer is modified."
+  },
+  "allocator_measurement": "Normal complete training-step timer is unchanged. Optional synchronize/empty_cache runs once after the first warmup step or after all warmup before the measured timer, with a separate duration. First-step release is included in total warmup_seconds and precedes every remaining warmup step. Allocator peaks still include initialization/warmup; no peak counters are reset by this wrapper."
+}

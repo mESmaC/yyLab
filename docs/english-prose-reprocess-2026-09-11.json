@@ -1,0 +1,814 @@
+{
+  "created_at_utc": "2026-09-12T00:12:19.468486+00:00",
+  "corpus_id": "cor_20260911_200936_0c330d",
+  "name": "Prepared prose \u00b7 english-prose \u2014 2026-09-11 (51 files)",
+  "previous_corpus_id": "cor_20260907_194430_e2959b",
+  "index": "C:\\Users\\engin\\Desktop\\yy\\yyLab\\artifacts\\cache\\text-sources\\7f20516eee6d5bc71e63\\text-index.json",
+  "index_file_sha256": "b12ebd61a6cd7c55a6c6c90da74c0984e613523666bd6c6116cd8ac98239bd75",
+  "previous_index_file_sha256": "8a52ec8bf3f59c2882777bff099d9e28b32394ccb095fddb1e78cdbe2f2153d7",
+  "source_files": 51,
+  "previous_source_files": 35,
+  "added_files": [
+    "The pragmatic programmer _ from journeyman to master -- Andrew Hunt, David Thomas, Andy Hunt, Dave Thomas, David _ -- Pearson Education (US), Reading, -- isbn13 9780132100670 -- 4f0b19300c93b5d196c9775db931e75e -- .txt",
+    "pg1695.txt",
+    "pg20239.txt",
+    "pg205.txt",
+    "pg2130.txt",
+    "pg23639.txt",
+    "pg26378.txt",
+    "pg2680.txt",
+    "pg3207.txt",
+    "pg3296.txt",
+    "pg3711134.txt",
+    "pg4363.txt",
+    "pg45109.txt",
+    "pg51356.txt",
+    "pg54657.txt",
+    "pg57342.txt"
+  ],
+  "source_bytes": 41511604,
+  "stats": {
+    "docs_written": 4344,
+    "chars_written": 36705101,
+    "utf8_bytes_written": 36924275,
+    "words": 6273275,
+    "domains": {
+      "language": {
+        "docs": 4344,
+        "chars": 36705101,
+        "tokens": {}
+      }
+    },
+    "langs": {
+      "en": 4344
+    },
+    "splits": {
+      "train": {
+        "docs": 4100,
+        "chars": 34736654,
+        "utf8_bytes": 34924409,
+        "domains": {
+          "language": {
+            "docs": 4100,
+            "chars": 34736654,
+            "tokens": {}
+          }
+        }
+      },
+      "test": {
+        "docs": 141,
+        "chars": 1145247,
+        "utf8_bytes": 1163853,
+        "domains": {
+          "language": {
+            "docs": 141,
+            "chars": 1145247,
+            "tokens": {}
+          }
+        }
+      },
+      "validation": {
+        "docs": 103,
+        "chars": 823200,
+        "utf8_bytes": 836013,
+        "domains": {
+          "language": {
+            "docs": 103,
+            "chars": 823200,
+            "tokens": {}
+          }
+        }
+      }
+    },
+    "shards": []
+  },
+  "preprocessing": {
+    "name": "prose_v1",
+    "version": 1,
+    "line_endings": "CRLF_and_CR_to_LF",
+    "max_consecutive_newlines_outside_fences": 2,
+    "preserve_fenced_newline_runs": true,
+    "fences": {
+      "markers": [
+        "`",
+        "~"
+      ],
+      "minimum_length": 3
+    },
+    "reflow": {
+      "unit": "entire_unindented_blank_line_delimited_block",
+      "minimum_lines": 4,
+      "body_line_length_minimum": 52,
+      "body_line_length_maximum": 100,
+      "body_line_length_spread_maximum": 20,
+      "final_line_overrun_maximum": 8,
+      "body_line_words_minimum": 7,
+      "final_line_words_minimum": 2,
+      "alphabetic_percent_minimum_per_line_excluding_whitespace": 85,
+      "digit_percent_maximum_per_line_excluding_whitespace": 5,
+      "soft_continuations_minimum": 2,
+      "soft_continuations_minimum_fraction": "one_half_of_line_boundaries",
+      "soft_continuation": "lowercase_start_after_nonterminal_nonhyphen_line",
+      "reject_any_indentation_or_tabs": true,
+      "reject_trailing_whitespace": true,
+      "reject_repeated_horizontal_whitespace": true,
+      "reject_all_uppercase_lines": true,
+      "structured_line_start_pattern": "^(?:[-+*\\u2022\\u2023]\\s|[#>]|\\(?\\d+(?:\\.\\d+)*[.)]\\s|\\(?[A-Za-z][.)]\\s|\\(?[IVXLCDMivxlcdm]{1,8}[.)]\\s)",
+      "function_call_line_start_pattern": "^[A-Za-z_]\\w*\\(",
+      "structured_characters": "|=+*/\\<>^{}[]",
+      "rejected_unicode_categories": [
+        "Sm"
+      ],
+      "reject_repeated_marks": [
+        "--",
+        "__",
+        ".."
+      ],
+      "reject_body_line_ending_characters": "-\u2010\u2011",
+      "sentence_ending_characters": ".!?;:\u2026",
+      "join": "replace_each_accepted_LF_with_one_space"
+    }
+  },
+  "normalized_duplicate_windows_removed": 336,
+  "checks": {
+    "all_source_hashes_match": true,
+    "all_previous_sources_unchanged": true,
+    "heldout_document_ids_splits_and_rendered_hashes_unchanged": true,
+    "all_rendered_records_have_no_carriage_returns": true
+  },
+  "caches": [
+    {
+      "tokenizer_id": "tok_20260911_121147_1f5f01",
+      "vocab_size": 8192,
+      "path": "C:\\Users\\engin\\Desktop\\yy\\yyLab\\artifacts\\cache\\prepared-tokens\\3654d1b2d5b5e85b9247fe647084631123aa98fe3af6def277681d681dd9959d",
+      "manifest_sha256": "b87c9c25fd52dc4a80dd6dbaeb96a5c57d326d194bf864a818f2f6cf3f648723",
+      "documents": 4344,
+      "tokens": 10618613,
+      "tokens_by_split": {
+        "train": 10045354,
+        "test": 326770,
+        "validation": 246489
+      },
+      "documents_by_split": {
+        "train": 4100,
+        "test": 141,
+        "validation": 103
+      },
+      "files": [
+        {
+          "bytes": 42474452,
+          "name": "tokens-000000.bin",
+          "sha256": "4474c2eb80e1cfcd8ecd3d2f735aa640108c02c41e37d4ab360e29cee6841d52"
+        },
+        {
+          "bytes": 17842176,
+          "name": "records.sqlite3",
+          "sha256": "e8d2918dfba8462cb4ebbd71f88b07cb3b2aa1135d2b012df22c6b4507af7ccc"
+        }
+      ],
+      "cache_reuse_verified": true,
+      "all_token_ids_match_fresh_encoding": true,
+      "all_file_hashes_verified": true,
+      "token_scope": "content tokens before document-boundary EOS and training packing"
+    },
+    {
+      "tokenizer_id": "tok_20260904_124041_6ec536",
+      "vocab_size": 16384,
+      "path": "C:\\Users\\engin\\Desktop\\yy\\yyLab\\artifacts\\cache\\prepared-tokens\\41376780da5cec6aa76c2fbd83fcf1ec201a3e96385892e1b4f1f1a59a101a6f",
+      "manifest_sha256": "ae699215db4ea8f19295d2ae5179b5b5f2c635b137756bdae22e49e32a4cd40d",
+      "documents": 4344,
+      "tokens": 10991740,
+      "tokens_by_split": {
+        "train": 10412803,
+        "test": 331064,
+        "validation": 247873
+      },
+      "documents_by_split": {
+        "train": 4100,
+        "test": 141,
+        "validation": 103
+      },
+      "files": [
+        {
+          "bytes": 43966960,
+          "name": "tokens-000000.bin",
+          "sha256": "78a33e94c720fffb7b14d5d974e16057fcce1313c0a918a5e1d9853ba261ab51"
+        },
+        {
+          "bytes": 17842176,
+          "name": "records.sqlite3",
+          "sha256": "c07e00533a4ce5dd8c646669f186f0eaf7c2178aa5e343748dab6baf30dd6af6"
+        }
+      ],
+      "cache_reuse_verified": true,
+      "all_token_ids_match_fresh_encoding": true,
+      "all_file_hashes_verified": true,
+      "token_scope": "content tokens before document-boundary EOS and training packing"
+    }
+  ],
+  "training_started": false,
+  "verification_script_sha256": "e5005cc7995aa2f0f21e3f6a5a686de43e1ba105202426f86db79670fed196c2",
+  "status": "verified",
+  "source_audit": {
+    "schema": "yylab.english-prose-source-audit/1",
+    "created_at_utc": "2026-09-12T00:12:03.239558+00:00",
+    "source_directory": "C:\\Users\\engin\\Documents\\datasets\\english-prose",
+    "previous_index": {
+      "path": "C:\\Users\\engin\\Desktop\\yy\\yyLab\\artifacts\\cache\\text-sources\\b372a2537f365de7f546\\text-index.json",
+      "file_sha256": "8a52ec8bf3f59c2882777bff099d9e28b32394ccb095fddb1e78cdbe2f2153d7",
+      "index_sha256": "fe9cf3491f61e04fd862cf95cd4a86b7c08c7d106da214c8b2b8d7993b4b23fb",
+      "file_count": 35,
+      "source_bytes": 32702787,
+      "documents": 3388,
+      "normalized_duplicates_removed": 325
+    },
+    "new_index": {
+      "path": "C:\\Users\\engin\\Desktop\\yy\\yyLab\\artifacts\\cache\\text-sources\\7f20516eee6d5bc71e63\\text-index.json",
+      "file_sha256": "b12ebd61a6cd7c55a6c6c90da74c0984e613523666bd6c6116cd8ac98239bd75",
+      "index_sha256": "43f65e15bd7634173fea303dee913c3a8c4a28facedd82addb6078c0979dcfd7",
+      "corpus_id": "cor_20260911_200936_0c330d",
+      "file_count": 51,
+      "source_bytes": 41511604,
+      "documents": 4344,
+      "documents_by_split": {
+        "train": 4100,
+        "test": 141,
+        "validation": 103
+      },
+      "normalized_duplicates_removed": 336
+    },
+    "inventory": {
+      "file_count": 51,
+      "extensions": {
+        ".txt": 51
+      },
+      "subdirectories": [],
+      "unsupported_files": [],
+      "missing_original_files": [],
+      "added_file_count": 16,
+      "added_source_bytes": 8808817,
+      "added_raw_words": 1495019
+    },
+    "added_files": [
+      {
+        "filename": "pg1695.txt",
+        "size_bytes": 355410,
+        "sha256": "16fde29acf764ba5742fd5db8833f424b6b89c0f6e282d518f6c626006faf6e1",
+        "matches_new_index": true,
+        "indexed_title": "The Man Who Was Thursday: A Nightmare",
+        "indexed_author": "G. K. Chesterton",
+        "raw_words": 61439,
+        "gutenberg_wrapper": true,
+        "excluded_bytes": 19858,
+        "strict_utf8": true,
+        "nul_characters": 0,
+        "replacement_characters": 0
+      },
+      {
+        "filename": "pg20239.txt",
+        "size_bytes": 612838,
+        "sha256": "70f07e261b34bcdd1ec7b331d3fd9cbd7c0ea4e924fb07a9ddd1a170c3f9b0c0",
+        "matches_new_index": true,
+        "indexed_title": "The Ten Books on Architecture",
+        "indexed_author": "Vitruvius Pollio",
+        "raw_words": 104318,
+        "gutenberg_wrapper": true,
+        "excluded_bytes": 19883,
+        "strict_utf8": true,
+        "nul_characters": 0,
+        "replacement_characters": 0
+      },
+      {
+        "filename": "pg205.txt",
+        "size_bytes": 667957,
+        "sha256": "2d9a76a2e3e8195c69430516ebd33c4d0757a53ad432ff6186b7b794e6fe99f9",
+        "matches_new_index": true,
+        "indexed_title": "Walden, and On The Duty Of Civil Disobedience",
+        "indexed_author": "Henry David Thoreau",
+        "raw_words": 119442,
+        "gutenberg_wrapper": true,
+        "excluded_bytes": 19891,
+        "strict_utf8": true,
+        "nul_characters": 0,
+        "replacement_characters": 0
+      },
+      {
+        "filename": "pg2130.txt",
+        "size_bytes": 261748,
+        "sha256": "9a07cd3fd858e085aa5229b13214c52dba0f0c2ddd0b62bae47b7e29490ce19e",
+        "matches_new_index": true,
+        "indexed_title": "Utopia",
+        "indexed_author": "Saint Thomas More",
+        "raw_words": 46703,
+        "gutenberg_wrapper": true,
+        "excluded_bytes": 19735,
+        "strict_utf8": true,
+        "nul_characters": 0,
+        "replacement_characters": 0
+      },
+      {
+        "filename": "pg23639.txt",
+        "size_bytes": 956607,
+        "sha256": "357a67ebc1c3618283db2d0a8314eaca1b75a4bed6441d376951ba1fb7d8e5e1",
+        "matches_new_index": true,
+        "indexed_title": "Plutarch's Morals",
+        "indexed_author": "Plutarch",
+        "raw_words": 164789,
+        "gutenberg_wrapper": true,
+        "excluded_bytes": 19832,
+        "strict_utf8": true,
+        "nul_characters": 0,
+        "replacement_characters": 0
+      },
+      {
+        "filename": "pg26378.txt",
+        "size_bytes": 739058,
+        "sha256": "8427e969bc262b6b0af30807582d057aa64fd5ffd61fb7fe181414a6144b918c",
+        "matches_new_index": true,
+        "indexed_title": "The Care of Books",
+        "indexed_author": "John Willis Clark",
+        "raw_words": 119747,
+        "gutenberg_wrapper": true,
+        "excluded_bytes": 19988,
+        "strict_utf8": true,
+        "nul_characters": 0,
+        "replacement_characters": 0
+      },
+      {
+        "filename": "pg2680.txt",
+        "size_bytes": 425304,
+        "sha256": "6977474f82a39dd88a4af31a59504821658174d33c177732c54357e4d680b96c",
+        "matches_new_index": true,
+        "indexed_title": "Meditations",
+        "indexed_author": "Emperor of Rome Marcus Aurelius",
+        "raw_words": 75188,
+        "gutenberg_wrapper": true,
+        "excluded_bytes": 19760,
+        "strict_utf8": true,
+        "nul_characters": 0,
+        "replacement_characters": 0
+      },
+      {
+        "filename": "pg3207.txt",
+        "size_bytes": 1254939,
+        "sha256": "3de1e492641d939567a8b0de827fb13e1ad992324f9ac8b204f60475009b7294",
+        "matches_new_index": true,
+        "indexed_title": "Leviathan",
+        "indexed_author": "Thomas Hobbes",
+        "raw_words": 216851,
+        "gutenberg_wrapper": true,
+        "excluded_bytes": 19740,
+        "strict_utf8": true,
+        "nul_characters": 0,
+        "replacement_characters": 0
+      },
+      {
+        "filename": "pg3296.txt",
+        "size_bytes": 632167,
+        "sha256": "5a036498dc7c546a98b9e7a31952e030ca74db7dd111b30029354efe12bcd691",
+        "matches_new_index": true,
+        "indexed_title": "The Confessions of St. Augustine",
+        "indexed_author": "Saint of Hippo Augustine",
+        "raw_words": 115015,
+        "gutenberg_wrapper": true,
+        "excluded_bytes": 19851,
+        "strict_utf8": true,
+        "nul_characters": 0,
+        "replacement_characters": 0
+      },
+      {
+        "filename": "pg3711134.txt",
+        "size_bytes": 108467,
+        "sha256": "fcc9a82788d649db7099424cd1c02e8c6457139478aefdaeb2a34809ae6a5e70",
+        "matches_new_index": true,
+        "indexed_title": "The Elements of Style",
+        "indexed_author": "William Strunk",
+        "raw_words": 17078,
+        "gutenberg_wrapper": true,
+        "excluded_bytes": 19930,
+        "strict_utf8": true,
+        "nul_characters": 0,
+        "replacement_characters": 0
+      },
+      {
+        "filename": "pg4363.txt",
+        "size_bytes": 408976,
+        "sha256": "ac99e74a7913004c2e94289dae28e6b03b6ad96c97f2fd5f72ce29caff0b4888",
+        "matches_new_index": true,
+        "indexed_title": "Beyond Good and Evil",
+        "indexed_author": "Friedrich Wilhelm Nietzsche",
+        "raw_words": 66219,
+        "gutenberg_wrapper": true,
+        "excluded_bytes": 19984,
+        "strict_utf8": true,
+        "nul_characters": 0,
+        "replacement_characters": 0
+      },
+      {
+        "filename": "pg45109.txt",
+        "size_bytes": 91688,
+        "sha256": "15a09ebd7f782cb64390459a29555140d86fb07f168675d41088a717978c3e4f",
+        "matches_new_index": true,
+        "indexed_title": "The Enchiridion",
+        "indexed_author": "Epictetus",
+        "raw_words": 14254,
+        "gutenberg_wrapper": true,
+        "excluded_bytes": 19852,
+        "strict_utf8": true,
+        "nul_characters": 0,
+        "replacement_characters": 0
+      },
+      {
+        "filename": "pg51356.txt",
+        "size_bytes": 353566,
+        "sha256": "d0b6472e892b22d7ea2d2225e7bcb77cded52ed7dd81360e5f8a2b4b794f5026",
+        "matches_new_index": true,
+        "indexed_title": "The Birth of Tragedy; or, Hellenism and Pessimism",
+        "indexed_author": "Friedrich Wilhelm Nietzsche",
+        "raw_words": 57555,
+        "gutenberg_wrapper": true,
+        "excluded_bytes": 20025,
+        "strict_utf8": true,
+        "nul_characters": 0,
+        "replacement_characters": 0
+      },
+      {
+        "filename": "pg54657.txt",
+        "size_bytes": 738059,
+        "sha256": "cd25636d471b9848143a9095e40a6a1cb46cfc3eefdf751e6ac44ce30a77f52f",
+        "matches_new_index": true,
+        "indexed_title": "Phrases and Names, Their Origins and Meanings",
+        "indexed_author": "Trench H. Johnson",
+        "raw_words": 111553,
+        "gutenberg_wrapper": true,
+        "excluded_bytes": 20072,
+        "strict_utf8": true,
+        "nul_characters": 0,
+        "replacement_characters": 0
+      },
+      {
+        "filename": "pg57342.txt",
+        "size_bytes": 1154825,
+        "sha256": "0176dd702dfcc4a11d355475cab857f2a521a72dc316ecd8921ef12a0495c5a1",
+        "matches_new_index": true,
+        "indexed_title": "The Lives and Opinions of Eminent Philosophers",
+        "indexed_author": "Diogenes Laertius",
+        "raw_words": 196488,
+        "gutenberg_wrapper": true,
+        "excluded_bytes": 19985,
+        "strict_utf8": true,
+        "nul_characters": 0,
+        "replacement_characters": 0
+      },
+      {
+        "filename": "The pragmatic programmer _ from journeyman to master -- Andrew Hunt, David Thomas, Andy Hunt, Dave Thomas, David _ -- Pearson Education (US), Reading, -- isbn13 9780132100670 -- 4f0b19300c93b5d196c9775db931e75e -- .txt",
+        "size_bytes": 47208,
+        "sha256": "6ae3ceaf1097a7506b6c0d58d76f39bbb9461abb796d66dc594ae9f4ecd27b7b",
+        "matches_new_index": true,
+        "indexed_title": "The pragmatic programmer _ from journeyman to master -- Andrew Hunt, David Thomas, Andy Hunt, Dave Thomas, David _ -- Pearson Education (US), Reading, -- isbn13 9780132100670 -- 4f0b19300c93b5d196c9775db931e75e -- ",
+        "indexed_author": "",
+        "raw_words": 8380,
+        "gutenberg_wrapper": false,
+        "excluded_bytes": 0,
+        "strict_utf8": true,
+        "nul_characters": 0,
+        "replacement_characters": 0
+      }
+    ],
+    "original_source_checks": [
+      {
+        "filename": "crime-and-punishment.txt",
+        "sha256": "d139120965c81f10e3f747d891a49babdb49d986b25f7ab25299b1bbf4731146",
+        "matches_previous_index": true,
+        "matches_new_index": true,
+        "size_unchanged": true
+      },
+      {
+        "filename": "deductive-and-inductive.txt",
+        "sha256": "3170d07cf0adbb259e38d8f422fe6a0543a1a3b0b55fa942b227eeebb3048ccd",
+        "matches_previous_index": true,
+        "matches_new_index": true,
+        "size_unchanged": true
+      },
+      {
+        "filename": "deductive-logic.txt",
+        "sha256": "64ac23b025f341d98e8f26667871d6c29459b19ae581610eed16b6cbcc63e103",
+        "matches_previous_index": true,
+        "matches_new_index": true,
+        "size_unchanged": true
+      },
+      {
+        "filename": "detective-stories.txt",
+        "sha256": "558a2fe355274607360fad8a7752a0b104062b154d2edf5fcbd9561e5247842a",
+        "matches_previous_index": true,
+        "matches_new_index": true,
+        "size_unchanged": true
+      },
+      {
+        "filename": "mathematics.txt",
+        "sha256": "7e52015850ff1a25cbba577911e2648d7ee200d2f15adbe05c8adf65776543d3",
+        "matches_previous_index": true,
+        "matches_new_index": true,
+        "size_unchanged": true
+      },
+      {
+        "filename": "pg11562.txt",
+        "sha256": "b95ce9bfd299347647f7ba39a7dc94060ec5a302b13828f478cffc2a6a3980c8",
+        "matches_previous_index": true,
+        "matches_new_index": true,
+        "size_unchanged": true
+      },
+      {
+        "filename": "pg16266.txt",
+        "sha256": "b3f35b4c0c702e1125d66240159b78bce5902a48aa3fe8bcad9efca8aff6b58a",
+        "matches_previous_index": true,
+        "matches_new_index": true,
+        "size_unchanged": true
+      },
+      {
+        "filename": "pg16287.txt",
+        "sha256": "19b854638699e30744278724f7ceb5681aa7893ca89706f11ab4cfdf6a8b50b5",
+        "matches_previous_index": true,
+        "matches_new_index": true,
+        "size_unchanged": true
+      },
+      {
+        "filename": "pg16713.txt",
+        "sha256": "7e52015850ff1a25cbba577911e2648d7ee200d2f15adbe05c8adf65776543d3",
+        "matches_previous_index": true,
+        "matches_new_index": true,
+        "size_unchanged": true
+      },
+      {
+        "filename": "pg20662.txt",
+        "sha256": "758ef5b03de3119b007162cfe40a6acb1b318efae28dae54f7f1a3392e1a3333",
+        "matches_previous_index": true,
+        "matches_new_index": true,
+        "size_unchanged": true
+      },
+      {
+        "filename": "pg22298.txt",
+        "sha256": "8995b5677258ef8a2f1ebb53b310d982c0f981b4fec4ff5ea1187dfa9edad885",
+        "matches_previous_index": true,
+        "matches_new_index": true,
+        "size_unchanged": true
+      },
+      {
+        "filename": "pg26535.txt",
+        "sha256": "55a850cb37ebee3d6c39083f4487d46b3bed8a09740b129e78d113342082bc1f",
+        "matches_previous_index": true,
+        "matches_new_index": true,
+        "size_unchanged": true
+      },
+      {
+        "filename": "pg27635.txt",
+        "sha256": "02aa60bc6c3b5982246b0e1ef68428a5b9a7b83980938ceb189df51f26a0762a",
+        "matches_previous_index": true,
+        "matches_new_index": true,
+        "size_unchanged": true
+      },
+      {
+        "filename": "pg29637.txt",
+        "sha256": "347628da34c44b7e77e7dc6646359fb164b83e5180518071e76da8a7b19ceb82",
+        "matches_previous_index": true,
+        "matches_new_index": true,
+        "size_unchanged": true
+      },
+      {
+        "filename": "pg37134.txt",
+        "sha256": "fcc9a82788d649db7099424cd1c02e8c6457139478aefdaeb2a34809ae6a5e70",
+        "matches_previous_index": true,
+        "matches_new_index": true,
+        "size_unchanged": true
+      },
+      {
+        "filename": "pg37423.txt",
+        "sha256": "679313717a590a285c10303a3ddd88a990041e415df74c6c678ac12c6c7b8896",
+        "matches_previous_index": true,
+        "matches_new_index": true,
+        "size_unchanged": true
+      },
+      {
+        "filename": "pg5000.txt",
+        "sha256": "83e79e107270ea7cbbc4b478913978738ae3d763081e54bc173a663d08ca5b10",
+        "matches_previous_index": true,
+        "matches_new_index": true,
+        "size_unchanged": true
+      },
+      {
+        "filename": "pg56903.txt",
+        "sha256": "1f393771fe8fb4b7a5c8157203e6f2f292ecdbef6f1b2efabb5a18c0825abacc",
+        "matches_previous_index": true,
+        "matches_new_index": true,
+        "size_unchanged": true
+      },
+      {
+        "filename": "pg57359.txt",
+        "sha256": "c149e07cd9525ffeafd1707225405542955c1601e2fd03d51da3172650220cbe",
+        "matches_previous_index": true,
+        "matches_new_index": true,
+        "size_unchanged": true
+      },
+      {
+        "filename": "pg60600.txt",
+        "sha256": "242e8f25758c12beb80c004d2a483ccaaaeef8c39ddfff38de42dcc14d52f861",
+        "matches_previous_index": true,
+        "matches_new_index": true,
+        "size_unchanged": true
+      },
+      {
+        "filename": "pg71046.txt",
+        "sha256": "56f5c279d53fce4ec9a30702498dd9e1e31677c2d89da113a099cf261d717760",
+        "matches_previous_index": true,
+        "matches_new_index": true,
+        "size_unchanged": true
+      },
+      {
+        "filename": "pg74864.txt",
+        "sha256": "fa0cf1b68b41e59fb08b7e411a635efef96cb39a89d3fb24cd446eb4346ca868",
+        "matches_previous_index": true,
+        "matches_new_index": true,
+        "size_unchanged": true
+      },
+      {
+        "filename": "pg75937.txt",
+        "sha256": "16318bc7dd62d25b8f438d59b3145ba52744c47eeb6e2f6926521869b0d87d59",
+        "matches_previous_index": true,
+        "matches_new_index": true,
+        "size_unchanged": true
+      },
+      {
+        "filename": "pg75948.txt",
+        "sha256": "7706458b733a223a04a2eb2e4d5ff780f73d50339af9b6fc11a6541664252ae9",
+        "matches_previous_index": true,
+        "matches_new_index": true,
+        "size_unchanged": true
+      },
+      {
+        "filename": "pride-and-prej.txt",
+        "sha256": "3f6bb9d6f78e0293b56acd4714dd68cb7d6d1d293402031ce9d5a216bcaf9d75",
+        "matches_previous_index": true,
+        "matches_new_index": true,
+        "size_unchanged": true
+      },
+      {
+        "filename": "sherlock.txt",
+        "sha256": "bf63b19ade817616aa64b5dcaf32e8685592c315fd22e336defe685baa02d419",
+        "matches_previous_index": true,
+        "matches_new_index": true,
+        "size_unchanged": true
+      },
+      {
+        "filename": "The Book of Disquiet - Fernando Pessoa_djvu.txt",
+        "sha256": "16ff8c7c980d8b885b9978efd62d67b9463e787c29d6cb24f8157f1b0d72c33e",
+        "matches_previous_index": true,
+        "matches_new_index": true,
+        "size_unchanged": true
+      },
+      {
+        "filename": "the-blue-castle.txt",
+        "sha256": "b418e6dae92794a0a79cb160f29d88c5e7169d342f9128f005d91905e9023636",
+        "matches_previous_index": true,
+        "matches_new_index": true,
+        "size_unchanged": true
+      },
+      {
+        "filename": "the-book-of-logic.txt",
+        "sha256": "3eb1577c2472b3d0b84b9808231eef152d289eb04a1cc30ea2f6f6c61821e95f",
+        "matches_previous_index": true,
+        "matches_new_index": true,
+        "size_unchanged": true
+      },
+      {
+        "filename": "the-critique-of-pratical-reason.txt",
+        "sha256": "09794f0a1f60e4e5d2a0c286b8f9f8bc65290d901d91f8596f9fb75b812dde96",
+        "matches_previous_index": true,
+        "matches_new_index": true,
+        "size_unchanged": true
+      },
+      {
+        "filename": "the-critique-of-pure-reason.txt",
+        "sha256": "9e44b1bc6042da4aeb669d4f3f585037a5488a2908e7ec225f9431c43f6720fc",
+        "matches_previous_index": true,
+        "matches_new_index": true,
+        "size_unchanged": true
+      },
+      {
+        "filename": "the-principles-of-science.txt",
+        "sha256": "fa0cf1b68b41e59fb08b7e411a635efef96cb39a89d3fb24cd446eb4346ca868",
+        "matches_previous_index": true,
+        "matches_new_index": true,
+        "size_unchanged": true
+      },
+      {
+        "filename": "the-roman-hat.txt",
+        "sha256": "62143b216908da145e02b240fbd8146e0ae9bf95161ef22bd812f2af67053b5b",
+        "matches_previous_index": true,
+        "matches_new_index": true,
+        "size_unchanged": true
+      },
+      {
+        "filename": "tragic-sense-of-life.txt",
+        "sha256": "1a0af878f83426376631fdcad02d7a082682e557b55257c5af081f0b06da3e8f",
+        "matches_previous_index": true,
+        "matches_new_index": true,
+        "size_unchanged": true
+      },
+      {
+        "filename": "unconscious.txt",
+        "sha256": "07b808b69c98854f3a5e8745439d889cf1e8c01b7b4f957511c6a3d18152e498",
+        "matches_previous_index": true,
+        "matches_new_index": true,
+        "size_unchanged": true
+      }
+    ],
+    "all_original_source_hashes_unchanged": true,
+    "all_current_source_hashes_match_new_index": true,
+    "exact_duplicate_source_groups": [
+      {
+        "sha256": "7e52015850ff1a25cbba577911e2648d7ee200d2f15adbe05c8adf65776543d3",
+        "filenames": [
+          "mathematics.txt",
+          "pg16713.txt"
+        ]
+      },
+      {
+        "sha256": "fa0cf1b68b41e59fb08b7e411a635efef96cb39a89d3fb24cd446eb4346ca868",
+        "filenames": [
+          "pg74864.txt",
+          "the-principles-of-science.txt"
+        ]
+      },
+      {
+        "sha256": "fcc9a82788d649db7099424cd1c02e8c6457139478aefdaeb2a34809ae6a5e70",
+        "filenames": [
+          "pg3711134.txt",
+          "pg37134.txt"
+        ]
+      }
+    ],
+    "added_duplicate": {
+      "new_filename": "pg3711134.txt",
+      "previous_filename": "pg37134.txt",
+      "title": "The Elements of Style",
+      "sha256": "fcc9a82788d649db7099424cd1c02e8c6457139478aefdaeb2a34809ae6a5e70",
+      "byte_identical": true,
+      "normalized_windows_matching_previous_index": 11,
+      "note": "The index retains one normalized copy; the original duplicate source files remain unchanged."
+    },
+    "holdout_checks": {
+      "split_policy": "whole books; duplicate windows retain strongest held-out copy",
+      "validation_files": [
+        "deductive-logic.txt",
+        "the-blue-castle.txt"
+      ],
+      "test_files": [
+        "the-book-of-logic.txt",
+        "the-roman-hat.txt"
+      ],
+      "previous_retained_documents": 244,
+      "new_retained_documents": 244,
+      "document_ids_split_source_ids_and_rendered_hashes_identical": true,
+      "manual_boundaries_preserved": true,
+      "manual_boundaries": {
+        "The Book of Disquiet - Fernando Pessoa_djvu.txt": "Table of Contents"
+      },
+      "preprocessing_identity_unchanged": true
+    },
+    "added_normalized_window_audit": {
+      "performed_before_index_registration": true,
+      "method": "Read-only inspection with installed spalmer.data.text_index.inspect_text_file, _chunks at the previous index target_chunk_bytes, _render_text using prose_v1 and recorded fence context, then SHA-256 of spalmer.data.manifest.normalize_for_dedup(rendered, kind=prose). Compared against the previous index normalized_sha256 values; no index or token files were written by this check.",
+      "target_chunk_bytes": 8192,
+      "candidate_windows": 967,
+      "matches_previous_index": 11,
+      "matches_previous_holdouts": 0,
+      "matching_previous_holdout_records": [],
+      "net_retained_record_increase_confirmed_by_new_index": 956,
+      "limits": "This checks equality after the existing normalization at index-window boundaries. It does not establish absence of paragraph-level, shifted-window, near-duplicate, thematic, quotation, or semantic overlap."
+    },
+    "filename_content_mismatch": {
+      "filename": "The pragmatic programmer _ from journeyman to master -- Andrew Hunt, David Thomas, Andy Hunt, Dave Thomas, David _ -- Pearson Education (US), Reading, -- isbn13 9780132100670 -- 4f0b19300c93b5d196c9775db931e75e -- .txt",
+      "file_sha256": "6ae3ceaf1097a7506b6c0d58d76f39bbb9461abb796d66dc594ae9f4ecd27b7b",
+      "filename_claims": "The Pragmatic Programmer",
+      "observed_opening_title": "THE CRAFT JOURNEY",
+      "observed_author": "W. Bro. J.R. CLELAND, M.A., D.D., P.P.A.G.Chap. (Kent).",
+      "observed_section": "Part 2. THE PREPARATION OF THE CANDIDATE.",
+      "action": "Source preserved and indexed as supplied. Do not describe this addition as The Pragmatic Programmer; the index currently derives its title from the filename because no Title: metadata header is present.",
+      "scope": "Identification from the supplied file opening, not external bibliographic verification."
+    },
+    "audit_scope": {
+      "source_mutations": false,
+      "database_mutations": false,
+      "index_mutations": false,
+      "token_preparation": false,
+      "training_or_gpu_work": false,
+      "only_written_file": "C:\\Users\\engin\\Desktop\\yy\\yyLab\\artifacts\\english-prose-reprocess-20260911\\source-audit.json"
+    }
+  },
+  "process_exit_codes": {
+    "import": 0,
+    "sprint_8k_prepare": 0,
+    "spalmer_16k_prepare": 0,
+    "verification": 0
+  }
+}

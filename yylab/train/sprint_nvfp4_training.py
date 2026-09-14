@@ -63,11 +63,12 @@ def apply_torchao_nvfp4_training(
     """
     from yylab.models.sprint import SprintForCausalLM
 
-    if stochastic_rounding not in {"hardware", "portable"}:
-        raise ValueError("stochastic_rounding must be 'hardware' or 'portable'.")
+    if stochastic_rounding not in {"hardware", "portable", "portable_sr4"}:
+        raise ValueError("stochastic_rounding must be 'hardware', 'portable' or 'portable_sr4'.")
+    portable = stochastic_rounding in {"portable", "portable_sr4"}
     if not isinstance(pad_to_alignment, bool):
         raise ValueError("pad_to_alignment must be a boolean.")
-    if pad_to_alignment and stochastic_rounding != "portable":
+    if pad_to_alignment and not portable:
         raise ValueError("Operand padding is supported only by the portable stochastic-rounding variant.")
     if not isinstance(model, SprintForCausalLM):
         raise TypeError("The all-GEMM NVFP4 benchmark requires a SprintForCausalLM.")
@@ -126,6 +127,10 @@ def apply_torchao_nvfp4_training(
         from .sprint_nvfp4_portable import portable_nvfp4_linear_class
 
         linear_cls = portable_nvfp4_linear_class()
+    elif stochastic_rounding == "portable_sr4":
+        from .sprint_nvfp4_portable import portable_nvfp4_sr4_linear_class
+
+        linear_cls = portable_nvfp4_sr4_linear_class()
     # Validate and construct everything before replacing the original topology.
     replacements = [
         (name, linear_cls.from_linear(module).train(module.training))
@@ -143,16 +148,19 @@ def apply_torchao_nvfp4_training(
         raise RuntimeError("TorchAO NVFP4 conversion failed to preserve the original parameters.")
 
     metadata = {
-        "precision": "nvfp4_all_gemm" if stochastic_rounding == "hardware" else "nvfp4_all_gemm_portable_sr",
+        "precision": {"hardware": "nvfp4_all_gemm", "portable": "nvfp4_all_gemm_portable_sr",
+                      "portable_sr4": "nvfp4_all_gemm_portable_sr4"}[stochastic_rounding],
         "experimental": True,
-        "provider": ("torchao_nvfp4_training_triton" if stochastic_rounding == "hardware"
-                     else "torchao_nvfp4_training_portable_sr"),
+        "provider": {"hardware": "torchao_nvfp4_training_triton", "portable": "torchao_nvfp4_training_portable_sr",
+                     "portable_sr4": "torchao_nvfp4_training_portable_sr4"}[stochastic_rounding],
         "stochastic_rounding": stochastic_rounding,
         "portable_cast_search": ({"tile": [128, 128], "num_stages": 2, "num_warps": [4, 8]}
-                                 if stochastic_rounding == "portable" else None),
+                                 if portable else None),
         "stochastic_rounding_details": (
-            "hardware cvt.rs instruction" if stochastic_rounding == "hardware" else
-            "software adjacent-level sampling with 24-bit per-element uniforms; different RNG layout from cvt.rs"
+            "hardware cvt.rs instruction" if stochastic_rounding == "hardware" else (
+                "software adjacent-level sampling with 24-bit per-element uniforms; four outputs per Philox4x32-10 call; different RNG layout from scalar portable SR and cvt.rs"
+                if stochastic_rounding == "portable_sr4" else
+                "software adjacent-level sampling with 24-bit per-element uniforms; different RNG layout from cvt.rs")
         ),
         "forward_gemm": "nvfp4",
         "backward_gemm": "nvfp4",
@@ -173,7 +181,11 @@ def apply_torchao_nvfp4_training(
         "parameters_after": sum(parameter.numel() for parameter in model.parameters()),
         "cuda_graph_workspace_prepared": device.type == "cuda",
     }
-    if stochastic_rounding == "portable":
+    if portable:
         metadata["source_provenance"] = copy.deepcopy(linear_cls._portable_provider_provenance)
+    if stochastic_rounding == "portable_sr4":
+        from .sprint_nvfp4_portable import portable_sr4_recipe
+
+        metadata["stochastic_rounding_recipe"] = portable_sr4_recipe()
     model._torchao_nvfp4_training_benchmark_metadata = copy.deepcopy(metadata)
     return metadata

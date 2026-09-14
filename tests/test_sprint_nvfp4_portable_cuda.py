@@ -8,7 +8,9 @@ import triton.language as tl
 from yylab.train.sprint_nvfp4_portable import (
     _portable_e2m1_codes,
     _portable_pack_fp4,
+    _portable_pack_fp4_sr4,
     portable_nvfp4_linear_class,
+    portable_nvfp4_sr4_linear_class,
     stochastic_e2m1_reference,
 )
 
@@ -24,11 +26,15 @@ def _codes_oracle_kernel(values, uniforms, output, N: tl.constexpr, BLOCK: tl.co
 
 
 @triton.jit
-def _pack_validation_kernel(values, output, seed, offset, ROWS: tl.constexpr, COLUMNS: tl.constexpr):
+def _pack_validation_kernel(values, output, seed, offset, ROWS: tl.constexpr, COLUMNS: tl.constexpr,
+                            SR4: tl.constexpr):
     rows = tl.arange(0, ROWS)[:, None]
     columns = tl.arange(0, COLUMNS)[None, :]
     scaled = tl.load(values + rows * COLUMNS + columns)
-    packed = _portable_pack_fp4(scaled, ROWS, COLUMNS, True, seed, offset, tl.program_id(0))
+    if SR4:
+        packed = _portable_pack_fp4_sr4(scaled, ROWS, COLUMNS, True, seed, offset, tl.program_id(0))
+    else:
+        packed = _portable_pack_fp4(scaled, ROWS, COLUMNS, True, seed, offset, tl.program_id(0))
     packed_columns = tl.arange(0, COLUMNS // 2)[None, :]
     tl.store(output + rows * (COLUMNS // 2) + packed_columns, packed)
 
@@ -49,14 +55,15 @@ def test_cuda_portable_codes_match_cpu_oracle_at_boundaries_and_special_values()
     torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
 
 
-def test_cuda_portable_pack_repeats_seed_offset_and_changes_with_new_offset():
+@pytest.mark.parametrize("sr4", [False, True], ids=["scalar", "sr4"])
+def test_cuda_portable_pack_repeats_seed_offset_and_changes_with_new_offset(sr4):
     values = torch.full((128, 128), .25, device="cuda", dtype=torch.float32)
     seed = torch.tensor([1729], device="cuda", dtype=torch.int64)
     offset = torch.tensor([91], device="cuda", dtype=torch.int64)
 
     def draw():
         result = torch.empty((128, 64), dtype=torch.uint8, device="cuda")
-        _pack_validation_kernel[(1,)](values, result, seed, offset, 128, 128)
+        _pack_validation_kernel[(1,)](values, result, seed, offset, 128, 128, sr4)
         return result.cpu()
 
     first, repeated = draw(), draw()
@@ -69,7 +76,8 @@ def test_cuda_portable_pack_repeats_seed_offset_and_changes_with_new_offset():
 
 
 @pytest.mark.parametrize("in_features,out_features,padded", [(256, 128, False), (192, 320, True)])
-def test_cuda_portable_native_linear_forward_backward_and_gradient_cropping(in_features, out_features, padded):
+@pytest.mark.parametrize("sr4", [False, True], ids=["scalar", "sr4"])
+def test_cuda_portable_native_linear_forward_backward_and_gradient_cropping(in_features, out_features, padded, sr4):
     if torch.cuda.get_device_capability()[0] < 10:
         pytest.skip("native NVFP4 GEMMs require Blackwell")
     from torchao.prototype.moe_training.nvfp4_training.hadamard_utils import prepare_for_cuda_graph
@@ -80,7 +88,8 @@ def test_cuda_portable_native_linear_forward_backward_and_gradient_cropping(in_f
     grad_cpu = torch.randn((128, out_features), generator=generator).to(torch.bfloat16)
     with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
         torch.manual_seed(833)
-        linear = portable_nvfp4_linear_class()(
+        linear_cls = portable_nvfp4_sr4_linear_class() if sr4 else portable_nvfp4_linear_class()
+        linear = linear_cls(
             in_features, out_features, bias=True, device="cuda", dtype=torch.bfloat16)
         linear._sprint_nvfp4_pad_to_alignment = padded
         with torch.no_grad():
@@ -105,7 +114,8 @@ def test_cuda_portable_native_linear_forward_backward_and_gradient_cropping(in_f
         torch.testing.assert_close(linear.bias.grad.float().cpu(), grad_cpu.float().sum(0).to(torch.bfloat16).float())
 
 
-def test_cuda_portable_sr_rng_advances_across_compiled_default_backward():
+@pytest.mark.parametrize("sr4", [False, True], ids=["scalar", "sr4"])
+def test_cuda_portable_sr_rng_advances_across_compiled_default_backward(sr4):
     """Fresh SR across default-compiled executions; explicit CUDA graphs are not covered."""
     if torch.cuda.get_device_capability()[0] < 10:
         pytest.skip("native NVFP4 GEMMs require Blackwell")
@@ -117,7 +127,8 @@ def test_cuda_portable_sr_rng_advances_across_compiled_default_backward():
     output_gradient_cpu = torch.randn((128, 128), generator=generator).to(torch.bfloat16)
     with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
         torch.manual_seed(937)
-        linear = portable_nvfp4_linear_class()(256, 128, device="cuda", dtype=torch.bfloat16)
+        linear_cls = portable_nvfp4_sr4_linear_class() if sr4 else portable_nvfp4_linear_class()
+        linear = linear_cls(256, 128, device="cuda", dtype=torch.bfloat16)
         with torch.no_grad():
             linear.weight.copy_(weight_cpu)
         prepare_for_cuda_graph(linear.weight.device, sign_vectors=(linear.rht_sign_vector,))

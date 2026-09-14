@@ -6,17 +6,22 @@ It trains independently of the SPALMER model/optimizer implementation while reus
 yyLab's tokenizer registry, corpus selections, split protections, data packers,
 background jobs, checkpoints, chat and export loading.
 
-See [the latest 10M–1B speed experiments](SPRINT_SPEED_ROUND2_2026-09-11.md),
+See [the 150M PLE + KDA billion-token run](SPRINT_150M_PLE_KDA_1B_2026-09-13.md),
+[the repetition investigation and repair status](SPRINT_REPETITION_REPAIR_2026-09-13.md),
+[the 1B PLE and KDA comparison](SPRINT_PLE_1B_2026-09-13.md),
+[the 10M–1B speed experiments](SPRINT_SPEED_ROUND2_2026-09-11.md),
+[packing speed and cache reuse](SPRINT_PACKING_2026-09-11.md),
 [the native precision comparison](SPRINT_PRECISION_BENCHMARKS_2026-09-11.md), and
 [the original RTX 5070 measurements](SPRINT_BENCHMARKS_2026-09-10.md).
 
 ## Architecture
 
 - Fixed-depth pre-normalized residual decoder. Every block runs once.
-- One packed QKV projection, full multi-head causal PyTorch SDPA, and an output
+- Standard attention (`attention_type="sdpa"`, the default) uses one packed QKV
+  projection, full multi-head causal PyTorch SDPA, and an output
   projection. Runtime chooses an available attention kernel for the GPU and shape;
   installing PyTorch does not guarantee that FlashAttention is available.
-- Rotary position embeddings, RMSNorm, and two-projection tanh-approximate GELU.
+- Rotary position embeddings in SDPA layers, RMSNorm, and two-projection tanh-approximate GELU.
   The model API also supports packed gate/up SwiGLU (`mlp_type="swiglu"`).
 - Tied input/output embeddings by default. No recurrent depth, expert routing,
   quantization simulation or auxiliary objectives.
@@ -31,9 +36,9 @@ See [the latest 10M–1B speed experiments](SPRINT_SPEED_ROUND2_2026-09-11.md),
 
 The parameter planner accepts arbitrary integer targets, including 500M and 1B,
 and computes the exact unique parameter count without allocating the model.
-For new targets of 10M parameters and above, the default `shape_profile="throughput"`
+For standard-attention targets of 10M parameters and above, the default `shape_profile="throughput"`
 uses wider decoders with fewer layers, widths aligned to 256, head dimensions of
-128, and MLP widths aligned to 64. It fits within 2% of the requested budget when
+128, and MLP widths aligned to 128. It fits within 2% of the requested budget when
 these constraints permit. `shape_profile="balanced"` retains the original
 proportions; targets below 10M retain their previous sizing with either profile.
 Manual shapes and existing checkpoints retain their saved dimensions.
@@ -42,6 +47,100 @@ below the supported vocabulary/architecture floor produce an actionable error.
 This shape planner is a heuristic. The wider profiles reduce measured training
 time and activation memory on the tested GPU, but equal convergence or final
 quality at the same parameter count has not been established.
+
+### Optional per-layer embeddings (PLE)
+
+For a **New model**, choose **Per-layer embeddings (PLE)** in the model section:
+
+- **No PLE** retains the existing Sprint architecture and remains the default.
+- **Regular PLE** adds one independent vocabulary-by-width lookup table and a
+  learned scalar gate before each layer after the first. The first input
+  embedding remains tied to the output head. This is one table per later layer,
+  not the historical four-full-table expansion.
+- **QR PLE** uses four smaller quotient/remainder lanes whose lookup vectors
+  combine before entering each later layer. The model/recipe API can set another
+  positive `ple_lanes` count; the page uses four.
+
+The preview shows total, PLE and feed-forward parameter allocations. With a
+standard-attention parameter target, the planner first keeps the ordinary plan's width and layer
+count and reduces feed-forward width to pay for PLE. It chooses a smaller shape
+if those fixed costs cannot fit. With a manual shape, PLE adds parameters to the
+specified backbone. Regular PLE can consume a large part of a small model's
+budget, leaving a narrow feed-forward layer. Faster training at the same total
+count does not establish equal model capability; no PLE quality study is implied.
+
+The selection travels with training and benchmark recipes as
+`model_config.ple_type` (`"none"`, `"full"` or `"qr"`) and
+`model_config.ple_lanes` (default `4`). The Python planner accepts these same
+keyword arguments. Benchmark recommendations require the same PLE choice and
+lane count, and older recipes without these fields retain No PLE. The selected
+weight precision, optimizer placement and token budget are unchanged by PLE.
+Changing PLE also keeps compatible prepared token data reusable.
+
+Saved models, periodic saves and final checkpoints include PLE weights and
+configuration. **Continue checkpoint** and **Resume optimizer state** inherit
+the saved choice. They reject changes to PLE type or lane count; start a new
+model for those changes. Model loading and generation retain the per-token PLE
+lookups, including when standard attention uses its generation cache.
+
+Use the page's complete-step benchmark for the selected architecture. Synthetic
+random tokens can differ from real corpus token-frequency skew in lookup cache
+behavior and repeated-row gradient accumulation, so their throughput is not a
+measured real-corpus training ETA.
+
+### Kimi linear attention with PLE
+
+Choose **Model attention → Kimi linear attention · hybrid 3:1** for a new model,
+or set `model_config.attention_type="kda"`. This Sprint hybrid repeats three
+Kimi Delta Attention layers followed by one full causal SDPA layer. Layer count
+must be divisible by four. Every physical layer still runs once; KDA's recurrence
+is across sequence positions and does not add SPALMER recurrent depth reasoning.
+No PLE, Regular PLE and QR PLE can all be combined with this attention choice.
+
+`kda_backend="auto"` selects the installed Flash Linear Attention (FLA) CUDA
+implementation for supported CUDA execution and the PyTorch reference path on
+CPU. `"fla"` explicitly requires the CUDA implementation; `"reference"` selects
+the correctness-oriented reference implementation. CUDA training uses BF16
+compute with **FP32 stored weights and FP32 GPU AdamW moments**:
+`parameter_dtype="float32", optimizer_state_offload="none"`. The page selects
+the GPU optimizer preset when KDA is chosen or detected in a continued/resumed
+checkpoint. BF16 parameter storage and the CPU-offload preset are rejected for
+production KDA training; experimental quantized weight or optimizer adapters are
+separate benchmarks. CPU reference training uses FP32 compute.
+
+`kda_disable_recompute=True` retains FLA intermediates for backward. Setting it
+to `False` lets FLA recompute some intermediates to reduce retained activation
+memory; measure the resulting speed/memory tradeoff. Block activation
+checkpointing is a separate setting. The KDA planner includes its gates,
+convolution and PLE in the exact parameter budget, can change width and layer
+count, and retains at least a width-sized feed-forward layer. Its shape choices
+are capacity heuristics rather than measured quality equivalence.
+
+Attention type, KDA backend and recomputation setting travel with model configs,
+saved checkpoints and exact-resume contracts. Existing checkpoints with no KDA
+fields retain standard SDPA. Continued training inherits the saved architecture,
+and incompatible overrides are rejected. Benchmark recommendations match these
+attention settings as well as shape and PLE, so a standard-attention measurement
+cannot be applied to a KDA model.
+
+KDA generation currently recomputes the complete prefix for each new token.
+`generate(use_cache=True)` deliberately selects the uncached path; a supplied
+external cache is rejected. Chat and Antidoom avoid constructing an inapplicable
+Transformers KV cache and display/expose the uncached behavior. This supports
+sampling, beam search, generation scores and padded batches, but does not provide
+fast recurrent-cache decoding. Left/right 2D padding and supported block-causal
+segments reset sequence state correctly; arbitrary attention biases or
+head-dependent masks are rejected.
+
+Saved PLE + KDA models are usable for continued pretraining, masked SFT and the
+prepared Antidoom FTPO workflow. Antidoom maps a complete split Q/K/V LoRA request
+to Sprint's packed `qkv_proj`; partial split requests fail clearly. The existing
+tied-output-head Antidoom adapter remains adapter-only and must not be merged
+into the tied base weights. Compatibility tests cover checkpoint and adapter
+roundtrips, the FTPO policy/reference objective, mining scores, NLL and chat;
+they do not establish downstream task quality. See
+[the training tests](../tests/test_sprint_kda_training.py) and
+[the posttraining tests](../tests/test_sprint_posttrain.py).
 
 To explore different feed-forward allocations at a fixed total parameter budget:
 
@@ -75,10 +174,11 @@ ordinary training and exact resume keep their existing optimizer dispatch.
    compilation. Advanced options can also compare CPU threads, optimizer transfer
    bucket sizes and attention implementations. Inspect failures as well as the
    fastest completed candidate.
-4. Apply the measured settings and start training. Runs shows progress and loss.
+4. Apply the measured settings and start training. Runs shows progress, loss and
+   generated-text diagnostics. Inspect the saved samples as well as the loss.
    Finished checkpoints can be selected in Chat and the checkpoint registry.
 
-The default CUDA recipe uses **BF16 weights and gradients**, with **FP32 master
+The default standard-attention CUDA recipe uses **BF16 weights and gradients**, with **FP32 master
 weights and Adam moments offloaded to CPU RAM**. Small updates accumulate in the
 FP32 CPU master before weights are copied back to BF16, so rounding the visible
 weights does not erase those updates. Gradient transfer and CPU updates use
@@ -100,7 +200,7 @@ Once a live compiled update starts, an error stops the run instead of retrying
 and risking a double update. Older checkpoints resume with their native CPU
 update; switching implementation requires starting a continuation.
 
-The earlier FP32-weight, fused GPU AdamW path remains an explicit comparison
+The FP32-weight, fused GPU AdamW path remains an explicit choice and is required for KDA
 (`parameter_dtype="float32", optimizer_state_offload="none"`). CPU execution
 uses FP32 by default. No simulated FP4/FP8 training or precision experiment matrix
 is introduced. Benchmark recommendations retain the precision, optimizer location
@@ -123,8 +223,128 @@ when the vocabulary fits, otherwise uint32; SFT retains labels and masks).
 Training uses bounded CPU read-ahead, pinned memory and asynchronous transfers.
 The cache identity includes tokenizer contents, corpus snapshots, selections,
 packing settings and its row limit. It stores derived token data, not source text.
-For budgets larger than one available corpus pass, cached rows are repeated with
+Reuse is automatic under `artifacts/cache/sprint-packed`: model size, learning
+rate and optimizer changes do not invalidate data. For legacy stream mixing, a smaller token budget can
+read a prefix of a larger compatible cache without copying files. A larger
+budget can reuse an already complete source pass. A shorter, budget-truncated
+cache is never mistaken for the whole corpus. Logical keys retain the requested
+row limit, so exact resume works regardless of which physical cache backs it.
+Changing source contents, tokenizer, objective, sequence length, seed, or the
+ordered corpus selection/mixing rules still requires different packed rows.
+
+Cold causal packing batches tokenization and writes bounded NumPy row chunks.
+Its token order, document EOS boundaries and source-accounting semantics match
+the original packer. Progress reports packing tokens/second; runtime receipts
+distinguish a new build, exact cache reuse, and compatible cache reuse. Prefix
+views report only known prefix statistics and retain full backing-cache
+statistics separately. Partial staging files from interrupted packing are not
+treated as valid caches. The optional per-document token cache remains useful
+across changed mixtures, but preparing entire corpora adds upfront work and disk
+usage; it is independent of the always-on packed cache.
+For legacy stream budgets larger than one available corpus pass, cached rows are repeated with
 deterministic block shuffling. Positive `epochs` can cap passes through that cache.
+
+### Fixed token shares
+
+New causal-training recipes created by the page default to **Fixed token shares**
+(`corpus_mix="fixed_token_quota"`). The worker does not reinterpret older saved
+`token_balanced`, `round_robin` or `concatenate` recipes. The legacy option is
+labeled **Balance while sources last (characters)** because it estimates cost
+from text length and redistributes the remaining stream after sources exhaust.
+It does not guarantee the final token mixture.
+
+Fixed quotas allocate complete sequence rows using `corpus_weights`: a weight of
+3 versus 1 requests 75% versus 25% of input tokens. Omitted selected corpora have
+weight 1. Largest-remainder rounding preserves the total budget and differs from
+each requested share by less than one sequence. Every row belongs to one source,
+so its share of shifted supervised targets is also known exactly.
+
+The packer prepares complete source row pools, samples without replacement before
+replay, and globally shuffles the allocated rows before the first update. Changed
+weights, budget, seed or replay allowance reuse these pools. A different budget
+materializes its own allocation instead of treating a random prefix as exact
+new quotas. Changing source contents/selection, tokenizer or sequence length needs
+different pools. The optional document token cache can avoid repeated tokenization;
+the source-pool cache independently avoids repeated packing of unchanged selections.
+
+**Maximum passes through each source** (`quota_max_source_epochs`) defaults to 1:
+each available source row can be selected at most once. A larger finite value
+explicitly permits replay. The recipe API also accepts a dictionary of limits by
+corpus ID; missing entries default to 1. If any source cannot supply its quota
+within its allowance, preparation fails with its required and available counts.
+Other sources do not silently replace the missing share. Reduce the weight or
+budget, add suitable data, or explicitly change the replay allowance.
+
+`source_max_ratio` belongs to the legacy scheduler and must be unset for fixed
+quotas. Chat SFT retains its existing source scheduling; fixed quotas currently
+support `causal_lm` only. Explicit `epochs` may be 0 or 1 because the allocation
+already contains the whole finite budget and any permitted replay.
+
+The version `sprint-fixed-token-quota-v1`, exact allocations and replay limits
+belong to cache identity. Saved row provenance records the source and original
+pool position. Final/checkpoint `consumed_data_stats` reports actual consumed
+source inputs, shifted targets and repeated positions, including an early stop.
+These are unique **pool positions**, not a semantic diversity measure. Configured
+exact-text training deduplication is preserved; this mode does not establish
+held-out decontamination or repair poor source content.
+
+### Optional cleanup of packed rows
+
+New fixed-share recipes in the page enable **Remove duplicate and extremely
+repetitive sequences**. The recipe field is
+`quota_row_filter={"enabled": true, "version": "sprint-quota-row-filter-v1"}`;
+the version can be omitted and resolves to v1. An absent field or
+`{"enabled": false}` preserves the existing unfiltered cache identity. Explicitly
+enabling this option outside `fixed_token_quota` is rejected.
+
+The v1 policy removes later exact complete-row matches across the selected
+sources, using SHA256 over their token bytes. It also removes rows of at least
+256 tokens when at least 90% of their overlapping token 8-gram occurrences are
+copies beyond the first occurrence of each distinct 8-gram. The latter check
+runs first; rejection reasons are exclusive. These fixed criteria catch obvious
+repeated-character, separator and cyclic spans. They do not normalize numbers,
+compare paraphrases, crop documents, or establish semantic diversity. Shorter
+sequence lengths still receive exact-row deduplication.
+
+Cleanup runs once on the CPU before quota allocation and replay admission. It
+derives a separate immutable pool group from reusable unfiltered pools, so
+enabling it does not require retokenizing unchanged source documents. Its digest
+index uses a disk-backed SQLite table with a bounded page cache. Changed weights,
+budget, seed or replay allowance reuse the cleaned pools. The policy participates
+in both pool and final-mixture identities; an enabled recipe cannot silently
+reuse an old unfiltered cache. Changing it on exact resume changes the data
+contract and requires starting a new schedule from a checkpoint instead.
+
+Replay limits apply to the **retained** row count. If cleanup leaves too little
+data for a source's requested share, preparation reports that shortage instead
+of replacing its quota with another source. A filtered pool's `row_pool_index`
+addresses retained rows; `source-N.original_rows.bin` maps them back to original
+unfiltered pool row offsets. The receipt records each source's input, retained
+and rejected rows and token slots, exclusive reason counts, and up to eight
+rejected examples with original offsets and hashes. `raw_data_stats` retains
+the original document/rendered-content/EOS counters separately from retained-row
+counts. Prefix and completed training statistics carry these removal receipts
+under `row_filter`, explicitly scoped to complete source-pool preparation rather
+than consumed training tokens.
+
+The [actual 150M payload audit](../artifacts/corpus-duplication-audit-20260913/PACKED_DUPLICATION_FINDINGS.md)
+motivates this conservative guard. The guard does not demonstrate that generation
+repetition is fixed or that an existing checkpoint has been repaired.
+
+### Materialized fixed allocations
+
+An explicit `fixed_token_mix` recipe instead identifies an already materialized
+fixed allocation. Its descriptor records the version, sampling seed, rows per
+selected corpus, SHA256 of each full-pass token pool and exact-text deduplication
+policy. It is part of packed-cache identity. The worker requires a matching
+materialized cache (or a compatible prefix), and fails if it is missing instead
+of rebuilding an ordinary concatenated dataset. The requested budget cannot
+exceed the descriptor's rows or add repeated epochs. Deliberate small-source
+repetition, when desired, must already be represented and counted in the
+materialized allocation. Held-out evaluation uses a separate cache and removes
+the training-only descriptor. The
+[150M run's data receipts](../artifacts/sprint-150m-ple-kda-1b-20260913/preparation-receipt.json)
+record this preparation and its exact token accounting.
 
 Losses and gradients are weighted by actual supervised targets when accumulating
 unequal or masked batches. Training counts forwarded token slots and supervised
@@ -132,6 +352,60 @@ next-token targets separately; sequence-boundary first tokens and ignored SFT
 labels do not count as targets. A requested token budget is rounded down to whole
 sequence rows, with a smaller final batch when needed. Its exact resolved totals
 are saved in the runtime receipt.
+
+### Generated-text and numerical checks
+
+**Check generated text for repetition** is enabled by default. Its own interval
+defaults to 500 optimizer updates, independently of loss evaluation and saving.
+It also runs at the final save unless that exact step was already checked.
+The default four prompts cover prose continuation, an instruction, copying two
+words and a simple word problem. Each uses greedy and sampled decoding, up to
+64 new tokens, without repetition penalties or ngram blocking. Token duplication,
+exact repeated tails, output length, raw probability/entropy, finite logits and
+the two simple answer checks are recorded in
+`<run>/generation-eval/step-XXXXXXXX.json`. Progress and metrics reference that
+receipt and warn about repetition. Runs displays the saved prompts and outputs,
+with gradient telemetry and warnings retained for completed/stopped runs.
+A short/skipped output is reported as such;
+absence of a detected loop is not a passing model-quality score.
+
+Use the checkbox to disable the checks, or set
+`"generation_eval": {"enabled": false}` in a recipe. The recipe API also accepts
+`interval` and bounded `options` such as `max_new_tokens`, `modes`, `prompts` and
+`prompt_format`. Causal training defaults to plain completion; chat SFT uses its
+recorded chat template. A chat-format diagnostic on a raw-only checkpoint is
+rejected. Explicit role/`[INST]` diagnostic formats do not establish that those
+formats occurred in training. The evaluator preserves RNG and model training
+modes, uses the eager model, and adds evaluation time rather than optimizer work.
+
+When clipping is enabled, the existing pre-clipping norm is now logged as latest
+and window-mean `gradient_norm`, together with `gradient_clip_fraction` and the
+latest clipping coefficient. Clipping disabled means no norm sample is collected.
+These are diagnostics, not a changed optimizer. Before publishing a checkpoint,
+the worker checks weights, FP32 master weights and Adam moments for nonfinite
+values and refuses an invalid bundle. Loss/norm checks report failures during
+logging; generated nonfinite logits also fail the run. Repetition warnings alone
+do not automatically halt a run or certify its checkpoint.
+
+### Checkpoint input format
+
+New Sprint bundles save `prompt_format.json`. Plain causal pretraining establishes
+**Text continuation**: the passage is sent literally, without synthetic chat
+markers or previous conversation turns. A tokenizer carrying a chat template
+does not establish that the weights learned it. Old Sprint causal checkpoints
+are interpreted from their training metadata without rewriting their files.
+
+Chat SFT records the actual tokenizer template and its SHA256; inference uses
+that saved template. Continued causal pretraining inherits an established parent
+chat contract. New chat SFT can upgrade a raw checkpoint, while conflicting
+inherited chat templates fail clearly. Exact resume cannot change the saved
+format contract. Unknown external/adapter formats remain visibly unverified.
+
+Input-format corrections and generated-text checks do not repair existing model
+weights. An experimental generated-repeat unlikelihood helper is available for
+bounded studies; it is **not part of ordinary Sprint training or enabled by a UI
+switch**. See the [repair report](SPRINT_REPETITION_REPAIR_2026-09-13.md) for the
+failed data-only intervention, preliminary targeted improvement and its limits.
 
 Validation uses explicitly selected disjoint source splits. Logging, evaluation
 and saves have independent intervals. Checkpoints retain the model, tokenizer,

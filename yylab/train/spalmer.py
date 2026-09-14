@@ -41,6 +41,7 @@ from .data import (
     normalize_source_splits,
     normalize_training_objective,
 )
+from .prefetch import BufferedBatches
 
 MODEL_FAMILY = "spalmer"
 MANIFEST_SCHEMA_VERSION = 1
@@ -437,6 +438,45 @@ def _normalize_checkpoint_execution(spalmer: Mapping[str, Any]) -> dict[str, Any
     return {"attention_backend": attention_backend, "require_fla": True}
 
 
+def _inherit_checkpoint_parameter_dtype(cfg: dict[str, Any]) -> None:
+    """Resolve parent state before choosing dtype-dependent optimizer defaults.
+
+    The payload reader uses CPU mmap and does not materialize the weight tensors.
+    Registry metadata and submitted recipe hints are not authoritative here.
+    """
+    from ..models.spalmer import load_spalmer_checkpoint_payload
+
+    payload = load_spalmer_checkpoint_payload(cfg["initialization"]["checkpoint_ref"])
+    experts = _mapping(payload.get("experts_config"), "experts_config")
+    parent_dtype = str(
+        experts.get("expert_master_dtype")
+        or payload.get("model_parameter_dtype")
+        or "bfloat16"
+    ).strip().casefold()
+    if parent_dtype not in {"bfloat16", "float32"}:
+        raise ValueError("parent checkpoint parameter dtype must be bfloat16 or float32")
+    stored_dtype = payload.get("model_parameter_dtype")
+    if stored_dtype is not None and str(stored_dtype).strip().casefold() != parent_dtype:
+        raise ValueError("parent checkpoint parameter dtype disagrees with its expert master dtype")
+    _validate_checkpoint_parameter_dtype(cfg, parent_dtype)
+    training = _mapping(cfg.get("training"), "training")
+    training["parameter_dtype"] = parent_dtype
+    cfg["training"] = training
+
+
+def _validate_checkpoint_parameter_dtype(cfg: Mapping[str, Any], parent_dtype: str) -> None:
+    """Reject explicit declarations that disagree with the loaded parent."""
+    training = _mapping(cfg.get("training"), "training")
+    supplied = training.get("parameter_dtype")
+    if supplied is not None and str(supplied).strip().casefold() != parent_dtype:
+        raise ValueError("continued training parameter dtype disagrees with parent checkpoint")
+    precision = _mapping(cfg.get("precision"), "precision")
+    for field in ("parameter_dtype", "expert_master_dtype", "master_weights", "ple_parameter_dtype"):
+        supplied = precision.get(field)
+        if supplied is not None and str(supplied).strip().casefold() != parent_dtype:
+            raise ValueError(f"precision.{field} disagrees with parent checkpoint parameter dtype")
+
+
 def _normalize_recurrence_architecture(value: object) -> dict[str, Any]:
     """Canonicalize the plan-driving recurrent-core block of a scratch recipe.
 
@@ -555,6 +595,34 @@ def _normalize_ple_backend(value: object) -> str:
     return backend
 
 
+def _training_parameter_dtype(config: Mapping[str, Any]) -> str:
+    """Resolve persistent state separately from expert operand precision."""
+    architecture = _mapping(config.get("spalmer"), "spalmer")
+    experts = _mapping(architecture.get("experts"), "spalmer.experts")
+    initialization = _mapping(config.get("initialization"), "initialization")
+    if initialization.get("mode") == INITIALIZATION_CHECKPOINT:
+        training = _mapping(config.get("training"), "training")
+        precision = _mapping(config.get("precision"), "precision")
+        value = training.get("parameter_dtype") or precision.get("parameter_dtype") or "bfloat16"
+    else:
+        value = experts.get("expert_master_dtype") or architecture.get("expert_master_dtype") or "bfloat16"
+    value = str(value).strip().casefold()
+    if value not in {"bfloat16", "float32"}:
+        raise ValueError("SPALMER parameter dtype must be bfloat16 or float32")
+    return value
+
+
+def _precision_recipe(experts: object) -> str:
+    master = _config_value(experts, "expert_master_dtype", "bfloat16")
+    weight = _config_value(experts, "expert_weight_format", "bfloat16")
+    if master == "float32":
+        return (
+            "spalmer_nvfp4_standard_fp32_master_v1" if weight == "nvfp4"
+            else "spalmer_bf16_amp_fp32_master_v1"
+        )
+    return "spalmer_native_experts_bf16_master_v1"
+
+
 def _normalize_scratch_architecture(cfg: dict[str, Any], spalmer: dict[str, Any]) -> None:
     """Validate the plan-driving architecture recipe for scratch initialization."""
 
@@ -595,8 +663,8 @@ def _normalize_scratch_architecture(cfg: dict[str, Any], spalmer: dict[str, Any]
         or precision.get("master_weights")
         or "bfloat16"
     ).strip().casefold()
-    if recorded_master != "bfloat16":
-        raise ValueError("SPALMER training requires BF16 expert master weights")
+    if recorded_master not in {"bfloat16", "float32"}:
+        raise ValueError("SPALMER expert master weights must be BF16 or FP32")
     weight_format = str(
         spalmer.get("expert_weight_format")
         or precision.get("expert_weight_format")
@@ -724,9 +792,21 @@ def _normalize_scratch_architecture(cfg: dict[str, Any], spalmer: dict[str, Any]
         raise ValueError("expert_qat_backend must be native or native-only auto")
     experts["expert_qat_backend"] = qat_backend
     experts["expert_activation_format"] = activation_format
-    master_dtype = str(experts.get("expert_master_dtype") or "bfloat16").strip().casefold()
-    if master_dtype != "bfloat16":
-        raise ValueError("SPALMER training requires BF16 expert master weights")
+    master_dtype = str(experts.get("expert_master_dtype") or recorded_master).strip().casefold()
+    if master_dtype not in {"bfloat16", "float32"}:
+        raise ValueError("SPALMER expert master weights must be BF16 or FP32")
+    for source in (spalmer, cfg):
+        recorded = source.get("expert_master_dtype")
+        if recorded is not None and str(recorded).strip().casefold() != master_dtype:
+            raise ValueError("conflicting expert_master_dtype declarations")
+    for field in ("expert_master_dtype", "master_weights", "parameter_dtype", "ple_parameter_dtype"):
+        recorded = precision.get(field)
+        if recorded is not None and str(recorded).strip().casefold() != master_dtype:
+            raise ValueError(f"precision.{field} disagrees with expert_master_dtype")
+    if master_dtype == "float32" and (weight_format, activation_format) not in {
+        ("bfloat16", "bfloat16"), ("nvfp4", "nvfp4")
+    }:
+        raise ValueError("FP32-master training supports BF16/BF16 or standard NVFP4/NVFP4")
     experts["expert_master_dtype"] = master_dtype
     promotion_format = str(experts.get("expert_promotion_format") or "bfloat16").strip().casefold()
     if promotion_format != "bfloat16":
@@ -735,7 +815,7 @@ def _normalize_scratch_architecture(cfg: dict[str, Any], spalmer: dict[str, Any]
             "precision provider is capability-verified"
         )
     experts["expert_promotion_format"] = promotion_format
-    default_potentiation_budget = 0 if weight_format == "bfloat16" else 2
+    default_potentiation_budget = 0 if weight_format == "bfloat16" or master_dtype == "float32" else 2
     potentiation_budget = int(
         experts.get("potentiation_budget", default_potentiation_budget)
         or 0
@@ -744,6 +824,8 @@ def _normalize_scratch_architecture(cfg: dict[str, Any], spalmer: dict[str, Any]
         raise ValueError("potentiation_budget cannot be negative")
     if weight_format == "bfloat16" and potentiation_budget:
         raise ValueError("BF16 experts have no higher native potentiation tier")
+    if master_dtype == "float32" and potentiation_budget:
+        raise ValueError("standard FP32-master training requires potentiation_budget=0")
     experts["potentiation_budget"] = potentiation_budget
     unknown_experts = sorted(
         set(raw_experts)
@@ -875,6 +957,7 @@ def normalize_spalmer_config(
     if mode == INITIALIZATION_CHECKPOINT:
         cfg["spalmer"] = _normalize_checkpoint_execution(spalmer)
         cfg.pop("target_parameters", None)
+        _inherit_checkpoint_parameter_dtype(cfg)
     else:
         _normalize_scratch_architecture(cfg, spalmer)
 
@@ -907,9 +990,10 @@ def normalize_spalmer_config(
         if root_name not in cfg and training_name in training:
             cfg[root_name] = training[training_name]
     _normalize_recurrence_training(cfg, mode=mode)
+    parameter_dtype = _training_parameter_dtype(cfg)
     for name, expected in (
         ("compute_dtype", "bfloat16"),
-        ("parameter_dtype", "bfloat16"),
+        ("parameter_dtype", parameter_dtype),
         ("optimizer_state_dtype", "float32"),
     ):
         value = str(training.get(name) or expected).strip().casefold()
@@ -918,12 +1002,14 @@ def normalize_spalmer_config(
     optimizer_state_offload = str(
         training.get(
             "optimizer_state_offload",
-            cfg.get("optimizer_state_offload", "cpu"),
+            cfg.get("optimizer_state_offload", "none" if parameter_dtype == "float32" else "cpu"),
         )
         or "cpu"
     ).strip().casefold()
-    if optimizer_state_offload != "cpu":
-        raise ValueError("SPALMER yyLab training requires optimizer_state_offload='cpu'")
+    if optimizer_state_offload not in {"cpu", "none"}:
+        raise ValueError("optimizer_state_offload must be 'cpu' or 'none'")
+    if parameter_dtype == "float32" and optimizer_state_offload != "none":
+        raise ValueError("FP32-master training currently requires optimizer_state_offload='none'")
     cfg["optimizer_state_offload"] = optimizer_state_offload
     for name in (
         "device",
@@ -1058,6 +1144,8 @@ def plan_spalmer_configuration(
         "recurrence": recurrence,
     }
     kwargs["ple_backend"] = _normalize_ple_backend(spalmer.get("ple_backend"))
+    if _training_parameter_dtype(cfg) == "float32":
+        kwargs["expert_master_dtype"] = "float32"
     if "num_experts" in spalmer:
         kwargs["search_space"] = symbols.ScaleSearchSpace(
             num_experts=int(spalmer["num_experts"])
@@ -1108,6 +1196,7 @@ def build_spalmer_training_config(
     config: Mapping[str, Any],
     *,
     api: SimpleNamespace | None = None,
+    parameter_dtype: str | None = None,
 ) -> Any:
     """Translate yyLab runtime controls to SPALMER's strict training config."""
 
@@ -1141,7 +1230,7 @@ def build_spalmer_training_config(
         device=str(cfg.get("device") or "cuda"),
         require_cuda=_bool(cfg.get("require_cuda"), default=True),
         compute_dtype="bfloat16",
-        parameter_dtype="bfloat16",
+        parameter_dtype=parameter_dtype or _training_parameter_dtype(cfg),
         optimizer_state_dtype="float32",
         optimizer_state_offload=str(cfg.get("optimizer_state_offload") or "cpu"),
         stochastic_parameter_rounding=_bool(
@@ -1189,7 +1278,7 @@ class YYLabSPALMERBatchSource:
 
     def __init__(
         self,
-        factory: Callable[[], PackedBatches],
+        factory: Callable[[], PackedBatches | BufferedBatches],
         *,
         causal_batch_type: type,
         micro_batch_size: int,
@@ -1206,13 +1295,13 @@ class YYLabSPALMERBatchSource:
         self.delivered_input_tokens = 0
         self.delivered_target_tokens = 0
         self.discarded_incomplete_batches = 0
-        self._packed: PackedBatches | None = None
+        self._packed: PackedBatches | BufferedBatches | None = None
         self._iterator: Any = None
         self._prefetched: deque[dict[str, Any]] = deque()
         self._exhausted = False
 
     @property
-    def packed_batches(self) -> PackedBatches:
+    def packed_batches(self) -> PackedBatches | BufferedBatches:
         if self._packed is None:
             self._packed = self._factory()
             self._iterator = iter(self._packed)
@@ -1294,6 +1383,11 @@ class YYLabSPALMERBatchSource:
         self._record_delivered(raw)
         return self._causal_batch_type(input_ids=input_ids)
 
+    def close(self) -> None:
+        close = getattr(self._iterator, "close", None)
+        if callable(close):
+            close()
+
     def state_dict(self) -> dict[str, Any]:
         return {
             "version": self.STATE_VERSION,
@@ -1326,6 +1420,7 @@ class YYLabSPALMERBatchSource:
         self.delivered_input_tokens = 0
         self.delivered_target_tokens = 0
         self.discarded_incomplete_batches = 0
+        self.close()
         self._packed = self._factory()
         self._iterator = iter(self._packed)
         self._prefetched.clear()
@@ -1403,7 +1498,11 @@ def build_spalmer_batch_source(
                     return [list(map(int, row)) for row in encoded["input_ids"]]
         return [tokenizer.encode(text, add_special_tokens=False) for text in texts]
 
-    def factory() -> PackedBatches:
+    from .prepared import prepare_for_training
+
+    reader = prepare_for_training(cfg, tokenizer, tokenize, progress=lambda text: print(text, flush=True))
+
+    def factory() -> BufferedBatches:
         def documents():
             for epoch in range(int(cfg["epochs"])):
                 yield from iter_corpus_docs(
@@ -1418,9 +1517,10 @@ def build_spalmer_batch_source(
                     corpus_weights=cfg.get("corpus_weights") or None,
                     source_max_ratio=cfg.get("source_max_ratio"),
                     annotate_source=True,
+                    corpus_reader=reader,
                 )
 
-        return PackedBatches(
+        packed = PackedBatches(
             documents(),
             tokenize,
             # CausalBatch uses one extra token as the final next-token target.
@@ -1431,6 +1531,8 @@ def build_spalmer_batch_source(
             tokenize_chunk=int(cfg["tokenize_chunk"]),
             max_text_chars=int(cfg["max_text_chars"]),
         )
+
+        return BufferedBatches(packed, int(cfg.get("data_prefetch_batches", 2)), resources=reader)
 
     return YYLabSPALMERBatchSource(
         factory,
@@ -1650,7 +1752,7 @@ def _parameter_accounting_payload(accounting: Any) -> dict[str, Any]:
     return payload
 
 
-def _optimizer_placement_payload(optimizer: Any) -> dict[str, Any]:
+def _optimizer_placement_payload(optimizer: Any, *, expected_policy: str = "cpu") -> dict[str, Any]:
     reporter = getattr(optimizer, "state_placement", None)
     if not callable(reporter):
         raise RuntimeError("SPALMER optimizer does not expose physical state placement")
@@ -1658,12 +1760,14 @@ def _optimizer_placement_payload(optimizer: Any) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise RuntimeError("SPALMER optimizer returned invalid state-placement telemetry")
     dense = payload.get("dense")
-    if not isinstance(dense, dict) or dense.get("policy") != "cpu":
-        raise RuntimeError("SPALMER FP32 optimizer moments are not configured for CPU offload")
+    if not isinstance(dense, dict) or dense.get("policy") != expected_policy:
+        raise RuntimeError(f"SPALMER optimizer placement does not match requested policy {expected_policy!r}")
     return payload
 
 
-def _validate_initialized_optimizer_offload(payload: Mapping[str, Any]) -> None:
+def _validate_initialized_optimizer_offload(
+    payload: Mapping[str, Any], *, parameter_dtype: str = "bfloat16"
+) -> None:
     dense = payload.get("dense")
     if not isinstance(dense, Mapping):
         raise RuntimeError("SPALMER dense optimizer placement telemetry is missing")
@@ -1673,15 +1777,19 @@ def _validate_initialized_optimizer_offload(payload: Mapping[str, Any]) -> None:
     if str(dense.get("moment_dtype") or "") != "float32":
         problems.append("optimizer moments are not FP32")
     devices = [str(value) for value in dense.get("devices") or []]
-    if devices != ["cpu"]:
-        problems.append(f"optimizer moment devices are {devices or ['missing']}, not CPU")
     parameter_devices = [str(value) for value in dense.get("parameter_devices") or []]
+    policy = dense.get("policy")
+    if policy not in {"cpu", "none"}:
+        problems.append(f"unknown optimizer placement policy {policy!r}")
+    expected_devices = ["cpu"] if policy == "cpu" else parameter_devices
+    if devices != expected_devices:
+        problems.append(f"optimizer moment devices are {devices or ['missing']}, expected {expected_devices}")
     if not parameter_devices or any(not value.startswith("cuda") for value in parameter_devices):
-        problems.append("BF16 master parameters are not accelerator-resident")
+        problems.append("master parameters are not accelerator-resident")
     parameter_dtypes = [str(value) for value in dense.get("parameter_dtypes") or []]
-    if parameter_dtypes != ["bfloat16"]:
+    if parameter_dtypes != [parameter_dtype]:
         problems.append(
-            f"master parameter dtypes are {parameter_dtypes or ['missing']}, not BF16"
+            f"master parameter dtypes are {parameter_dtypes or ['missing']}, expected {parameter_dtype}"
         )
     if int(dense.get("moment_bytes") or 0) <= 0:
         problems.append("optimizer reports no physical moment storage")
@@ -1728,6 +1836,8 @@ def _tokenized_view_manifest(
         },
         "tokens": tokens,
         "per_corpus": dict(batcher.get("per_corpus") or {}),
+        "prepared_tokens": dict(batcher.get("prepared_tokens") or {}),
+        "data_prefetch_batches": int(batcher.get("data_prefetch_batches") or 0),
         "reconciliation": {
             "model_slots_equal_real_plus_padding": forwarded_model
             == forwarded_real + padding,
@@ -1792,6 +1902,18 @@ def _validate_native_expert_precision(
         raise RuntimeError("SPALMER training refuses emulated expert stochastic quantization")
     if backend not in {"auto", "native"}:
         raise RuntimeError("SPALMER training refuses reference or emulated expert backends")
+    master = str(_config_value(experts, "expert_master_dtype", "bfloat16"))
+    if (weight, activation, master) == ("nvfp4", "nvfp4", "float32"):
+        if execution != "loop":
+            raise RuntimeError("standard NVFP4 training currently requires loop expert execution")
+        from spalmer.experts.standard_nvfp4 import standard_nvfp4_provider_capability
+
+        selected = standard_nvfp4_provider_capability(device or "cuda")
+        if not all(selected.get(key) for key in (
+            "verified", "selectable", "forward_available", "backward_available"
+        )):
+            raise RuntimeError(str(selected.get("detail") or "standard NVFP4 training is unavailable"))
+        return dict(selected)
     detector = getattr(api, "detect_precision_capabilities", None)
     if not callable(detector):
         raise RuntimeError("SPALMER native precision capability detection is unavailable")
@@ -1950,7 +2072,12 @@ def _prepare_checkpoint_run(cfg: dict[str, Any], symbols: SimpleNamespace) -> Pr
         symbols,
         device=str(cfg.get("device") or "cuda"),
     )
-    training = build_spalmer_training_config(cfg, api=symbols)
+    parent_dtype = _config_value(bundle.experts, "expert_master_dtype", "bfloat16")
+    _validate_checkpoint_parameter_dtype(cfg, parent_dtype)
+    submitted_training = dict(cfg.get("training") or {})
+    submitted_training["parameter_dtype"] = parent_dtype
+    cfg["training"] = submitted_training
+    training = build_spalmer_training_config(cfg, api=symbols, parameter_dtype=parent_dtype)
     _validate_fast_attention(cfg, symbols)
     parent = {
         "checkpoint_id": str(initialization.get("checkpoint_id") or ""),
@@ -2002,6 +2129,14 @@ def _save_bundle_checkpoint(
         "plan_fingerprint": prepared.plan.fingerprint,
         "tokenizer": prepared.tokenizer.identity.to_dict(),
         "training_config": prepared.training.to_dict(),
+        "precision": {
+            "recipe": _precision_recipe(prepared.bundle.experts),
+            "parameter_dtype": prepared.training.parameter_dtype,
+            "compute_dtype": prepared.training.compute_dtype,
+            "expert_weight_format": prepared.bundle.experts.expert_weight_format,
+            "expert_activation_format": prepared.bundle.experts.expert_activation_format,
+            "expert_master_dtype": prepared.bundle.experts.expert_master_dtype,
+        },
         "training": (
             None
             if metrics is None
@@ -2092,6 +2227,10 @@ def run_spalmer_base(config: Mapping[str, Any], rd: Path) -> dict[str, Any]:
             flush=True,
         )
 
+    batches = build_spalmer_batch_source(
+        cfg, prepared.tokenizer, causal_batch_type=api.CausalBatch,
+    )
+
     api.seed_everything(
         int(prepared.training.seed),
         deterministic_algorithms=bool(prepared.training.deterministic_algorithms),
@@ -2120,18 +2259,13 @@ def run_spalmer_base(config: Mapping[str, Any], rd: Path) -> dict[str, Any]:
         api.assert_accounting_matches_plan(plan, accounting)
     accounting_payload = _parameter_accounting_payload(accounting)
 
-    batches = build_spalmer_batch_source(
-        cfg,
-        prepared.tokenizer,
-        causal_batch_type=api.CausalBatch,
-    )
     output = checkpoint_dir(str(cfg["out_checkpoint_id"]))
     output.mkdir(parents=True, exist_ok=True)
     telemetry = _TelemetryWriter(rd, max_steps=int(prepared.training.max_steps))
 
     def periodic_checkpoint(trainer: Any, metrics: Any) -> None:
-        placement = _optimizer_placement_payload(trainer.optimizer)
-        _validate_initialized_optimizer_offload(placement)
+        placement = _optimizer_placement_payload(trainer.optimizer, expected_policy=cfg["optimizer_state_offload"])
+        _validate_initialized_optimizer_offload(placement, parameter_dtype=prepared.training.parameter_dtype)
         step = int(_metric_value(metrics, "step", trainer.progress.completed_steps))
         step_dir = output / "steps" / f"step-{step:08d}"
         _save_bundle_checkpoint(
@@ -2152,7 +2286,7 @@ def run_spalmer_base(config: Mapping[str, Any], rd: Path) -> dict[str, Any]:
         on_checkpoint=periodic_checkpoint,
         on_telemetry=telemetry.record,
     )
-    optimizer_placement = _optimizer_placement_payload(trainer.optimizer)
+    optimizer_placement = _optimizer_placement_payload(trainer.optimizer, expected_policy=cfg["optimizer_state_offload"])
     dense_placement = optimizer_placement["dense"]
     pinned_state = dense_placement.get("cpu_pinned")
     host_memory = (
@@ -2160,8 +2294,11 @@ def run_spalmer_base(config: Mapping[str, Any], rd: Path) -> dict[str, Any]:
         if pinned_state is None
         else ("pinned" if pinned_state else "pageable")
     )
+    if cfg["optimizer_state_offload"] == "none":
+        host_memory = "not used for moments"
     print(
-        "SPALMER optimizer: BF16 accelerator masters; FP32 moments CPU-offloaded; "
+        f"SPALMER optimizer: {prepared.training.parameter_dtype} accelerator masters; "
+        f"FP32 moment placement={cfg['optimizer_state_offload']}; "
         f"update_chunk={int(prepared.training.optimizer_update_chunk_size):,}; "
         f"host_memory={host_memory}",
         flush=True,
@@ -2177,8 +2314,8 @@ def run_spalmer_base(config: Mapping[str, Any], rd: Path) -> dict[str, Any]:
                 # its moments on the first completed update.  Prove and
                 # persist the physical placement immediately instead of
                 # waiting for a periodic checkpoint or the end of a long run.
-                observed_placement = _optimizer_placement_payload(trainer.optimizer)
-                _validate_initialized_optimizer_offload(observed_placement)
+                observed_placement = _optimizer_placement_payload(trainer.optimizer, expected_policy=cfg["optimizer_state_offload"])
+                _validate_initialized_optimizer_offload(observed_placement, parameter_dtype=prepared.training.parameter_dtype)
                 first_step = int(
                     _metric_value(metrics, "step", trainer.progress.completed_steps)
                 )
@@ -2210,6 +2347,10 @@ def run_spalmer_base(config: Mapping[str, Any], rd: Path) -> dict[str, Any]:
             except TypeError:
                 zero_grad()
         print(f"SPALMER data exhausted cleanly: {exc}", flush=True)
+    finally:
+        close = getattr(batches, "close", None)
+        if callable(close):
+            close()
     completed_steps = int(getattr(trainer.progress, "completed_steps", 0))
     tokens_seen = int(getattr(trainer.progress, "tokens_seen", 0))
     if completed_steps < 1 or last_metrics is None:
@@ -2217,8 +2358,8 @@ def run_spalmer_base(config: Mapping[str, Any], rd: Path) -> dict[str, Any]:
             "selected SPALMER corpora produced no complete optimizer step; "
             "check shards, filters, sequence length, and accumulation size"
         )
-    optimizer_placement = _optimizer_placement_payload(trainer.optimizer)
-    _validate_initialized_optimizer_offload(optimizer_placement)
+    optimizer_placement = _optimizer_placement_payload(trainer.optimizer, expected_policy=cfg["optimizer_state_offload"])
+    _validate_initialized_optimizer_offload(optimizer_placement, parameter_dtype=prepared.training.parameter_dtype)
     if telemetry.last_step < int(_metric_value(last_metrics, "step", 0)):
         telemetry.record(last_metrics)
     final_progress = _metric_payload(
@@ -2301,14 +2442,17 @@ def run_spalmer_base(config: Mapping[str, Any], rd: Path) -> dict[str, Any]:
         "parameters": actual_parameters,
         "tokenizer": manifest["tokenizer"],
         "precision": {
+            "recipe": _precision_recipe(prepared.bundle.experts),
             "expert_weights": plan.config.expert_weight_format,
             "expert_activations": prepared.bundle.experts.expert_activation_format,
             "master_weights": prepared.bundle.experts.expert_master_dtype,
             "expert_qat_backend": prepared.bundle.experts.expert_qat_backend,
             "expert_execution": prepared.bundle.experts.expert_execution,
             "ple_backend": ple_metadata["backend"],
-            "ple_parameter_dtype": "bfloat16",
-            "optimizer_moments": "float32_cpu_offload",
+            "ple_parameter_dtype": prepared.training.parameter_dtype,
+            "optimizer_moments": (
+                "float32_cpu_offload" if cfg["optimizer_state_offload"] == "cpu" else "float32_accelerator"
+            ),
         },
         "training_sequence_length": int(prepared.training.sequence_length),
         # ``num_layers`` in the registry stays physical; the recurrent depth a

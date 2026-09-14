@@ -1,0 +1,4 @@
+# Preserve the exact archived experiment/recipe bytes recorded in SHA-256 manifests.
+# Accept original CRLF endings without normalizing the hashed archives.
+*.json -text whitespace=cr-at-eol
+experiments/** -text whitespace=cr-at-eol

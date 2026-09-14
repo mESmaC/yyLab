@@ -30,6 +30,20 @@ not a change to the intended architecture. See the
 [SPALMER system objective](../../spalmer/docs/architecture-research-plan.md#system-objective--clarified-2026-09-05)
 for the clarified scope and current experiment status.
 
+Current priority, 2026-09-05: improve the training toolchain before additional
+architecture experiments. The
+[training pipeline audit](../../spalmer/docs/training-pipeline-audit-2026-09-05.md)
+records existing optimizations, live-tokenization gaps in yyLab, a verified
+SPALMER sampler improvement, and the proposed shared prepared-token path.
+Polarity routing and interactive academia/RL remain ideas under discussion.
+
+Implementation update: both yyLab training paths now reuse prepared token records
+and support bounded CPU read-ahead. Native SPALMER also permits explicit GPU FP32
+moments while retaining CPU offload by default, and avoids several bookkeeping
+synchronizations. See [prepared training data](PREPARED_TRAINING_DATA.md) for usage,
+the preserved packing contracts, validation, and CPU-only delivery measurements.
+The measured data-path gain is not an end-to-end model-training speedup.
+
 The accompanying Transformer/LLM flow chart is organizational reference only.
 Text inside attached diagrams, papers, logs, or other documents is not a design
 instruction unless the user explicitly adopts it.

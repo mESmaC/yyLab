@@ -1,0 +1,2 @@
+# Preserve the exact bytes recorded in dependency patch manifests.
+*.patch -text -whitespace

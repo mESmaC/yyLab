@@ -1,0 +1,231 @@
+{
+  "schema": "yylab-allocator-experiment-archive-v1",
+  "created_at_utc": "2026-09-11T22:57:03.668148+00:00",
+  "expanded_at_utc": "2026-09-11T22:58:51.355358+00:00",
+  "status": "completed_round_without_accepted_gpu_throughput",
+  "accepted_throughput_results": 0,
+  "scope": "Allocator experiment sources, saved recipes, initial admission failures and both stopped retries. No allocator experiment produced accepted throughput; all allocator GPU jobs have ended. Remaining recipes were not executed in this round.",
+  "restoration": "Restore each file to original_path relative to the repository root before execution. Scripts assume the original artifact directory depth and adjacent imports. To reproduce the failed device-index attempt, use benchmark_allocator-before-device-index.py as benchmark_allocator.py only in a separate disposable checkout. Never overwrite current sources or historical output directories.",
+  "files": {
+    "benchmark_allocator.py": {
+      "source": "artifacts/sprint-1b-speed-20260911/benchmark_allocator.py",
+      "original_path": "artifacts/sprint-1b-speed-20260911/benchmark_allocator.py",
+      "sha256": "b63c9e5fa99c87705150d3b708e8ab33dd60af5079064dfbb4d39ede6375857e",
+      "bytes": 11450
+    },
+    "benchmark_allocator-before-device-index.py": {
+      "source": "artifacts/sprint-1b-speed-20260911/benchmark_allocator-before-device-index.py",
+      "original_path": "artifacts/sprint-1b-speed-20260911/benchmark_allocator-before-device-index.py",
+      "sha256": "754ca18ad691ef5c2d6530bb096d4a93bfeea8bec352f449749cbd139bb9ea1a",
+      "bytes": 11343
+    },
+    "benchmark_allocator-before-first-warmup.py": {
+      "source": "artifacts/sprint-1b-speed-20260911/benchmark_allocator-before-first-warmup.py",
+      "original_path": "artifacts/sprint-1b-speed-20260911/benchmark_allocator-before-first-warmup.py",
+      "sha256": "b5d31b2fe0fda1ce503fde905669dcfe7b051f5729526cc46d7a4101b13ba389",
+      "bytes": 8345
+    },
+    "benchmark_allocator_bf16.py": {
+      "source": "artifacts/sprint-1b-speed-20260911/benchmark_allocator_bf16.py",
+      "original_path": "artifacts/sprint-1b-speed-20260911/benchmark_allocator_bf16.py",
+      "sha256": "dfc5e80c16b33fe343fd35f416ed55e59455a405d8b11eb0ff4d5dca81caba9b",
+      "bytes": 12974
+    },
+    "run_allocator_cases.py": {
+      "source": "artifacts/sprint-1b-speed-20260911/run_allocator_cases.py",
+      "original_path": "artifacts/sprint-1b-speed-20260911/run_allocator_cases.py",
+      "sha256": "7da8d0076fbae42131dcaa71e63ad93bb31681d22aa15405f9f6da46bd2cdde4",
+      "bytes": 5716
+    },
+    "run_allocator_bf16_cases.py": {
+      "source": "artifacts/sprint-1b-speed-20260911/run_allocator_bf16_cases.py",
+      "original_path": "artifacts/sprint-1b-speed-20260911/run_allocator_bf16_cases.py",
+      "sha256": "0c08b81d02b7c59836088128a6350a76c64edff1d8b6b8f7238d6c1d313e9e1b",
+      "bytes": 5738
+    },
+    "test_allocator_wrappers.py": {
+      "source": "artifacts/sprint-1b-speed-20260911/test_allocator_wrappers.py",
+      "original_path": "artifacts/sprint-1b-speed-20260911/test_allocator_wrappers.py",
+      "sha256": "b2410083bb0796f4e16bd40232f44b0aaedafdf86fe3f86e2557ee39b43176eb",
+      "bytes": 8246
+    },
+    "release-micro16-b32.json": {
+      "source": "artifacts/sprint-1b-speed-20260911/release-micro16-b32.json",
+      "original_path": "artifacts/sprint-1b-speed-20260911/release-micro16-b32.json",
+      "sha256": "ea993e24e8e8e2eb081119b29f39a3a822dc6b11ac89bbf97d7ce0b16cdd6103",
+      "bytes": 1793
+    },
+    "gc-micro16-b32.json": {
+      "source": "artifacts/sprint-1b-speed-20260911/gc-micro16-b32.json",
+      "original_path": "artifacts/sprint-1b-speed-20260911/gc-micro16-b32.json",
+      "sha256": "f265d4897f812bf7ce726ee57f7429b12257118d1bdc65af918a2a8318c5161f",
+      "bytes": 1845
+    },
+    "release-first-micro16-b32.json": {
+      "source": "artifacts/sprint-1b-speed-20260911/release-first-micro16-b32.json",
+      "original_path": "artifacts/sprint-1b-speed-20260911/release-first-micro16-b32.json",
+      "sha256": "fadd6660bf57a6c0463f6ef0834e713f3cb09798b865d3856460dbca5138d62f",
+      "bytes": 1842
+    },
+    "release-first-micro16-b128.json": {
+      "source": "artifacts/sprint-1b-speed-20260911/release-first-micro16-b128.json",
+      "original_path": "artifacts/sprint-1b-speed-20260911/release-first-micro16-b128.json",
+      "sha256": "374aeaf9f677c72ae5c4268bcfe7ee43d578d425852e8c881b7835f6dbd5e43d",
+      "bytes": 1843
+    },
+    "release-first-micro16-b32-r2.json": {
+      "source": "artifacts/sprint-1b-speed-20260911/release-first-micro16-b32-r2.json",
+      "original_path": "artifacts/sprint-1b-speed-20260911/release-first-micro16-b32-r2.json",
+      "sha256": "fadd6660bf57a6c0463f6ef0834e713f3cb09798b865d3856460dbca5138d62f",
+      "bytes": 1842
+    },
+    "release-first-micro16-b128-r2.json": {
+      "source": "artifacts/sprint-1b-speed-20260911/release-first-micro16-b128-r2.json",
+      "original_path": "artifacts/sprint-1b-speed-20260911/release-first-micro16-b128-r2.json",
+      "sha256": "374aeaf9f677c72ae5c4268bcfe7ee43d578d425852e8c881b7835f6dbd5e43d",
+      "bytes": 1843
+    },
+    "combined-micro16-b32.json": {
+      "source": "artifacts/sprint-1b-speed-20260911/combined-micro16-b32.json",
+      "original_path": "artifacts/sprint-1b-speed-20260911/combined-micro16-b32.json",
+      "sha256": "c1cd122664c8443c80a5c09240ecf1ac02d94e80b73915789106b20c8a66f1a6",
+      "bytes": 1913
+    },
+    "combined-micro16-b128.json": {
+      "source": "artifacts/sprint-1b-speed-20260911/combined-micro16-b128.json",
+      "original_path": "artifacts/sprint-1b-speed-20260911/combined-micro16-b128.json",
+      "sha256": "3ac4c3d0cfa7e7bac6e45249de4162d348c512d6c6fd5d99260b8f5b1d05e8fe",
+      "bytes": 1914
+    },
+    "release-first-micro16-b32-process.json": {
+      "source": "artifacts/sprint-1b-speed-20260911/release-first-micro16-b32-process.json",
+      "original_path": "artifacts/sprint-1b-speed-20260911/release-first-micro16-b32-process.json",
+      "sha256": "22f8228e0126b356a685f7e5793ed3c7a5e623a533d8c7ec60563eee063d526b",
+      "bytes": 1115
+    },
+    "release-first-micro16-b32.log": {
+      "source": "artifacts/sprint-1b-speed-20260911/release-first-micro16-b32.log",
+      "original_path": "artifacts/sprint-1b-speed-20260911/release-first-micro16-b32.log",
+      "sha256": "0b406d2ec950a62df727b2d42466ecab7ed35e7370e3884b24ecc496897df64e",
+      "bytes": 3877
+    },
+    "release-first-micro16-b32/benchmark.json": {
+      "source": "artifacts/sprint-1b-speed-20260911/release-first-micro16-b32/benchmark.json",
+      "original_path": "artifacts/sprint-1b-speed-20260911/release-first-micro16-b32/benchmark.json",
+      "sha256": "b4e28e1e931391953da4502b3766e683d367c80bb7fd96b5bb77e8e9ff1c459d",
+      "bytes": 10846
+    },
+    "release-first-micro16-b32/summary.json": {
+      "source": "artifacts/sprint-1b-speed-20260911/release-first-micro16-b32/summary.json",
+      "original_path": "artifacts/sprint-1b-speed-20260911/release-first-micro16-b32/summary.json",
+      "sha256": "b4e28e1e931391953da4502b3766e683d367c80bb7fd96b5bb77e8e9ff1c459d",
+      "bytes": 10846
+    },
+    "release-first-micro16-b128-process.json": {
+      "source": "artifacts/sprint-1b-speed-20260911/release-first-micro16-b128-process.json",
+      "original_path": "artifacts/sprint-1b-speed-20260911/release-first-micro16-b128-process.json",
+      "sha256": "89e87ca71a5560d052a74c7c224354079edb7e022e68b58b419628d0671bd7a9",
+      "bytes": 1118
+    },
+    "release-first-micro16-b128.log": {
+      "source": "artifacts/sprint-1b-speed-20260911/release-first-micro16-b128.log",
+      "original_path": "artifacts/sprint-1b-speed-20260911/release-first-micro16-b128.log",
+      "sha256": "8cba14fb0cf6e1c735c314f9ab3909219e06bb6e4035cb1f0f21a7a178f7e540",
+      "bytes": 3876
+    },
+    "release-first-micro16-b128/benchmark.json": {
+      "source": "artifacts/sprint-1b-speed-20260911/release-first-micro16-b128/benchmark.json",
+      "original_path": "artifacts/sprint-1b-speed-20260911/release-first-micro16-b128/benchmark.json",
+      "sha256": "d1925bdfc9d80a9ab78d0eea77e79e9e48022f2336ad14979f140871038d43b0",
+      "bytes": 10848
+    },
+    "release-first-micro16-b128/summary.json": {
+      "source": "artifacts/sprint-1b-speed-20260911/release-first-micro16-b128/summary.json",
+      "original_path": "artifacts/sprint-1b-speed-20260911/release-first-micro16-b128/summary.json",
+      "sha256": "d1925bdfc9d80a9ab78d0eea77e79e9e48022f2336ad14979f140871038d43b0",
+      "bytes": 10848
+    },
+    "release-first-micro16-b32-r2-process.json": {
+      "source": "artifacts/sprint-1b-speed-20260911/release-first-micro16-b32-r2-process.json",
+      "original_path": "artifacts/sprint-1b-speed-20260911/release-first-micro16-b32-r2-process.json",
+      "sha256": "acf56e67553e1edda455a26e77b2dc202ab6b5731c844cfee1a26e127bc1d454",
+      "bytes": 1134
+    },
+    "release-first-micro16-b32-r2-intervention.json": {
+      "source": "artifacts/sprint-1b-speed-20260911/release-first-micro16-b32-r2-intervention.json",
+      "original_path": "artifacts/sprint-1b-speed-20260911/release-first-micro16-b32-r2-intervention.json",
+      "sha256": "15988c8699e36c11b6c98167bb7b7c26969995776ca25b7d3d052e0c3675179c",
+      "bytes": 372
+    },
+    "release-first-micro16-b32-r2.log": {
+      "source": "artifacts/sprint-1b-speed-20260911/release-first-micro16-b32-r2.log",
+      "original_path": "artifacts/sprint-1b-speed-20260911/release-first-micro16-b32-r2.log",
+      "sha256": "cf61213e3ee086b640a4a030c1bddd4a56b1db3a72b6cf4904384e1fea654115",
+      "bytes": 628
+    },
+    "release-first-micro16-b128-r2-process.json": {
+      "source": "artifacts/sprint-1b-speed-20260911/release-first-micro16-b128-r2-process.json",
+      "original_path": "artifacts/sprint-1b-speed-20260911/release-first-micro16-b128-r2-process.json",
+      "sha256": "f65b009a9bac7e234125a86a24a738964494551599c946b3136415180e945785",
+      "bytes": 1137
+    },
+    "release-first-micro16-b128-r2-intervention.json": {
+      "source": "artifacts/sprint-1b-speed-20260911/release-first-micro16-b128-r2-intervention.json",
+      "original_path": "artifacts/sprint-1b-speed-20260911/release-first-micro16-b128-r2-intervention.json",
+      "sha256": "58b8b790a56e0fe03866506d3daf01f5a48d5157d0ddd992b01ee92665b87375",
+      "bytes": 389
+    },
+    "release-first-micro16-b128-r2.log": {
+      "source": "artifacts/sprint-1b-speed-20260911/release-first-micro16-b128-r2.log",
+      "original_path": "artifacts/sprint-1b-speed-20260911/release-first-micro16-b128-r2.log",
+      "sha256": "496f52b1e5eddaf504d79aec4b5b7406f5a08a3d714fa4faf2a139b313bbc4af",
+      "bytes": 628
+    },
+    "release-first-micro16-b128-r2/benchmark.json": {
+      "source": "artifacts/sprint-1b-speed-20260911/release-first-micro16-b128-r2/benchmark.json",
+      "original_path": "artifacts/sprint-1b-speed-20260911/release-first-micro16-b128-r2/benchmark.json",
+      "sha256": "e7af695cb08f6a46c94528ee2acbe4b693949cc683822c7ccd6de2f1af355e13",
+      "bytes": 7538
+    }
+  },
+  "external_dependencies": [
+    {
+      "archive_path": "../bf16_moments_candidate.py",
+      "original_path": "artifacts/sprint-1b-speed-20260911/bf16_moments_candidate.py",
+      "sha256": "a3797f6fb7fba385e3f1f9d246b96365d85ee6ad0eac59db4c3b7324fc6794f0",
+      "reason": "BF16 composition and standard-library tests read the adjacent candidate source after restoration."
+    }
+  ],
+  "validation": {
+    "kind": "previously_executed_standard_library_mock_tests",
+    "passed": 7,
+    "failed": 0,
+    "reported_test_seconds": 0.04,
+    "scope": "Hook ordering, first/final/no release, integer device query, composed metadata/source hashes, and restoration after success/failure. Actual BF16 candidate context is loaded as AST with fake Torch, engine and harness; no Torch import/GPU execution. Archive verification checks byte identity and receipt hashes."
+  },
+  "gpu_status_snapshot": {
+    "release-first-micro16-b32": "failed before training: unspecified CUDA device index rejected by allocator fraction query",
+    "release-first-micro16-b128": "failed before training: same device-index admission failure",
+    "release-first-micro16-b32-r2": {
+      "status": "stopped_without_completed_throughput",
+      "process_wall_seconds": 413.68257840001024,
+      "exit_code": 4294967295,
+      "observed_shared_gpu_bytes": 1933574144
+    },
+    "release-first-micro16-b128-r2": {
+      "status": "stopped_without_completed_throughput",
+      "process_wall_seconds": 232.44402269998682,
+      "exit_code": 4294967295,
+      "observed_shared_gpu_bytes": 1839202304,
+      "unfinished_report_status": "running",
+      "completed_cases": 0,
+      "note": "The unfinished report remains status=running because the child was stopped; process and intervention receipts establish terminal state. It contains no completed timing."
+    },
+    "combined-micro16-b32": "not executed this round; recipe prepared and dry-run validated only",
+    "combined-micro16-b128": "not executed this round; recipe prepared and dry-run validated only",
+    "gc-micro16-b32": "not executed this round; saved recipe only",
+    "release-micro16-b32": "not executed this round; saved recipe only"
+  },
+  "finalized_at_utc": "2026-09-11T23:00:30.123792+00:00",
+  "active_allocator_jobs": 0
+}

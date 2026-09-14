@@ -1,7 +1,11 @@
 # Import GCCF classified corpora
 
+A GCCF receipt is a manifest of original source locations and processing
+decisions. **yyLab imports receipts by reference. It does not create an extracted
+text export or a second set of compressed corpus shards.**
+
 In **Corpora**, select **Import GCCF receipt** and enter the path to a
-`gccf.receipt/1` JSON receipt. By default, yyLab builds a metadata index over the
+`gccf.receipt/1` JSON receipt. yyLab builds a metadata index over the
 original datasets. It applies approved-file and bad-record decisions, deduplicates,
 preserves held-out splits, and creates one selectable corpus per approved source.
 Corpus text stays in the datasets directory. Names begin with `GCCF ·`.
@@ -15,20 +19,14 @@ From the yyLab checkout:
 ```powershell
 uv sync
 .venv\Scripts\python.exe -m yylab.ingest.gccf C:\path\gccf-receipt.json
-
-# Optional: explicitly create a processed copy.
-.venv\Scripts\python.exe -m yylab.ingest.gccf C:\path\gccf-receipt.json --materialize
-
-# Reuse a SPALMER export rather than extracting the original corpus again.
-.venv\Scripts\python.exe -m yylab.ingest.gccf --export-dir C:\data\gccf-approved
 ```
 
 The shared reader lives in the sibling `../spalmer` checkout, now used as yyLab's
 editable uv dependency. Both checkouts are required for this local development
 configuration. For a bounded ingestion smoke test, add `--limit-per-file 32`;
 this is explicitly recorded as a partial prefix sample, not a training corpus
-quality assessment. The cache separates metadata indexes, materialized exports,
-and partial/full scans.
+quality assessment. `--output` chooses the metadata-index directory. Partial and
+full scans have separate identities.
 
 The index stores record locations, content identities, deduplication/split
 decisions, and counts. Training and previews extract canonical text and messages
@@ -39,44 +37,41 @@ reuses its index and ready registrations. The shared index is also a valid input
 to SPALMER `prepare-data`, which writes token shards directly from bounded memory
 buffers instead of making a temporary text corpus.
 
-## Optional processed copy
+Training can separately create reusable token records and packed batches, as
+described in [prepared training data](PREPARED_TRAINING_DATA.md). These are
+tokenizer- and training-specific caches; the GCCF importer does not make duplicate
+text corpora to feed them.
 
-Enable **Create a processed copy** in the dialog, or pass `--materialize`, to
-request compressed yyLab shards. The already completed September 5 import remains
-available in this form. It was not deleted or recreated when the default changed.
+## Earlier copied imports
 
-Registration verifies each record's normalized text against its export ID.
-Changed records are excluded and listed, without their contents, in each corpus's
-`gccf-integrity-rejections.jsonl`; `stats.json` records the count. Failed imports
-can be retried with the same command. Ready corpora are reused.
-Missing records are separately counted in `gccf-integrity-summary.json` and the
-verified manifest; their IDs cannot be recovered from the remaining export.
-An export with more records than its manifest is rejected.
+Earlier yyLab versions offered **Create a processed copy**, `--materialize`, and
+`--export-dir`. Those copying paths have been disabled. Legacy API calls that
+request copying fail before creating output or changing registry entries.
 
-The importer also publishes `verified/data/` beneath the export directory, using
-the normal native `.jsonl.zst` shards. `verified/verified-export.json` records the
-usable counts and receipt lineage. Point standalone SPALMER `prepare-data` at
-that **verified/data** directory. Its reader understands the native fields and
-checks GCCF identities too. This verifies normalized canonical text, not every
-metadata field or the exact original byte representation.
+Already registered native corpora remain readable. Their saved training caches
+and checkpoints are preserved; this change does not silently migrate an existing
+corpus or reinterpret a saved training schedule. To refresh GCCF data, import the
+original receipt through the source-index path. Migrating existing corpus IDs
+requires an explicit, separately verified migration of their saved data identity.
 
-On this machine, Windows Defender remediated embedded scripts in part of the
-security-code export. Changed records are excluded; security settings and
-quarantined content are left alone. Use the verified view when using that existing copy.
+The September 13 artifact cleanup removed an unused 62.76 GB uncompressed import
+export while preserving its receipt, original sources, native corpus shards, and
+saved-run dependencies. Those old copied corpora may still record the former
+export folder as their historical re-import source. Generic Re-import of a
+missing source fails without replacing the existing corpus. Use the original
+receipt for future ingestion; do not recreate the copied export as the normal
+workflow.
 
 ## Training
 
-Select the **train** split for training. Use token-balanced corpus mixing and
-source weights to prevent the largest code collections from dominating. Start
-with classified-only data; raw general prose can later supply a controlled
-10–20% of training tokens. Global ingest deduplication does not let previously
-ingested raw data erase approved copies; training-time cross-corpus deduplication
-is still available.
+Select the **train** split for training and preserve original-source holdouts.
+Choose measured token quotas and source/task-family exposure limits. A corpus's
+approval label or document count does not establish topic diversity or factual
+correctness. The [duplication and diversity audit](SPRINT_DATA_DUPLICATION_2026-09-13.md)
+documents the current library's limitations.
 
-The supplied 16-book collection is now available as **Raw prose · english-prose**,
-backed directly by the originals. See [ENGLISH_PROSE.md](ENGLISH_PROSE.md) for
-its book-level holdouts, unclassified provenance, and a 90/10 starting target.
+The English prose collection also reads its original files. See
+[ENGLISH_PROSE.md](ENGLISH_PROSE.md) for its preparation and holdout receipts.
 
 The full schema and extraction/split guarantees are documented in SPALMER's
-`docs/gccf-ingestion.md`. GCCF export artifacts are reusable by SPALMER's
-`prepare-data` command and are not tied to yyLab's database.
+`docs/gccf-ingestion.md`.

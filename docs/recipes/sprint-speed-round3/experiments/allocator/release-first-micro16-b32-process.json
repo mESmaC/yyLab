@@ -1,0 +1,23 @@
+{
+  "name": "release-first-micro16-b32",
+  "harness": "allocator",
+  "command": [
+    "C:\\Users\\engin\\Desktop\\yy\\yyLab\\.venv\\Scripts\\python.exe",
+    "-u",
+    "C:\\Users\\engin\\Desktop\\yy\\yyLab\\artifacts\\sprint-1b-speed-20260911\\benchmark_allocator.py",
+    "--config",
+    "C:\\Users\\engin\\Desktop\\yy\\yyLab\\artifacts\\sprint-1b-speed-20260911\\release-first-micro16-b32.json",
+    "--output",
+    "C:\\Users\\engin\\Desktop\\yy\\yyLab\\artifacts\\sprint-1b-speed-20260911\\release-first-micro16-b32"
+  ],
+  "exit_code": 1,
+  "recipe_sha256": "fadd6660bf57a6c0463f6ef0834e713f3cb09798b865d3856460dbca5138d62f",
+  "wrapper_sha256": "754ca18ad691ef5c2d6530bb096d4a93bfeea8bec352f449749cbd139bb9ea1a",
+  "orchestrator_sha256": "7da8d0076fbae42131dcaa71e63ad93bb31681d22aa15405f9f6da46bd2cdde4",
+  "started_at_utc": "2026-09-11T22:47:46.313619+00:00",
+  "pid": 21620,
+  "wall_seconds": 4.911419399984879,
+  "completed_at_utc": "2026-09-11T22:47:51.227995+00:00",
+  "log_sha256": "0b406d2ec950a62df727b2d42466ecab7ed35e7370e3884b24ecc496897df64e",
+  "recipe_unchanged": true
+}

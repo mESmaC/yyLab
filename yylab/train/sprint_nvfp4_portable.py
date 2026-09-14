@@ -5,7 +5,9 @@ instruction used by the stock training kernel. This variant selects adjacent
 E2M1 levels with distance-proportional probability using 24 random bits per
 element. It retains stochastic rounding, but is not bitwise equivalent to the
 hardware instruction's random-bit layout. Scaling, RHT and all GEMMs remain
-the installed TorchAO implementation.
+the installed TorchAO implementation. The explicit SR4 variant consumes all
+four Philox outputs per call; the original per-element random layout remains
+available independently.
 
 Private provider functions are cloned with isolated globals so neither the
 installed package nor another model's stock provider is modified. This is
@@ -36,6 +38,25 @@ _REVIEWED_PROVIDER_SHA256 = {
     "quantize_2d_triton.py": "370e13a5658df1e475e5b4e1402fb31c4df5e9c61cd6e294daa55a5d3d392514",
     "nvfp4_training.py": "43e052f781c922ffc2f7c5d56fc1f68f06d2599565e0838d895e67ac48a53999",
 }
+
+_REVIEWED_SR4_CANDIDATE_SHA256 = "4d091890b0047859a56e2a60585325f338eb38a9fff76806c6b4f8466642354f"
+
+
+def portable_sr4_recipe() -> dict:
+    """Describe the explicit SR4 random layout, independent of model state."""
+    return {
+        "variant": "portable_sr4",
+        "algorithm": "philox4x32_10_all_outputs",
+        "philox_rounds": 10,
+        "random_values_per_call": 4,
+        "uniform_bits_per_element": 24,
+        "random_layout": "counter=(call_offset_low32, unique_four_element_group_high32); output lanes 0,1,2,3 map to adjacent columns",
+        "stream_separation": "unchanged caller seed and seed XOR 1, independent row/column offsets",
+        "baseline_bitwise_equivalent": False,
+        "hardware_bitwise_equivalent": False,
+        "rounding": "distance-proportional sampling between adjacent E2M1 values",
+        "reviewed_candidate_source_sha256": _REVIEWED_SR4_CANDIDATE_SHA256,
+    }
 
 
 def _provider_source_provenance() -> dict:
@@ -125,6 +146,37 @@ def _portable_pack_fp4(
         return convert_8xfp32_to_4xfp4_packed(scaled.reshape(BLOCK_N, BLOCK_M // 2, 2).split())
 
 
+@triton.jit
+def _sr4_random_bits(BLOCK_N: tl.constexpr, BLOCK_M: tl.constexpr,
+                     seed, offset_base, tile_id):
+    tl.static_assert(BLOCK_M % 4 == 0)
+    local_n = tl.arange(0, BLOCK_N)[:, None]
+    local_g = tl.arange(0, BLOCK_M // 4)[None, :]
+    group_idx = (tile_id.to(tl.int64) * (BLOCK_N * (BLOCK_M // 4))
+                 + (local_n * (BLOCK_M // 4) + local_g).to(tl.int64))
+    offset = (group_idx.to(tl.uint64) << 32) | (offset_base.to(tl.uint64) & 0xFFFFFFFF)
+    r0, r1, r2, r3 = tl.randint4x(seed, offset, n_rounds=10)
+    # Nested joins flatten to r0,r1,r2,r3 for four adjacent columns.
+    bits = tl.join(tl.join(r0, r2), tl.join(r1, r3))
+    return bits.reshape(BLOCK_N, BLOCK_M).to(tl.uint32)
+
+
+@triton.jit
+def _portable_pack_fp4_sr4(scaled, BLOCK_N: tl.constexpr, BLOCK_M: tl.constexpr,
+                          STOCHASTIC_ROUNDING: tl.constexpr,
+                          seed_ptr, offset_base_ptr, tile_id):
+    if STOCHASTIC_ROUNDING:
+        seed = tl.load(seed_ptr)
+        offset_base = tl.load(offset_base_ptr)
+        random_bits = _sr4_random_bits(BLOCK_N, BLOCK_M, seed, offset_base, tile_id)
+        uniform = (random_bits >> 8).to(tl.float32) * (1.0 / 16777216.0)
+        codes = _portable_e2m1_codes(scaled, uniform)
+        low, high = codes.reshape(BLOCK_N, BLOCK_M // 2, 2).split()
+        return low | (high << 4)
+    else:
+        return convert_8xfp32_to_4xfp4_packed(scaled.reshape(BLOCK_N, BLOCK_M // 2, 2).split())
+
+
 def _clone_function(function, **global_replacements):
     namespace = dict(function.__globals__)
     namespace.update(global_replacements)
@@ -138,7 +190,19 @@ def _clone_function(function, **global_replacements):
 @functools.lru_cache(maxsize=1)
 def portable_nvfp4_linear_class():
     """Create an isolated TorchAO module variant; imports/registration only."""
+    return _build_portable_nvfp4_linear_class(sr4=False)
+
+
+@functools.lru_cache(maxsize=1)
+def portable_nvfp4_sr4_linear_class():
+    """Create an independent SR4 variant without changing scalar-SR providers."""
+    return _build_portable_nvfp4_linear_class(sr4=True)
+
+
+def _build_portable_nvfp4_linear_class(*, sr4: bool):
     provenance = _provider_source_provenance()
+    if sr4:
+        provenance["stochastic_rounding_recipe"] = portable_sr4_recipe()
     from torchao.prototype.moe_training.nvfp4_training import (
         hadamard_quantize_row_col_triton as provider_quant,
     )
@@ -147,7 +211,8 @@ def portable_nvfp4_linear_class():
 
     try:
         original_kernel = provider_quant._hadamard_quantize_row_col_kernel
-        kernel_fn = _clone_function(original_kernel.fn.fn, _pack_fp4=_portable_pack_fp4)
+        pack = _portable_pack_fp4_sr4 if sr4 else _portable_pack_fp4
+        kernel_fn = _clone_function(original_kernel.fn.fn, _pack_fp4=pack)
         # Software per-element Philox substantially increases register pressure
         # versus cvt.rs. Keep the portable experiment's startup search bounded;
         # larger/high-stage provider tiles compile very slowly on SM120.
@@ -163,7 +228,8 @@ def portable_nvfp4_linear_class():
     except AttributeError as exc:
         raise RuntimeError("Installed TorchAO's NVFP4 kernel API is incompatible with portable SR.") from exc
 
-    operation = torch.library.custom_op("yylab::nvfp4_portable_sr_quantize", mutates_args=())(operation_fn)
+    operation_name = "yylab::nvfp4_portable_sr4_quantize" if sr4 else "yylab::nvfp4_portable_sr_quantize"
+    operation = torch.library.custom_op(operation_name, mutates_args=())(operation_fn)
 
     @operation.register_fake
     def _fake(A, col_global_amax, row_global_amax, sign_vector, stochastic_rounding=False,
@@ -178,7 +244,8 @@ def portable_nvfp4_linear_class():
         )
 
     replacements = {"triton_rht_quantize_row_col": operation}
-    function_cls = type("PortableSRNVFP4Function", (torch.autograd.Function,), {
+    function_name = "PortableSR4NVFP4Function" if sr4 else "PortableSRNVFP4Function"
+    function_cls = type(function_name, (torch.autograd.Function,), {
         "forward": staticmethod(_clone_function(nvfp4_mm_triton.forward, **replacements)),
         "backward": staticmethod(_clone_function(nvfp4_mm_triton.backward, **replacements)),
     })
@@ -203,4 +270,6 @@ def portable_nvfp4_linear_class():
             output = function_cls.apply(inputs, weight, bias, self._sr_seed, self.rht_sign_vector)
             return output[..., :self.out_features].contiguous()
 
+    if sr4:
+        PortableSRNVFP4Linear.__name__ = "PortableSR4NVFP4Linear"
     return PortableSRNVFP4Linear

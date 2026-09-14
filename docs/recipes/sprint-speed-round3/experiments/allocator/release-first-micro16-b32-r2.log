@@ -1,0 +1,4 @@
+W0911 18:48:36.363000 28088 .venv\Lib\site-packages\torch\distributed\elastic\multiprocessing\redirects.py:29] NOTE: Redirects are currently not supported in Windows or MacOs.
+Sprint precision benchmark: nvfp4_mxfp8_fast, batch 16, accumulation 2, default
+C:\Users\engin\Desktop\yy\yyLab\yylab\train\low_precision.py:157: UserWarning: Attempting to run cuBLAS, but there was no current CUDA context! Attempting to set the primary context... (Triggered internally at C:\actions-runner\_work\pytorch\pytorch\pytorch\aten\src\ATen\cuda\CublasHandlePool.cpp:335.)
+  grad_input = grad_flat.mm(weight_hp).reshape(ctx.input_shape)

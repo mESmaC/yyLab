@@ -1,0 +1,132 @@
+{
+  "workload": "CPU-only complete cache build; no model or GPU",
+  "source_run": "run_20260911_233414_7e34c9",
+  "corpora": [
+    "cor_20260830_210009_25df45",
+    "cor_20260904_221352_1dbcd0",
+    "cor_20260904_221256_32348f",
+    "cor_20260830_210817_a83f91",
+    "cor_20260904_221351_db2bf4",
+    "cor_20260911_200936_0c330d",
+    "cor_20260904_221245_e6b838",
+    "cor_20260904_220531_881dc0",
+    "cor_20260830_210837_54cc9d",
+    "cor_20260830_210839_92c5d4"
+  ],
+  "tokenizer_id": "tok_20260831_193151_b89d82",
+  "seq_len": 1024,
+  "token_slots": 16777216,
+  "baseline_source_sha256": "a6302c5b73819ea8cbf5cb245bf1b2611e28fa1db892fdde995cd105dd30ba22",
+  "repeats": 3,
+  "results": [
+    {
+      "variant": "baseline",
+      "repeat": 0,
+      "seconds": 11.79938460001722,
+      "rows": 16384,
+      "token_slots": 16777216,
+      "token_slots_per_second": 1421872.120345625
+    },
+    {
+      "variant": "current",
+      "repeat": 0,
+      "seconds": 4.596947000012733,
+      "rows": 16384,
+      "token_slots": 16777216,
+      "token_slots_per_second": 3649643.121827058
+    },
+    {
+      "variant": "current",
+      "repeat": 1,
+      "seconds": 4.5817906000011135,
+      "rows": 16384,
+      "token_slots": 16777216,
+      "token_slots_per_second": 3661716.011202241
+    },
+    {
+      "variant": "baseline",
+      "repeat": 1,
+      "seconds": 11.95184490000247,
+      "rows": 16384,
+      "token_slots": 16777216,
+      "token_slots_per_second": 1403734.414257378
+    },
+    {
+      "variant": "baseline",
+      "repeat": 2,
+      "seconds": 12.04278190000332,
+      "rows": 16384,
+      "token_slots": 16777216,
+      "token_slots_per_second": 1393134.587947273
+    },
+    {
+      "variant": "current",
+      "repeat": 2,
+      "seconds": 4.650921299995389,
+      "rows": 16384,
+      "token_slots": 16777216,
+      "token_slots_per_second": 3607288.7322381986
+    }
+  ],
+  "median_seconds": {
+    "baseline": 11.95184490000247,
+    "current": 4.596947000012733
+  },
+  "speedup": 2.599952729489673,
+  "identical_packed_files_and_statistics": true,
+  "files": {
+    "input_ids": {
+      "bytes": 33554432,
+      "dtype": "<u2",
+      "sha256": "f9c7db3a29faa48688fbdb0c98b33130d74620b4a22f69324280441c623c4165"
+    }
+  },
+  "cache_reuse": [
+    {
+      "rows": 16384,
+      "seconds": 0.033141399995656684,
+      "mode": "exact_cache",
+      "backing_rows": 16384
+    },
+    {
+      "rows": 8192,
+      "seconds": 0.033514500013552606,
+      "mode": "compatible_cache",
+      "backing_rows": 16384
+    }
+  ],
+  "limits": "OS page cache was not flushed. Fresh output directory each build; excludes imports, tokenizer loading and model setup. Budget-prefix reuse needs a completed compatible cache.",
+  "baseline_git_commit": "46594164a8cf3fdf20395e33f7d57dc5667daafe",
+  "date": "2026-09-11",
+  "cpu": "Intel Core Ultra 7 265F",
+  "versions": {
+    "torch": "2.11.0+cu128",
+    "transformers": "5.16.1",
+    "tokenizers": "0.23.1",
+    "numpy": "2.3.5"
+  },
+  "source_sha256": {
+    "yylab/train/sprint.py": "7074064f11b73bbc965a61a6921d94d2298a2767689dca4ff384e70e8eabf58a",
+    "yylab/train/sprint_packing.py": "05282d946badb477d54592a27ee33f7edf218230d2efc8c65d493bbb7c8cd97a"
+  },
+  "changes": [
+    "Reuse compatible packed prefixes across token budgets without copying",
+    "Reuse complete source passes for larger budgets; reject truncated undersized caches",
+    "Bounded NumPy row packing and bulk validation/writes",
+    "Batch128 physical tokenization with unchanged logical8 accounting for the verified generic fast encoder",
+    "Private IDs-only backend preserves tokenizer identity; custom encoders retain their original batch boundaries",
+    "Defer unused lookahead errors while retaining required failures"
+  ],
+  "validation": {
+    "tests_passed": 336,
+    "test_files": [
+      "tests/test_sprint_packing.py",
+      "tests/test_sprint_training.py",
+      "tests/test_sprint_ui.py"
+    ],
+    "ruff": "passed",
+    "packed_bytes_and_statistics_identical": true,
+    "exact_resume_across_different_physical_cache": true,
+    "prefix_sft_labels_and_masks": true
+  }
+}

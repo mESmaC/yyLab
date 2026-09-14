@@ -11,7 +11,7 @@ import torch
 from torch import nn
 
 DEFAULT_PRECISION_MODES = ("bf16", "nvfp4_bf16", "nvfp4_mxfp8", "mxfp8", "bitnet_b158")
-PRECISION_MODES = (*DEFAULT_PRECISION_MODES, "nvfp4_all", "nvfp4_all_portable",
+PRECISION_MODES = (*DEFAULT_PRECISION_MODES, "nvfp4_all", "nvfp4_all_portable", "nvfp4_all_portable_sr4",
                    "mxfp8_fast", "nvfp4_mxfp8_fast", "bitnet_b158_int8")
 
 
@@ -122,14 +122,15 @@ def apply_sprint_precision(model: nn.Module, precision: str, device) -> dict:
             module.__class__ = FastLowPrecisionLinear
             module.forward_format = "nvfp4" if base.startswith("nvfp4") else "mxfp8"
         metadata.update(precision=precision, cast_implementation="fused BF16 transpose and MXFP8 column cast")
-    elif precision in {"nvfp4_all", "nvfp4_all_portable"}:
+    elif precision in {"nvfp4_all", "nvfp4_all_portable", "nvfp4_all_portable_sr4"}:
         if device.type != "cuda":
             raise RuntimeError("native all-GEMM NVFP4 execution requires CUDA")
         from .sprint_nvfp4_training import apply_torchao_nvfp4_training
 
+        rounding = {"nvfp4_all": "hardware", "nvfp4_all_portable": "portable",
+                    "nvfp4_all_portable_sr4": "portable_sr4"}[precision]
         metadata.update(apply_torchao_nvfp4_training(
-            model, stochastic_rounding="portable" if precision.endswith("portable") else "hardware",
-            pad_to_alignment=precision.endswith("portable")))
+            model, stochastic_rounding=rounding, pad_to_alignment=rounding != "hardware"))
         metadata["precision"] = precision
     elif precision.startswith("nvfp4_"):
         from .low_precision import apply_qat, qat_metadata
